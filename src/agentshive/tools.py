@@ -118,6 +118,77 @@ def register_tools(mcp, settings: Settings) -> None:
     poll_interval = settings.poll_interval_seconds
     block_timeout = settings.tool_block_timeout_seconds
 
+    # ---------- Long-poll helpers (v1.2 Feature 4 — DRY up 6 near-identical wait loops) ----------
+    #
+    # Two helpers, not one. The wait sites split into two patterns that don't combine cleanly:
+    #   Pattern A — wait on a SPECIFIC row by id, return on terminal state, surface parent
+    #               mission's status if it left "active" mid-wait. Async state machine.
+    #               Used by _wait_for_question and _wait_for_summary.
+    #   Pattern B — wait on the OLDEST matching row for the active mission, return when one
+    #               appears. No lifecycle branch (the row IS for active mission by query
+    #               construction). Pure pull-from-queue. Optional on_hit side-effect lets
+    #               message tools increment redelivery_count without auto-acking.
+    #               Used by wait_for_next_question, wait_for_next_summary,
+    #               wait_for_coder_message, wait_for_planner_message.
+    #
+    # A previous draft tried a single helper with lifecycle_check=None — confusing conditional
+    # paths defeated the abstraction. Two helpers, each does one thing.
+
+    def _wait_specific(
+        row_id,
+        model_cls,
+        id_key,
+        is_terminal,
+        terminal_status,
+        to_dict,
+        pending_msg,
+    ):
+        deadline = time.monotonic() + block_timeout
+        while True:
+            with Session(get_engine()) as session:
+                row = session.get(model_cls, row_id)
+                if row is None:
+                    return {"error": f"no {id_key.replace('_id', '')} with id {row_id}"}
+                if is_terminal(row):
+                    return {"status": terminal_status, **to_dict(row)}
+                mission = session.get(Mission, row.mission_id)
+                if mission is not None and mission.status != "active":
+                    return {
+                        "status": mission.status,
+                        id_key: row_id,
+                        "mission_id": row.mission_id,
+                        "message": (
+                            "Your mission is no longer active — fetch_mission to get the new "
+                            "spec and decide whether to restart."
+                            if mission.status == "superseded"
+                            else "Your mission is marked done — stop work."
+                        ),
+                    }
+            if time.monotonic() >= deadline:
+                return {"status": "pending", id_key: row_id, "message": pending_msg}
+            time.sleep(poll_interval)
+
+    def _wait_for_active(
+        query_fn,
+        to_dict,
+        pending_msg,
+        block_for,
+        on_hit_mutate=None,
+    ):
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    row = query_fn(session, mission)
+                    if row is not None:
+                        if on_hit_mutate is not None:
+                            on_hit_mutate(row, session)
+                        return to_dict(row)
+            if time.monotonic() >= deadline:
+                return {"status": "pending", "message": pending_msg}
+            time.sleep(poll_interval)
+
     # ---------- Planner-side tools ----------
 
     @mcp.tool
@@ -282,25 +353,16 @@ def register_tools(mcp, settings: Settings) -> None:
             timeout_seconds: optional override for how long the server blocks before
                 returning "pending". Falls back to TOOL_BLOCK_TIMEOUT_SECONDS.
         """
-        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
-        deadline = time.monotonic() + block_for
-        while True:
-            with Session(get_engine()) as session:
-                mission = _active_mission(session)
-                if mission is not None:
-                    q = session.exec(
-                        select(Question)
-                        .where(Question.mission_id == mission.id, Question.answer.is_(None))
-                        .order_by(Question.created_at)
-                    ).first()
-                    if q is not None:
-                        return _question_dict(q)
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "message": "no questions yet — call wait_for_next_question again to keep waiting",
-                }
-            time.sleep(poll_interval)
+        return _wait_for_active(
+            lambda session, mission: session.exec(
+                select(Question)
+                .where(Question.mission_id == mission.id, Question.answer.is_(None))
+                .order_by(Question.created_at)
+            ).first(),
+            _question_dict,
+            "no questions yet — call wait_for_next_question again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+        )
 
     @mcp.tool
     def wait_for_next_summary(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
@@ -323,25 +385,16 @@ def register_tools(mcp, settings: Settings) -> None:
             timeout_seconds: optional override for the server-side block.
                 Falls back to TOOL_BLOCK_TIMEOUT_SECONDS.
         """
-        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
-        deadline = time.monotonic() + block_for
-        while True:
-            with Session(get_engine()) as session:
-                mission = _active_mission(session)
-                if mission is not None:
-                    s = session.exec(
-                        select(Summary)
-                        .where(Summary.mission_id == mission.id, Summary.response.is_(None))
-                        .order_by(Summary.created_at)
-                    ).first()
-                    if s is not None:
-                        return _summary_dict(s)
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "message": "no summaries yet — call wait_for_next_summary again to keep waiting",
-                }
-            time.sleep(poll_interval)
+        return _wait_for_active(
+            lambda session, mission: session.exec(
+                select(Summary)
+                .where(Summary.mission_id == mission.id, Summary.response.is_(None))
+                .order_by(Summary.created_at)
+            ).first(),
+            _summary_dict,
+            "no summaries yet — call wait_for_next_summary again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+        )
 
     @mcp.tool
     def send_to_coder(body: str) -> dict[str, Any]:
@@ -384,33 +437,26 @@ def register_tools(mcp, settings: Settings) -> None:
             timeout_seconds: optional override for the server-side block. Falls back to
                 TOOL_BLOCK_TIMEOUT_SECONDS.
         """
-        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
-        deadline = time.monotonic() + block_for
-        while True:
-            with Session(get_engine()) as session:
-                mission = _active_mission(session)
-                if mission is not None:
-                    m = session.exec(
-                        select(Message)
-                        .where(
-                            Message.mission_id == mission.id,
-                            Message.direction == "coder_to_planner",
-                            Message.delivered_at.is_(None),
-                        )
-                        .order_by(Message.created_at)
-                    ).first()
-                    if m is not None:
-                        m.redelivery_count = (m.redelivery_count or 0) + 1
-                        session.add(m)
-                        session.commit()
-                        session.refresh(m)
-                        return _message_dict(m)
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "message": "no messages yet — call wait_for_coder_message again to keep waiting",
-                }
-            time.sleep(poll_interval)
+        def _bump(m, session):
+            m.redelivery_count = (m.redelivery_count or 0) + 1
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+        return _wait_for_active(
+            lambda session, mission: session.exec(
+                select(Message)
+                .where(
+                    Message.mission_id == mission.id,
+                    Message.direction == "coder_to_planner",
+                    Message.delivered_at.is_(None),
+                )
+                .order_by(Message.created_at)
+            ).first(),
+            _message_dict,
+            "no messages yet — call wait_for_coder_message again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+            on_hit_mutate=_bump,
+        )
 
     @mcp.tool
     def send_to_planner(body: str) -> dict[str, Any]:
@@ -456,33 +502,26 @@ def register_tools(mcp, settings: Settings) -> None:
         """
         with Session(get_engine()) as session:
             _touch_coder(session)
-        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
-        deadline = time.monotonic() + block_for
-        while True:
-            with Session(get_engine()) as session:
-                mission = _active_mission(session)
-                if mission is not None:
-                    m = session.exec(
-                        select(Message)
-                        .where(
-                            Message.mission_id == mission.id,
-                            Message.direction == "planner_to_coder",
-                            Message.delivered_at.is_(None),
-                        )
-                        .order_by(Message.created_at)
-                    ).first()
-                    if m is not None:
-                        m.redelivery_count = (m.redelivery_count or 0) + 1
-                        session.add(m)
-                        session.commit()
-                        session.refresh(m)
-                        return _message_dict(m)
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "message": "no messages yet — call wait_for_planner_message again to keep waiting",
-                }
-            time.sleep(poll_interval)
+        def _bump(m, session):
+            m.redelivery_count = (m.redelivery_count or 0) + 1
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+        return _wait_for_active(
+            lambda session, mission: session.exec(
+                select(Message)
+                .where(
+                    Message.mission_id == mission.id,
+                    Message.direction == "planner_to_coder",
+                    Message.delivered_at.is_(None),
+                )
+                .order_by(Message.created_at)
+            ).first(),
+            _message_dict,
+            "no messages yet — call wait_for_planner_message again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+            on_hit_mutate=_bump,
+        )
 
     @mcp.tool
     def ack_message(message_id: str) -> dict[str, Any]:
@@ -548,41 +587,18 @@ def register_tools(mcp, settings: Settings) -> None:
             return _mission_dict(mission)
 
     def _wait_for_question(question_id: str) -> dict[str, Any]:
-        deadline = time.monotonic() + block_timeout
-        while True:
-            with Session(get_engine()) as session:
-                q = session.get(Question, question_id)
-                if q is None:
-                    return {"error": f"no question with id {question_id}"}
-                if q.answer is not None:
-                    return {"status": "answered", **_question_dict(q)}
-                # The mission this question belongs to may have moved out from under us
-                # (Planner called create_mission again, or mark_mission_done). Surface the
-                # actual mission.status so the Coder can branch — without this, the Coder
-                # would block forever waiting for an answer that no Planner UI can deliver.
-                mission = session.get(Mission, q.mission_id)
-                if mission is not None and mission.status != "active":
-                    return {
-                        "status": mission.status,
-                        "question_id": question_id,
-                        "mission_id": q.mission_id,
-                        "message": (
-                            "Your mission is no longer active — fetch_mission to get the new "
-                            "spec and decide whether to restart."
-                            if mission.status == "superseded"
-                            else "Your mission is marked done — stop work."
-                        ),
-                    }
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "question_id": question_id,
-                    "message": (
-                        "Planner has not answered yet. Call wait_for_answer(question_id) "
-                        "to keep waiting — this is not an error, just a long-running operation."
-                    ),
-                }
-            time.sleep(poll_interval)
+        return _wait_specific(
+            question_id,
+            Question,
+            "question_id",
+            lambda q: q.answer is not None,
+            "answered",
+            _question_dict,
+            (
+                "Planner has not answered yet. Call wait_for_answer(question_id) "
+                "to keep waiting — this is not an error, just a long-running operation."
+            ),
+        )
 
     @mcp.tool
     def ask_planner(question: str) -> dict[str, Any]:
@@ -625,37 +641,18 @@ def register_tools(mcp, settings: Settings) -> None:
         return _wait_for_question(question_id)
 
     def _wait_for_summary(summary_id: str) -> dict[str, Any]:
-        deadline = time.monotonic() + block_timeout
-        while True:
-            with Session(get_engine()) as session:
-                s = session.get(Summary, summary_id)
-                if s is None:
-                    return {"error": f"no summary with id {summary_id}"}
-                if s.response is not None:
-                    return {"status": "responded", **_summary_dict(s)}
-                mission = session.get(Mission, s.mission_id)
-                if mission is not None and mission.status != "active":
-                    return {
-                        "status": mission.status,
-                        "summary_id": summary_id,
-                        "mission_id": s.mission_id,
-                        "message": (
-                            "Your mission is no longer active — fetch_mission to get the new "
-                            "spec and decide whether to restart."
-                            if mission.status == "superseded"
-                            else "Your mission is marked done — stop work."
-                        ),
-                    }
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "summary_id": summary_id,
-                    "message": (
-                        "Planner has not responded yet. Call wait_for_summary_response(summary_id) "
-                        "to keep waiting."
-                    ),
-                }
-            time.sleep(poll_interval)
+        return _wait_specific(
+            summary_id,
+            Summary,
+            "summary_id",
+            lambda s: s.response is not None,
+            "responded",
+            _summary_dict,
+            (
+                "Planner has not responded yet. Call wait_for_summary_response(summary_id) "
+                "to keep waiting."
+            ),
+        )
 
     @mcp.tool
     def submit_progress(summary: str) -> dict[str, Any]:
