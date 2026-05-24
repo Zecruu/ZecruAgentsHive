@@ -5,7 +5,7 @@ from typing import Any, Optional
 from sqlmodel import Session, select
 
 from .config import Settings
-from .db import Mission, Question, Summary, get_engine
+from .db import Message, Mission, Question, Summary, get_engine
 
 
 def _utcnow() -> datetime:
@@ -43,6 +43,17 @@ def _summary_dict(s: Summary) -> dict[str, Any]:
         "response": s.response,
         "created_at": s.created_at.isoformat(),
         "responded_at": s.responded_at.isoformat() if s.responded_at else None,
+    }
+
+
+def _message_dict(m: Message) -> dict[str, Any]:
+    return {
+        "message_id": m.id,
+        "mission_id": m.mission_id,
+        "direction": m.direction,
+        "body": m.body,
+        "created_at": m.created_at.isoformat(),
+        "delivered_at": m.delivered_at.isoformat() if m.delivered_at else None,
     }
 
 
@@ -266,6 +277,135 @@ def register_tools(mcp, settings: Settings) -> None:
                 return {
                     "status": "pending",
                     "message": "no summaries yet — call wait_for_next_summary again to keep waiting",
+                }
+            time.sleep(poll_interval)
+
+    @mcp.tool
+    def send_to_coder(body: str) -> dict[str, Any]:
+        """Planner-side: send a free-form message TO the Coder. Fire-and-forget.
+
+        Use this for casual "fyi…" / "while you're at it…" / "I noticed X" updates that
+        don't need a structured response. The Coder reads via wait_for_planner_message().
+        For structured Q&A or progress review, use answer_question / respond_to_summary
+        as before — this is the chat-style channel, not a replacement.
+
+        Inserts a Message addressed to the Coder against the currently-active mission.
+        Returns the message_id immediately; does NOT block.
+        """
+        with Session(get_engine()) as session:
+            mission = _active_mission(session)
+            if mission is None:
+                return {"error": "no active mission — cannot send"}
+            m = Message(mission_id=mission.id, direction="planner_to_coder", body=body)
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+            return _message_dict(m)
+
+    @mcp.tool
+    def wait_for_coder_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Planner-side: block until an undelivered Coder→Planner message exists for the active mission.
+
+        Returns the OLDEST undelivered message; marks delivered_at on return so the next
+        call gets the next one. Use in a loop to drain a backlog, or just for a single
+        push-style receive.
+
+        On timeout: {status: "pending", message: ...}. Call again to keep waiting.
+
+        Args:
+            timeout_seconds: optional override for the server-side block. Falls back to
+                TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    m = session.exec(
+                        select(Message)
+                        .where(
+                            Message.mission_id == mission.id,
+                            Message.direction == "coder_to_planner",
+                            Message.delivered_at.is_(None),
+                        )
+                        .order_by(Message.created_at)
+                    ).first()
+                    if m is not None:
+                        m.delivered_at = _utcnow()
+                        session.add(m)
+                        session.commit()
+                        session.refresh(m)
+                        return _message_dict(m)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "pending",
+                    "message": "no messages yet — call wait_for_coder_message again to keep waiting",
+                }
+            time.sleep(poll_interval)
+
+    @mcp.tool
+    def send_to_planner(body: str) -> dict[str, Any]:
+        """Coder-side: send a free-form message TO the Planner. Fire-and-forget.
+
+        Use this for "fyi…" / "I made a small tangential decision" / "here's an
+        observation about AgentsHive itself" updates that don't warrant a full
+        submit_progress checkpoint. The Planner reads via wait_for_coder_message().
+
+        Inserts a Message addressed to the Planner against the active mission. Also
+        bumps the Coder heartbeat. Returns the message_id immediately; does NOT block.
+        """
+        with Session(get_engine()) as session:
+            _touch_coder(session)
+            mission = _active_mission(session)
+            if mission is None:
+                return {"error": "no active mission — cannot send"}
+            m = Message(mission_id=mission.id, direction="coder_to_planner", body=body)
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+            return _message_dict(m)
+
+    @mcp.tool
+    def wait_for_planner_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Coder-side: block until an undelivered Planner→Coder message exists for the active mission.
+
+        Returns the OLDEST undelivered message; marks delivered_at on return. Also bumps
+        the Coder heartbeat (single touch on entry, not per poll iteration).
+
+        On timeout: {status: "pending", message: ...}. Call again to keep waiting.
+
+        Args:
+            timeout_seconds: optional override for the server-side block. Falls back to
+                TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        with Session(get_engine()) as session:
+            _touch_coder(session)
+        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    m = session.exec(
+                        select(Message)
+                        .where(
+                            Message.mission_id == mission.id,
+                            Message.direction == "planner_to_coder",
+                            Message.delivered_at.is_(None),
+                        )
+                        .order_by(Message.created_at)
+                    ).first()
+                    if m is not None:
+                        m.delivered_at = _utcnow()
+                        session.add(m)
+                        session.commit()
+                        session.refresh(m)
+                        return _message_dict(m)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "pending",
+                    "message": "no messages yet — call wait_for_planner_message again to keep waiting",
                 }
             time.sleep(poll_interval)
 

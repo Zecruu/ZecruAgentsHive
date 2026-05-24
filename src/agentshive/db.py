@@ -53,6 +53,19 @@ class Summary(SQLModel, table=True):
     responded_at: Optional[datetime] = None
 
 
+# Free-form bidirectional chat channel ADDITIVE to the structured ask/answer + submit/respond
+# loops. Use for "hey also fyi…" updates that don't need a structured response.
+# direction: "planner_to_coder" | "coder_to_planner"
+# delivered_at: stamped when a wait_for_*_message reader returns this row.
+class Message(SQLModel, table=True):
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    mission_id: str = Field(foreign_key="mission.id", index=True)
+    direction: str = Field(index=True)
+    body: str
+    created_at: datetime = Field(default_factory=_utcnow)
+    delivered_at: Optional[datetime] = None
+
+
 _engine: Optional[Engine] = None
 
 
