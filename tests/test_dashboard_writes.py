@@ -226,11 +226,16 @@ async def test_mark_done_happy_path():
 
 def test_mark_done_no_mission_ok_false():
     print("--- T14: /mark-done with no active mission → 200 ok=false ---")
-    # T13 just marked the previous mission done; there's now no active mission
-    r = httpx.post(f"{BASE}/api/dashboard/mark-done", headers=BEARER)
-    assert r.status_code == 200
-    body = r.json()
-    assert body["ok"] is False, f"got {body}"
+    # Earlier integration tests (T15, T16) may have created new active missions
+    # since T13. Drain by calling /mark-done in a small loop until we get the
+    # no-active-mission response. Cap at 5 iterations so a real bug doesn't loop.
+    for _ in range(5):
+        r = httpx.post(f"{BASE}/api/dashboard/mark-done", headers=BEARER)
+        assert r.status_code == 200, f"unexpected status: {r.status_code}"
+        body = r.json()
+        if body.get("ok") is False:
+            break
+    assert body["ok"] is False, f"could not drain to no-active-mission: {body}"
     assert "no active mission" in body.get("error", "").lower()
     print(f"  [OK]")
 
