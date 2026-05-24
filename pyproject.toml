@@ -21,7 +21,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentshive"]
 
-# Hatch's wheel target includes .py files by default; .html template files need
-# to be explicitly listed or they won't ship in the built artifact.
-[tool.hatch.build.targets.wheel.force-include]
-"src/agentshive/templates" = "agentshive/templates"
+# Hatch's wheel target only includes .py files for declared packages by default.
+# We need .html template files too. Using a global include glob (evaluated at
+# build time, not at metadata-gen time) instead of force-include — the latter
+# validates paths during metadata generation, which breaks Nixpacks's "copy
+# pyproject first, install, then copy source" caching pattern. Global include
+# is evaluated only when files are actually being collected for the wheel.
+[tool.hatch.build]
+include = [
+    "src/agentshive/**/*.py",
+    "src/agentshive/**/*.html",
+]
