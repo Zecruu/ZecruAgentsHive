@@ -1,12 +1,35 @@
+import hashlib
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from fastmcp import Context
+from mcp.types import ToolListChangedNotification
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from . import __version__ as AGENTSHIVE_VERSION
 from .config import Settings
 from .db import Message, Mission, Question, Summary, get_engine
+
+
+# Captured at module load. See get_server_info — surfaced as `started_at` so a client
+# can detect "I am talking to a server that restarted since my last call." Combined
+# with tools_catalog_hash drift, this gives cooperating clients a path to notice
+# their cached tool list is stale without having to compare every tool name.
+SERVER_STARTED_AT = datetime.now(timezone.utc)
+
+
+def _compute_tools_catalog_hash(tool_names: list[str]) -> str:
+    """Deterministic short fingerprint of the registered tool surface.
+
+    sha256 over sorted-and-newline-joined tool names, truncated to 16 hex chars.
+    16 hex chars = 64 bits, more than enough collision space to detect drift while
+    staying short enough to display in a status line. Stable across calls within
+    a deploy; changes only when the tool surface itself changes.
+    """
+    payload = "\n".join(sorted(tool_names)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
 
 
 def _utcnow() -> datetime:
@@ -561,6 +584,91 @@ def register_tools(mcp, settings: Settings) -> None:
             session.commit()
             session.refresh(m)
             return _message_dict(m)
+
+    # ---------- Symmetric meta tools (v1.3) ----------
+
+    async def _list_tool_names() -> list[str]:
+        tools = await mcp.list_tools()
+        if isinstance(tools, list):
+            return [t.name for t in tools]
+        return list(tools.keys())
+
+    @mcp.tool
+    async def get_server_info() -> dict[str, Any]:
+        """Return server metadata for catalog-drift detection. Pure — no side effects.
+
+        Use this to detect whether your MCP client's cached view of AgentsHive is stale
+        relative to what the server actually exposes today. Three fields:
+
+          server_version: semver string of the running AgentsHive build (e.g. "1.3.0").
+              A change vs. your last observed value means the server was redeployed.
+
+          tools_catalog_hash: short fingerprint (16 hex chars) of the registered tool
+              names. Stable across calls within a deploy; changes if any tool is added,
+              removed, or renamed. If THIS differs from your previous observation, your
+              cached tool list is stale — call refresh_tool_catalog to ask the server
+              to push a refresh signal, or manually disconnect/reconnect your MCP client.
+
+          started_at: ISO timestamp of when this server process started. A change here
+              also indicates a redeploy (the server PID changed).
+
+        Important: this tool does NOT trigger a tool-list refresh. It only reports the
+        current state. Use refresh_tool_catalog when you want the server to emit a
+        notifications/tools/list_changed event for spec-compliant clients.
+        """
+        names = await _list_tool_names()
+        return {
+            "server_version": AGENTSHIVE_VERSION,
+            "tools_catalog_hash": _compute_tools_catalog_hash(names),
+            "started_at": SERVER_STARTED_AT.isoformat(),
+        }
+
+    @mcp.tool
+    async def refresh_tool_catalog(ctx: Context) -> dict[str, Any]:
+        """Ask the server to push a tools/list_changed notification to your session.
+
+        Use this when get_server_info reports a tools_catalog_hash you haven't seen
+        before — your cached tool list is stale and you want the server to nudge
+        your client to re-list.
+
+        Side effect: emits an MCP notifications/tools/list_changed event scoped to
+        the calling session. Spec-compliant MCP clients respond by re-fetching the
+        tool list automatically; you should see new tools in your toolbelt without
+        any client-side action.
+
+        Caveat: some MCP clients (notably Claude Code in current versions) cache the
+        tool catalog aggressively across underlying HTTP reconnects and do NOT respect
+        the notification. Those clients require a manual disconnect/reconnect — close
+        and reopen the client app, or toggle the connector off and on in the UI. See
+        the README troubleshooting section.
+
+        Returns: {ok, tools_catalog_hash, message}. The hash matches what
+        get_server_info would return; included so a caller can confirm what they
+        refreshed to without a second round-trip.
+        """
+        names = await _list_tool_names()
+        try:
+            await ctx.send_notification(ToolListChangedNotification())
+        except Exception as e:
+            # Notification emission failing should not break the diagnostic — the hash
+            # in the return value is still useful even if the push didn't go out.
+            return {
+                "ok": False,
+                "tools_catalog_hash": _compute_tools_catalog_hash(names),
+                "message": (
+                    f"notification emission failed ({type(e).__name__}: {e}). "
+                    "Manual client reconnect required to refresh the cache."
+                ),
+            }
+        return {
+            "ok": True,
+            "tools_catalog_hash": _compute_tools_catalog_hash(names),
+            "message": (
+                "tools/list_changed notification emitted. Spec-compliant clients will "
+                "re-list automatically. Aggressively-caching clients (e.g., Claude Code) "
+                "need a manual disconnect/reconnect — see README."
+            ),
+        }
 
     @mcp.tool
     def mark_mission_done() -> dict[str, Any]:
