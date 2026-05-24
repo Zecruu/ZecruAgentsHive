@@ -53,7 +53,9 @@ def _message_dict(m: Message) -> dict[str, Any]:
         "direction": m.direction,
         "body": m.body,
         "created_at": m.created_at.isoformat(),
+        # delivered_at semantically means "acked_at" since v1.2 — see Message model docstring
         "delivered_at": m.delivered_at.isoformat() if m.delivered_at else None,
+        "redelivery_count": m.redelivery_count or 0,
     }
 
 
@@ -347,11 +349,13 @@ def register_tools(mcp, settings: Settings) -> None:
 
     @mcp.tool
     def wait_for_coder_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
-        """Planner-side: block until an undelivered Coder→Planner message exists for the active mission.
+        """Planner-side: block until an unacked Coder→Planner message exists for the active mission.
 
-        Returns the OLDEST undelivered message; marks delivered_at on return so the next
-        call gets the next one. Use in a loop to drain a backlog, or just for a single
-        push-style receive.
+        AT-LEAST-ONCE SEMANTICS (v1.2): returns the OLDEST unacked message but does NOT
+        stamp delivered_at. Until you call ack_message(message_id), subsequent calls to
+        this tool keep returning the same row (with redelivery_count incrementing each
+        time). Reader pattern: wait → process → ack. If you crash before ack, you'll see
+        the row again on next call — exactly the safety property you want.
 
         On timeout: {status: "pending", message: ...}. Call again to keep waiting.
 
@@ -375,7 +379,7 @@ def register_tools(mcp, settings: Settings) -> None:
                         .order_by(Message.created_at)
                     ).first()
                     if m is not None:
-                        m.delivered_at = _utcnow()
+                        m.redelivery_count = (m.redelivery_count or 0) + 1
                         session.add(m)
                         session.commit()
                         session.refresh(m)
@@ -414,10 +418,14 @@ def register_tools(mcp, settings: Settings) -> None:
 
     @mcp.tool
     def wait_for_planner_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
-        """Coder-side: block until an undelivered Planner→Coder message exists for the active mission.
+        """Coder-side: block until an unacked Planner→Coder message exists for the active mission.
 
-        Returns the OLDEST undelivered message; marks delivered_at on return. Also bumps
-        the Coder heartbeat (single touch on entry, not per poll iteration).
+        AT-LEAST-ONCE SEMANTICS (v1.2): returns the OLDEST unacked message but does NOT
+        stamp delivered_at. Until you call ack_message(message_id), subsequent calls keep
+        returning the same row (with redelivery_count incrementing). Reader pattern:
+        wait → process → ack. If you crash before ack, you'll see the row again next call.
+
+        Also bumps the Coder heartbeat (single touch on entry, not per poll iteration).
 
         On timeout: {status: "pending", message: ...}. Call again to keep waiting.
 
@@ -443,7 +451,7 @@ def register_tools(mcp, settings: Settings) -> None:
                         .order_by(Message.created_at)
                     ).first()
                     if m is not None:
-                        m.delivered_at = _utcnow()
+                        m.redelivery_count = (m.redelivery_count or 0) + 1
                         session.add(m)
                         session.commit()
                         session.refresh(m)
@@ -454,6 +462,39 @@ def register_tools(mcp, settings: Settings) -> None:
                     "message": "no messages yet — call wait_for_planner_message again to keep waiting",
                 }
             time.sleep(poll_interval)
+
+    @mcp.tool
+    def ack_message(message_id: str) -> dict[str, Any]:
+        """Acknowledge receipt of a message returned by wait_for_coder_message or wait_for_planner_message.
+
+        Idempotent: calling ack on an already-acked message is a no-op that returns the
+        same message dict. Both Planner and Coder use this — the symmetric design avoids
+        a "who should ack this?" handshake on top of the role split.
+
+        Reader pattern (v1.2 at-least-once):
+            msg = wait_for_*_message(...)
+            ... process msg ...
+            ack_message(msg["message_id"])
+
+        If you skip the ack, the next wait_for_*_message call returns the same row with
+        redelivery_count incremented. If you crashed between wait and ack, that's the
+        feature — the message lives on for the next reader instead of vanishing into
+        the void of "delivered but never seen."
+
+        Returns the full message dict with the (possibly newly stamped) delivered_at.
+        """
+        with Session(get_engine()) as session:
+            m = session.get(Message, message_id)
+            if m is None:
+                return {"error": f"no message with id {message_id}"}
+            if m.delivered_at is not None:
+                # idempotent: already acked, just return the row as-is
+                return _message_dict(m)
+            m.delivered_at = _utcnow()
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+            return _message_dict(m)
 
     @mcp.tool
     def mark_mission_done() -> dict[str, Any]:

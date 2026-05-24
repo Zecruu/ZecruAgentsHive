@@ -95,23 +95,26 @@ async def test_long_poll_survives_supersede():
 # ---------- FEATURE 2: bidirectional messaging ----------
 
 async def test_planner_to_coder_message():
-    print("--- F2.a: send_to_coder + wait_for_planner_message ---")
+    print("--- F2.a: send_to_coder + wait_for_planner_message + ack_message ---")
     async with Client(URL, auth=KEY) as cli:
         await cli.call_tool("create_mission", {"name": "msg-pc", "spec": "s"})
         sent = _c(await cli.call_tool("send_to_coder", {"body": "hey heads up: rate-limit is 100/s"}))
         assert sent["direction"] == "planner_to_coder", f"wrong direction: {sent}"
-        assert sent["delivered_at"] is None, f"new message should be undelivered: {sent}"
-        print(f"  [OK] send_to_coder created message_id={sent['message_id'][:8]} undelivered")
+        assert sent["delivered_at"] is None, f"new message should be unacked: {sent}"
+        print(f"  [OK] send_to_coder created message_id={sent['message_id'][:8]}")
 
         async with Client(URL, auth=KEY) as coder:
+            # v1.2: wait_for_*_message no longer auto-stamps; ack_message is required
             r = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 5}))
             assert r["body"] == "hey heads up: rate-limit is 100/s", f"unexpected body: {r}"
-            assert r["delivered_at"] is not None, f"should be stamped delivered: {r}"
-            print(f"  [OK] Coder received it; delivered_at was stamped on read")
+            assert r["delivered_at"] is None, f"wait should NOT auto-stamp (v1.2): {r}"
+            acked = _c(await coder.call_tool("ack_message", {"message_id": r["message_id"]}))
+            assert acked["delivered_at"] is not None, f"ack should stamp: {acked}"
+            print("  [OK] Coder received unacked; ack_message stamped delivered_at")
 
 
 async def test_coder_to_planner_message():
-    print("--- F2.b: send_to_planner + wait_for_coder_message ---")
+    print("--- F2.b: send_to_planner + wait_for_coder_message + ack ---")
     async with Client(URL, auth=KEY) as cli:
         await cli.call_tool("create_mission", {"name": "msg-cp", "spec": "s"})
 
@@ -122,12 +125,14 @@ async def test_coder_to_planner_message():
 
         r = _c(await cli.call_tool("wait_for_coder_message", {"timeout_seconds": 5}))
         assert r["body"] == "fyi: noticed FastMCP wraps lists", f"unexpected body: {r}"
-        assert r["delivered_at"] is not None, f"should be stamped delivered: {r}"
-        print("  [OK] Planner received it")
+        assert r["delivered_at"] is None, f"wait should NOT auto-stamp: {r}"
+        acked = _c(await cli.call_tool("ack_message", {"message_id": r["message_id"]}))
+        assert acked["delivered_at"] is not None, f"ack should stamp: {acked}"
+        print("  [OK] Planner received unacked; ack stamped")
 
 
 async def test_message_drain_in_order():
-    print("--- F2.c: multiple messages drain in arrival order ---")
+    print("--- F2.c: drain multiple in order (with ack between each) ---")
     async with Client(URL, auth=KEY) as cli:
         await cli.call_tool("create_mission", {"name": "msg-drain", "spec": "s"})
         for body in ["m1", "m2", "m3"]:
@@ -138,11 +143,13 @@ async def test_message_drain_in_order():
             for _ in range(3):
                 r = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 3}))
                 seen.append(r["body"])
+                # ack between each wait — without this, v1.2 would return m1 every time
+                await coder.call_tool("ack_message", {"message_id": r["message_id"]})
             assert seen == ["m1", "m2", "m3"], f"expected ordered drain, got {seen}"
             # Now the queue is empty — next call should timeout
             r = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 2}))
             assert r.get("status") == "pending", f"queue should be drained, got {r}"
-        print("  [OK] drained 3 messages in order; subsequent wait timed out")
+        print("  [OK] drained 3 messages with ack between; subsequent wait timed out")
 
 
 async def test_message_timeout_path():
