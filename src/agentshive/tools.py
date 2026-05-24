@@ -2,6 +2,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from .config import Settings
@@ -47,13 +48,21 @@ def _summary_dict(s: Summary) -> dict[str, Any]:
 
 
 def _message_dict(m: Message) -> dict[str, Any]:
+    # redelivery_count surface is 0-indexed (matches docstring: 0 = first delivery,
+    # positive = N readers saw this before you without acking). DB stays 1-indexed
+    # internally because writes are simpler that way; we subtract 1 here so callers
+    # see the semantic value. max(0, ...) handles the never-returned case where the
+    # DB column is still 0 from the default.
+    db_count = m.redelivery_count or 0
     return {
         "message_id": m.id,
         "mission_id": m.mission_id,
         "direction": m.direction,
         "body": m.body,
         "created_at": m.created_at.isoformat(),
+        # delivered_at semantically means "acked_at" since v1.2 — see Message model docstring
         "delivered_at": m.delivered_at.isoformat() if m.delivered_at else None,
+        "redelivery_count": max(0, db_count - 1),
     }
 
 
@@ -61,6 +70,35 @@ def _active_mission(session: Session) -> Optional[Mission]:
     return session.exec(
         select(Mission).where(Mission.status == "active").order_by(Mission.created_at.desc())
     ).first()
+
+
+# ---------- Input validation (v1.2 Feature 3) ----------
+# Length caps live here, not in config, because they're protocol guarantees rather
+# than per-deployment tunables. If anyone hits a wall against these, we'll move
+# them to env vars then — until then a single source of truth keeps the surface flat.
+
+MAX_NAME_LEN = 200
+MAX_SPEC_LEN = 64 * 1024       # 64 KB
+MAX_TEXT_LEN = 16 * 1024       # 16 KB — applies to question, summary, message body,
+                               # answer, response. One cap simpler than seven nearly-equal ones.
+
+
+def _validate_text(value: str, field_name: str, max_len: int) -> Optional[dict]:
+    """Return an error dict if value is empty/whitespace or exceeds max_len; None if OK.
+
+    Tool entry points call this and short-circuit on a non-None return so callers
+    get a clean error before any DB write happens.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return {"error": f"{field_name} must be a non-empty string"}
+    if len(value) > max_len:
+        return {
+            "error": (
+                f"{field_name} exceeds maximum length of {max_len} characters "
+                f"(got {len(value)})"
+            )
+        }
+    return None
 
 
 def _touch_coder(session: Session) -> None:
@@ -86,6 +124,77 @@ def register_tools(mcp, settings: Settings) -> None:
     poll_interval = settings.poll_interval_seconds
     block_timeout = settings.tool_block_timeout_seconds
 
+    # ---------- Long-poll helpers (v1.2 Feature 4 — DRY up 6 near-identical wait loops) ----------
+    #
+    # Two helpers, not one. The wait sites split into two patterns that don't combine cleanly:
+    #   Pattern A — wait on a SPECIFIC row by id, return on terminal state, surface parent
+    #               mission's status if it left "active" mid-wait. Async state machine.
+    #               Used by _wait_for_question and _wait_for_summary.
+    #   Pattern B — wait on the OLDEST matching row for the active mission, return when one
+    #               appears. No lifecycle branch (the row IS for active mission by query
+    #               construction). Pure pull-from-queue. Optional on_hit side-effect lets
+    #               message tools increment redelivery_count without auto-acking.
+    #               Used by wait_for_next_question, wait_for_next_summary,
+    #               wait_for_coder_message, wait_for_planner_message.
+    #
+    # A previous draft tried a single helper with lifecycle_check=None — confusing conditional
+    # paths defeated the abstraction. Two helpers, each does one thing.
+
+    def _wait_specific(
+        row_id,
+        model_cls,
+        id_key,
+        is_terminal,
+        terminal_status,
+        to_dict,
+        pending_msg,
+    ):
+        deadline = time.monotonic() + block_timeout
+        while True:
+            with Session(get_engine()) as session:
+                row = session.get(model_cls, row_id)
+                if row is None:
+                    return {"error": f"no {id_key.replace('_id', '')} with id {row_id}"}
+                if is_terminal(row):
+                    return {"status": terminal_status, **to_dict(row)}
+                mission = session.get(Mission, row.mission_id)
+                if mission is not None and mission.status != "active":
+                    return {
+                        "status": mission.status,
+                        id_key: row_id,
+                        "mission_id": row.mission_id,
+                        "message": (
+                            "Your mission is no longer active — fetch_mission to get the new "
+                            "spec and decide whether to restart."
+                            if mission.status == "superseded"
+                            else "Your mission is marked done — stop work."
+                        ),
+                    }
+            if time.monotonic() >= deadline:
+                return {"status": "pending", id_key: row_id, "message": pending_msg}
+            time.sleep(poll_interval)
+
+    def _wait_for_active(
+        query_fn,
+        to_dict,
+        pending_msg,
+        block_for,
+        on_hit_mutate=None,
+    ):
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    row = query_fn(session, mission)
+                    if row is not None:
+                        if on_hit_mutate is not None:
+                            on_hit_mutate(row, session)
+                        return to_dict(row)
+            if time.monotonic() >= deadline:
+                return {"status": "pending", "message": pending_msg}
+            time.sleep(poll_interval)
+
     # ---------- Planner-side tools ----------
 
     @mcp.tool
@@ -96,19 +205,44 @@ def register_tools(mcp, settings: Settings) -> None:
         mission at a time. Call this once you and the human have locked the spec.
 
         Args:
-            name: short label for the mission (e.g., "Build the invoice exporter")
-            spec: the full natural-language specification the Coder should implement
+            name: short label for the mission (e.g., "Build the invoice exporter").
+                Must be non-empty, max {MAX_NAME_LEN} characters.
+            spec: the full natural-language specification the Coder should implement.
+                Must be non-empty, max {MAX_SPEC_LEN // 1024} KB.
         """
-        with Session(get_engine()) as session:
-            current = _active_mission(session)
-            if current:
-                current.status = "superseded"
-                session.add(current)
-            mission = Mission(name=name, spec=spec, status="active")
-            session.add(mission)
-            session.commit()
-            session.refresh(mission)
-            return _mission_dict(mission)
+        err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
+        if err:
+            return err
+        # Belt-and-suspenders against concurrent create_mission races on Postgres:
+        # the partial unique index `one_active_mission ON mission(status) WHERE
+        # status='active'` enforces the invariant at the DB level. On collision we
+        # treat the racing winner as a "supersede target" and retry once — semantically
+        # faithful to create_mission's contract ("new mission, prior is superseded").
+        # One retry only: sustained contention should surface as an error so the caller
+        # decides what to do instead of us spinning.
+        for attempt in range(2):
+            try:
+                with Session(get_engine()) as session:
+                    current = _active_mission(session)
+                    if current:
+                        current.status = "superseded"
+                        session.add(current)
+                    mission = Mission(name=name, spec=spec, status="active")
+                    session.add(mission)
+                    session.commit()
+                    session.refresh(mission)
+                    return _mission_dict(mission)
+            except IntegrityError:
+                if attempt == 0:
+                    continue
+                return {
+                    "error": (
+                        "create_mission contention: another concurrent creator beat us "
+                        "twice in a row. The active mission belongs to someone else right "
+                        "now — call get_active_mission to see it, then create_mission again "
+                        "if you still want to supersede."
+                    )
+                }
 
     @mcp.tool
     def get_active_mission() -> dict[str, Any]:
@@ -142,6 +276,9 @@ def register_tools(mcp, settings: Settings) -> None:
     @mcp.tool
     def answer_question(question_id: str, answer: str) -> dict[str, Any]:
         """Answer a pending question from the Coder. The Coder will receive this and resume."""
+        err = _validate_text(answer, "answer", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             q = session.get(Question, question_id)
             if q is None:
@@ -180,6 +317,9 @@ def register_tools(mcp, settings: Settings) -> None:
 
         To mark the entire mission as finished, call mark_mission_done — not this.
         """
+        err = _validate_text(response, "response", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             s = session.get(Summary, summary_id)
             if s is None:
@@ -219,25 +359,16 @@ def register_tools(mcp, settings: Settings) -> None:
             timeout_seconds: optional override for how long the server blocks before
                 returning "pending". Falls back to TOOL_BLOCK_TIMEOUT_SECONDS.
         """
-        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
-        deadline = time.monotonic() + block_for
-        while True:
-            with Session(get_engine()) as session:
-                mission = _active_mission(session)
-                if mission is not None:
-                    q = session.exec(
-                        select(Question)
-                        .where(Question.mission_id == mission.id, Question.answer.is_(None))
-                        .order_by(Question.created_at)
-                    ).first()
-                    if q is not None:
-                        return _question_dict(q)
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "message": "no questions yet — call wait_for_next_question again to keep waiting",
-                }
-            time.sleep(poll_interval)
+        return _wait_for_active(
+            lambda session, mission: session.exec(
+                select(Question)
+                .where(Question.mission_id == mission.id, Question.answer.is_(None))
+                .order_by(Question.created_at)
+            ).first(),
+            _question_dict,
+            "no questions yet — call wait_for_next_question again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+        )
 
     @mcp.tool
     def wait_for_next_summary(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
@@ -260,25 +391,16 @@ def register_tools(mcp, settings: Settings) -> None:
             timeout_seconds: optional override for the server-side block.
                 Falls back to TOOL_BLOCK_TIMEOUT_SECONDS.
         """
-        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
-        deadline = time.monotonic() + block_for
-        while True:
-            with Session(get_engine()) as session:
-                mission = _active_mission(session)
-                if mission is not None:
-                    s = session.exec(
-                        select(Summary)
-                        .where(Summary.mission_id == mission.id, Summary.response.is_(None))
-                        .order_by(Summary.created_at)
-                    ).first()
-                    if s is not None:
-                        return _summary_dict(s)
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "message": "no summaries yet — call wait_for_next_summary again to keep waiting",
-                }
-            time.sleep(poll_interval)
+        return _wait_for_active(
+            lambda session, mission: session.exec(
+                select(Summary)
+                .where(Summary.mission_id == mission.id, Summary.response.is_(None))
+                .order_by(Summary.created_at)
+            ).first(),
+            _summary_dict,
+            "no summaries yet — call wait_for_next_summary again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+        )
 
     @mcp.tool
     def send_to_coder(body: str) -> dict[str, Any]:
@@ -292,6 +414,9 @@ def register_tools(mcp, settings: Settings) -> None:
         Inserts a Message addressed to the Coder against the currently-active mission.
         Returns the message_id immediately; does NOT block.
         """
+        err = _validate_text(body, "body", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             mission = _active_mission(session)
             if mission is None:
@@ -304,11 +429,13 @@ def register_tools(mcp, settings: Settings) -> None:
 
     @mcp.tool
     def wait_for_coder_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
-        """Planner-side: block until an undelivered Coder→Planner message exists for the active mission.
+        """Planner-side: block until an unacked Coder→Planner message exists for the active mission.
 
-        Returns the OLDEST undelivered message; marks delivered_at on return so the next
-        call gets the next one. Use in a loop to drain a backlog, or just for a single
-        push-style receive.
+        AT-LEAST-ONCE SEMANTICS (v1.2): returns the OLDEST unacked message but does NOT
+        stamp delivered_at. Until you call ack_message(message_id), subsequent calls to
+        this tool keep returning the same row (with redelivery_count incrementing each
+        time). Reader pattern: wait → process → ack. If you crash before ack, you'll see
+        the row again on next call — exactly the safety property you want.
 
         On timeout: {status: "pending", message: ...}. Call again to keep waiting.
 
@@ -316,33 +443,26 @@ def register_tools(mcp, settings: Settings) -> None:
             timeout_seconds: optional override for the server-side block. Falls back to
                 TOOL_BLOCK_TIMEOUT_SECONDS.
         """
-        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
-        deadline = time.monotonic() + block_for
-        while True:
-            with Session(get_engine()) as session:
-                mission = _active_mission(session)
-                if mission is not None:
-                    m = session.exec(
-                        select(Message)
-                        .where(
-                            Message.mission_id == mission.id,
-                            Message.direction == "coder_to_planner",
-                            Message.delivered_at.is_(None),
-                        )
-                        .order_by(Message.created_at)
-                    ).first()
-                    if m is not None:
-                        m.delivered_at = _utcnow()
-                        session.add(m)
-                        session.commit()
-                        session.refresh(m)
-                        return _message_dict(m)
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "message": "no messages yet — call wait_for_coder_message again to keep waiting",
-                }
-            time.sleep(poll_interval)
+        def _bump(m, session):
+            m.redelivery_count = (m.redelivery_count or 0) + 1
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+        return _wait_for_active(
+            lambda session, mission: session.exec(
+                select(Message)
+                .where(
+                    Message.mission_id == mission.id,
+                    Message.direction == "coder_to_planner",
+                    Message.delivered_at.is_(None),
+                )
+                .order_by(Message.created_at)
+            ).first(),
+            _message_dict,
+            "no messages yet — call wait_for_coder_message again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+            on_hit_mutate=_bump,
+        )
 
     @mcp.tool
     def send_to_planner(body: str) -> dict[str, Any]:
@@ -355,6 +475,9 @@ def register_tools(mcp, settings: Settings) -> None:
         Inserts a Message addressed to the Planner against the active mission. Also
         bumps the Coder heartbeat. Returns the message_id immediately; does NOT block.
         """
+        err = _validate_text(body, "body", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             _touch_coder(session)
             mission = _active_mission(session)
@@ -368,10 +491,14 @@ def register_tools(mcp, settings: Settings) -> None:
 
     @mcp.tool
     def wait_for_planner_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
-        """Coder-side: block until an undelivered Planner→Coder message exists for the active mission.
+        """Coder-side: block until an unacked Planner→Coder message exists for the active mission.
 
-        Returns the OLDEST undelivered message; marks delivered_at on return. Also bumps
-        the Coder heartbeat (single touch on entry, not per poll iteration).
+        AT-LEAST-ONCE SEMANTICS (v1.2): returns the OLDEST unacked message but does NOT
+        stamp delivered_at. Until you call ack_message(message_id), subsequent calls keep
+        returning the same row (with redelivery_count incrementing). Reader pattern:
+        wait → process → ack. If you crash before ack, you'll see the row again next call.
+
+        Also bumps the Coder heartbeat (single touch on entry, not per poll iteration).
 
         On timeout: {status: "pending", message: ...}. Call again to keep waiting.
 
@@ -381,33 +508,59 @@ def register_tools(mcp, settings: Settings) -> None:
         """
         with Session(get_engine()) as session:
             _touch_coder(session)
-        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
-        deadline = time.monotonic() + block_for
-        while True:
-            with Session(get_engine()) as session:
-                mission = _active_mission(session)
-                if mission is not None:
-                    m = session.exec(
-                        select(Message)
-                        .where(
-                            Message.mission_id == mission.id,
-                            Message.direction == "planner_to_coder",
-                            Message.delivered_at.is_(None),
-                        )
-                        .order_by(Message.created_at)
-                    ).first()
-                    if m is not None:
-                        m.delivered_at = _utcnow()
-                        session.add(m)
-                        session.commit()
-                        session.refresh(m)
-                        return _message_dict(m)
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "message": "no messages yet — call wait_for_planner_message again to keep waiting",
-                }
-            time.sleep(poll_interval)
+        def _bump(m, session):
+            m.redelivery_count = (m.redelivery_count or 0) + 1
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+        return _wait_for_active(
+            lambda session, mission: session.exec(
+                select(Message)
+                .where(
+                    Message.mission_id == mission.id,
+                    Message.direction == "planner_to_coder",
+                    Message.delivered_at.is_(None),
+                )
+                .order_by(Message.created_at)
+            ).first(),
+            _message_dict,
+            "no messages yet — call wait_for_planner_message again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+            on_hit_mutate=_bump,
+        )
+
+    @mcp.tool
+    def ack_message(message_id: str) -> dict[str, Any]:
+        """Acknowledge receipt of a message returned by wait_for_coder_message or wait_for_planner_message.
+
+        Idempotent: calling ack on an already-acked message is a no-op that returns the
+        same message dict. Both Planner and Coder use this — the symmetric design avoids
+        a "who should ack this?" handshake on top of the role split.
+
+        Reader pattern (v1.2 at-least-once):
+            msg = wait_for_*_message(...)
+            ... process msg ...
+            ack_message(msg["message_id"])
+
+        If you skip the ack, the next wait_for_*_message call returns the same row with
+        redelivery_count incremented. If you crashed between wait and ack, that's the
+        feature — the message lives on for the next reader instead of vanishing into
+        the void of "delivered but never seen."
+
+        Returns the full message dict with the (possibly newly stamped) delivered_at.
+        """
+        with Session(get_engine()) as session:
+            m = session.get(Message, message_id)
+            if m is None:
+                return {"error": f"no message with id {message_id}"}
+            if m.delivered_at is not None:
+                # idempotent: already acked, just return the row as-is
+                return _message_dict(m)
+            m.delivered_at = _utcnow()
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+            return _message_dict(m)
 
     @mcp.tool
     def mark_mission_done() -> dict[str, Any]:
@@ -440,41 +593,18 @@ def register_tools(mcp, settings: Settings) -> None:
             return _mission_dict(mission)
 
     def _wait_for_question(question_id: str) -> dict[str, Any]:
-        deadline = time.monotonic() + block_timeout
-        while True:
-            with Session(get_engine()) as session:
-                q = session.get(Question, question_id)
-                if q is None:
-                    return {"error": f"no question with id {question_id}"}
-                if q.answer is not None:
-                    return {"status": "answered", **_question_dict(q)}
-                # The mission this question belongs to may have moved out from under us
-                # (Planner called create_mission again, or mark_mission_done). Surface the
-                # actual mission.status so the Coder can branch — without this, the Coder
-                # would block forever waiting for an answer that no Planner UI can deliver.
-                mission = session.get(Mission, q.mission_id)
-                if mission is not None and mission.status != "active":
-                    return {
-                        "status": mission.status,
-                        "question_id": question_id,
-                        "mission_id": q.mission_id,
-                        "message": (
-                            "Your mission is no longer active — fetch_mission to get the new "
-                            "spec and decide whether to restart."
-                            if mission.status == "superseded"
-                            else "Your mission is marked done — stop work."
-                        ),
-                    }
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "question_id": question_id,
-                    "message": (
-                        "Planner has not answered yet. Call wait_for_answer(question_id) "
-                        "to keep waiting — this is not an error, just a long-running operation."
-                    ),
-                }
-            time.sleep(poll_interval)
+        return _wait_specific(
+            question_id,
+            Question,
+            "question_id",
+            lambda q: q.answer is not None,
+            "answered",
+            _question_dict,
+            (
+                "Planner has not answered yet. Call wait_for_answer(question_id) "
+                "to keep waiting — this is not an error, just a long-running operation."
+            ),
+        )
 
     @mcp.tool
     def ask_planner(question: str) -> dict[str, Any]:
@@ -490,6 +620,9 @@ def register_tools(mcp, settings: Settings) -> None:
         response — call wait_for_answer(question_id) repeatedly until you get a real
         answer. Do NOT treat 'pending' as failure.
         """
+        err = _validate_text(question, "question", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             _touch_coder(session)
             mission = _active_mission(session)
@@ -514,37 +647,18 @@ def register_tools(mcp, settings: Settings) -> None:
         return _wait_for_question(question_id)
 
     def _wait_for_summary(summary_id: str) -> dict[str, Any]:
-        deadline = time.monotonic() + block_timeout
-        while True:
-            with Session(get_engine()) as session:
-                s = session.get(Summary, summary_id)
-                if s is None:
-                    return {"error": f"no summary with id {summary_id}"}
-                if s.response is not None:
-                    return {"status": "responded", **_summary_dict(s)}
-                mission = session.get(Mission, s.mission_id)
-                if mission is not None and mission.status != "active":
-                    return {
-                        "status": mission.status,
-                        "summary_id": summary_id,
-                        "mission_id": s.mission_id,
-                        "message": (
-                            "Your mission is no longer active — fetch_mission to get the new "
-                            "spec and decide whether to restart."
-                            if mission.status == "superseded"
-                            else "Your mission is marked done — stop work."
-                        ),
-                    }
-            if time.monotonic() >= deadline:
-                return {
-                    "status": "pending",
-                    "summary_id": summary_id,
-                    "message": (
-                        "Planner has not responded yet. Call wait_for_summary_response(summary_id) "
-                        "to keep waiting."
-                    ),
-                }
-            time.sleep(poll_interval)
+        return _wait_specific(
+            summary_id,
+            Summary,
+            "summary_id",
+            lambda s: s.response is not None,
+            "responded",
+            _summary_dict,
+            (
+                "Planner has not responded yet. Call wait_for_summary_response(summary_id) "
+                "to keep waiting."
+            ),
+        )
 
     @mcp.tool
     def submit_progress(summary: str) -> dict[str, Any]:
@@ -558,6 +672,9 @@ def register_tools(mcp, settings: Settings) -> None:
         you get status="pending" + summary_id — call wait_for_summary_response(summary_id)
         to keep waiting.
         """
+        err = _validate_text(summary, "summary", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             _touch_coder(session)
             mission = _active_mission(session)
