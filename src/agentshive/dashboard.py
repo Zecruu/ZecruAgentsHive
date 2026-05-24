@@ -12,8 +12,10 @@ AGENTSHIVE_API_KEY backs both — cookie signing key is derived from it via
 itsdangerous, so rotating the env var also invalidates every existing session.
 """
 
+import asyncio
 import hmac
 import importlib.resources
+import json
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -21,8 +23,10 @@ from typing import Any
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlmodel import Session, desc, select
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
+
+from . import dashboard_events
 
 from .config import Settings
 from .db import Message, Mission, Question, Summary, get_engine
@@ -430,6 +434,69 @@ def _make_send_handler(settings):
     return _make_write_handler(settings, action)
 
 
+def _make_events_handler(settings: Settings):
+    """SSE push channel — clients GET this once, the server holds the connection
+    open and ships a state envelope on every state change (and a keepalive comment
+    every 15s to prevent proxy idle-timeout).
+    """
+    KEEPALIVE_SECONDS = 15
+
+    async def events(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        # Capture the uvicorn event loop lazily on first SSE connect, so sync
+        # write paths can schedule queue puts onto it. Starlette 1.x dropped
+        # the on_startup hook in favor of lifespan; rather than wiring lifespan
+        # just for this, we grab the running loop here. The first subscriber
+        # primes it; broadcasts triggered before any subscriber connects
+        # silently no-op (no subscribers to wake anyway).
+        if dashboard_events._event_loop is None:
+            dashboard_events.register_loop(asyncio.get_running_loop())
+
+        sub_id, queue = dashboard_events.subscribe()
+
+        async def event_stream():
+            try:
+                # Initial state event — connected clients get the current snapshot
+                # immediately without waiting for the next mutation. Suggest a 3s
+                # reconnect backoff to the browser.
+                initial = _build_state_payload(settings)
+                yield f"retry: 3000\nevent: state\ndata: {json.dumps(initial)}\n\n".encode("utf-8")
+
+                while True:
+                    try:
+                        # Wait for either a broadcast sentinel or the keepalive timeout.
+                        await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_SECONDS)
+                        # Sentinel arrived — push current state.
+                        payload = _build_state_payload(settings)
+                        yield f"event: state\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+                    except asyncio.TimeoutError:
+                        # No event in KEEPALIVE_SECONDS — send an SSE comment to
+                        # keep the connection alive through proxy idle timeouts.
+                        yield b": keepalive\n\n"
+                    except (asyncio.CancelledError, GeneratorExit):
+                        # Client disconnected or server is shutting down.
+                        break
+            finally:
+                dashboard_events.unsubscribe(sub_id)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                # Disable proxy buffering for SSE — without this, some intermediate
+                # proxies (Railway included sometimes) hold bytes until the connection
+                # closes, defeating the whole point of a push channel.
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",  # nginx-family hint
+                "Connection": "keep-alive",
+            },
+        )
+
+    return events
+
+
 def _make_mark_done_handler(settings: Settings):
     async def handler(request: Request) -> Response:
         if not _require_dashboard_auth(request, settings):
@@ -468,3 +535,5 @@ def register_routes(app, settings: Settings, tool_names: list[str]) -> None:
     app.router.routes.append(Route("/api/dashboard/ack", _make_ack_handler(settings), methods=["POST"]))
     app.router.routes.append(Route("/api/dashboard/send", _make_send_handler(settings), methods=["POST"]))
     app.router.routes.append(Route("/api/dashboard/mark-done", _make_mark_done_handler(settings), methods=["POST"]))
+    # v1.6 SSE push channel
+    app.router.routes.append(Route("/api/dashboard/events", _make_events_handler(settings), methods=["GET"]))

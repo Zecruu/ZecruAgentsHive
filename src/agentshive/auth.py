@@ -27,6 +27,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         "/api/dashboard/ack",
         "/api/dashboard/send",
         "/api/dashboard/mark-done",
+        # v1.6 SSE push channel — dashboard handler enforces cookie-or-bearer auth.
+        "/api/dashboard/events",
     }
 
     def __init__(self, app, api_key: str):
