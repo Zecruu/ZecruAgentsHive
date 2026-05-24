@@ -1,3 +1,5 @@
+import hmac
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -23,6 +25,6 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not header.lower().startswith("bearer "):
             return JSONResponse({"error": "missing bearer token"}, status_code=401)
         token = header[7:].strip()
-        if token != self._api_key:
+        if not hmac.compare_digest(token.encode("utf-8"), self._api_key.encode("utf-8")):
             return JSONResponse({"error": "invalid bearer token"}, status_code=401)
         return await call_next(request)

@@ -192,6 +192,23 @@ def register_tools(mcp, settings: Settings) -> None:
                     return {"error": f"no question with id {question_id}"}
                 if q.answer is not None:
                     return {"status": "answered", **_question_dict(q)}
+                # The mission this question belongs to may have moved out from under us
+                # (Planner called create_mission again, or mark_mission_done). Surface the
+                # actual mission.status so the Coder can branch — without this, the Coder
+                # would block forever waiting for an answer that no Planner UI can deliver.
+                mission = session.get(Mission, q.mission_id)
+                if mission is not None and mission.status != "active":
+                    return {
+                        "status": mission.status,
+                        "question_id": question_id,
+                        "mission_id": q.mission_id,
+                        "message": (
+                            "Your mission is no longer active — fetch_mission to get the new "
+                            "spec and decide whether to restart."
+                            if mission.status == "superseded"
+                            else "Your mission is marked done — stop work."
+                        ),
+                    }
             if time.monotonic() >= deadline:
                 return {
                     "status": "pending",
@@ -245,6 +262,19 @@ def register_tools(mcp, settings: Settings) -> None:
                     return {"error": f"no summary with id {summary_id}"}
                 if s.response is not None:
                     return {"status": "responded", **_summary_dict(s)}
+                mission = session.get(Mission, s.mission_id)
+                if mission is not None and mission.status != "active":
+                    return {
+                        "status": mission.status,
+                        "summary_id": summary_id,
+                        "mission_id": s.mission_id,
+                        "message": (
+                            "Your mission is no longer active — fetch_mission to get the new "
+                            "spec and decide whether to restart."
+                            if mission.status == "superseded"
+                            else "Your mission is marked done — stop work."
+                        ),
+                    }
             if time.monotonic() >= deadline:
                 return {
                     "status": "pending",
@@ -285,19 +315,46 @@ def register_tools(mcp, settings: Settings) -> None:
         return _wait_for_summary(summary_id)
 
     @mcp.tool
-    def is_mission_done() -> dict[str, Any]:
-        """Check whether the Planner has marked the active mission as done.
+    def is_mission_done(mission_id: Optional[str] = None) -> dict[str, Any]:
+        """Check the status of a mission.
 
-        Returns {done: true, mission: {...}} once the Planner calls mark_mission_done.
-        While the mission is still active, returns {done: false, mission: {...}}.
+        Without an argument: backward-compatible behavior — reports on the latest applicable
+        mission (active first, else most-recently-done). Useful as a simple "are we shipped?"
+        check when the Coder only ever cares about the current top mission.
+
+        With mission_id: report on that specific mission. Use this when you're holding a
+        mission_id from an earlier fetch_mission / ask_planner / submit_progress and want
+        to know whether the mission you're actually working on is active, superseded by a
+        newer one, or done.
+
+        Returns: {done: bool, status: "active"|"done"|"superseded"|None, mission: dict|None}
+        - done is True ONLY when status == "done"
+        - status carries the literal mission.status so the Coder can branch correctly
+          (e.g., distinguish "Planner started a new mission, fetch_mission and restart"
+          from "Planner shipped this one, stop")
         """
         with Session(get_engine()) as session:
-            mission = _active_mission(session)
-            if mission is not None:
-                return {"done": False, "mission": _mission_dict(mission)}
+            if mission_id is not None:
+                m = session.get(Mission, mission_id)
+                if m is None:
+                    return {
+                        "done": False,
+                        "status": None,
+                        "mission": None,
+                        "error": f"no mission with id {mission_id}",
+                    }
+                return {
+                    "done": m.status == "done",
+                    "status": m.status,
+                    "mission": _mission_dict(m),
+                }
+
+            active = _active_mission(session)
+            if active is not None:
+                return {"done": False, "status": active.status, "mission": _mission_dict(active)}
             most_recent_done = session.exec(
                 select(Mission).where(Mission.status == "done").order_by(Mission.created_at.desc())
             ).first()
             if most_recent_done is not None:
-                return {"done": True, "mission": _mission_dict(most_recent_done)}
-            return {"done": False, "mission": None, "message": "No mission exists yet."}
+                return {"done": True, "status": "done", "mission": _mission_dict(most_recent_done)}
+            return {"done": False, "status": None, "mission": None, "message": "No mission exists yet."}
