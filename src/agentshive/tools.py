@@ -48,6 +48,12 @@ def _summary_dict(s: Summary) -> dict[str, Any]:
 
 
 def _message_dict(m: Message) -> dict[str, Any]:
+    # redelivery_count surface is 0-indexed (matches docstring: 0 = first delivery,
+    # positive = N readers saw this before you without acking). DB stays 1-indexed
+    # internally because writes are simpler that way; we subtract 1 here so callers
+    # see the semantic value. max(0, ...) handles the never-returned case where the
+    # DB column is still 0 from the default.
+    db_count = m.redelivery_count or 0
     return {
         "message_id": m.id,
         "mission_id": m.mission_id,
@@ -56,7 +62,7 @@ def _message_dict(m: Message) -> dict[str, Any]:
         "created_at": m.created_at.isoformat(),
         # delivered_at semantically means "acked_at" since v1.2 — see Message model docstring
         "delivered_at": m.delivered_at.isoformat() if m.delivered_at else None,
-        "redelivery_count": m.redelivery_count or 0,
+        "redelivery_count": max(0, db_count - 1),
     }
 
 

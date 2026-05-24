@@ -33,8 +33,9 @@ async def test_ack_required_no_auto_stamp():
             got = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 3}))
             assert got["message_id"] == sent["message_id"]
             assert got["delivered_at"] is None, f"expected unacked, got {got}"
-            assert got["redelivery_count"] == 1, f"expected 1, got {got}"
-            print(f"  [OK] returned unacked, redelivery_count=1")
+            # 0-indexed: 0 means "this is the first delivery, no predecessor saw it"
+            assert got["redelivery_count"] == 0, f"expected 0 on first delivery, got {got}"
+            print(f"  [OK] returned unacked, redelivery_count=0 (first delivery)")
 
 
 async def test_redeliver_on_crash():
@@ -48,8 +49,10 @@ async def test_redeliver_on_crash():
             r2 = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 3}))
             r3 = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 3}))
             assert r1["message_id"] == r2["message_id"] == r3["message_id"] == mid
-            assert (r1["redelivery_count"], r2["redelivery_count"], r3["redelivery_count"]) == (1, 2, 3)
-            print(f"  [OK] same msg returned 3 times, redelivery_count 1→2→3")
+            # 0-indexed surface: first delivery → 0, then 1 (one predecessor), then 2 (two)
+            assert (r1["redelivery_count"], r2["redelivery_count"], r3["redelivery_count"]) == (0, 1, 2), \
+                f"expected 0,1,2 got {(r1['redelivery_count'], r2['redelivery_count'], r3['redelivery_count'])}"
+            print(f"  [OK] same msg returned 3 times, redelivery_count 0→1→2 (predecessor count)")
             # Now ack
             await coder.call_tool("ack_message", {"message_id": mid})
             r4 = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 2}))
