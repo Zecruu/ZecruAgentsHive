@@ -111,6 +111,11 @@ def register_tools(mcp, settings: Settings) -> None:
         """List every question the Coder has asked that you have not yet answered.
 
         Returns questions for the currently-active mission, oldest first.
+
+        Transport note: list returns are wrapped by FastMCP's structured_content layer
+        under a "result" key in the MCP message envelope. Most clients unwrap this
+        automatically; if yours doesn't, look for {"result": [...]}. Prefer
+        wait_for_next_question for a push-style loop that returns one item at a time.
         """
         with Session(get_engine()) as session:
             mission = _active_mission(session)
@@ -141,7 +146,12 @@ def register_tools(mcp, settings: Settings) -> None:
 
     @mcp.tool
     def list_pending_summaries() -> list[dict[str, Any]]:
-        """List every progress summary the Coder has submitted that you have not yet responded to."""
+        """List every progress summary the Coder has submitted that you have not yet responded to.
+
+        Transport note: list returns are wrapped by FastMCP's structured_content layer
+        under a "result" key in the MCP message envelope. Most clients unwrap this
+        automatically. Prefer wait_for_next_summary for a push-style loop.
+        """
         with Session(get_engine()) as session:
             mission = _active_mission(session)
             if not mission:
