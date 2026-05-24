@@ -50,6 +50,27 @@ Hosted on Railway. Provision a Postgres plugin (auto-injects `DATABASE_URL`) and
 
 v1 uses a single shared bearer token (`AGENTSHIVE_API_KEY`). Both the Planner connector and the Coder MCP client must send `Authorization: Bearer <key>`. Multi-tenancy and per-user auth are deferred.
 
+## Dashboard (v1.4+)
+
+A read-only web view of the unified Planner / Coder state, served by the same Starlette app at:
+
+```
+https://<your-railway>.up.railway.app/dashboard
+```
+
+Sign in by pasting your `AGENTSHIVE_API_KEY` (same value as `Authorization: Bearer ...`). Session cookie is signed (the key derives from your API key, so rotating the env var auto-invalidates all sessions) and good for 12 hours.
+
+What you see, all on one page:
+
+- **Header card** — active mission name, status badge, Coder heartbeat (color-coded by freshness: <30s green, <60s yellow, >60s red, "not connected" gray), spec preview with expand/collapse, server version + tools catalog hash, logout button.
+- **Pending Questions** — questions the Coder is blocked on waiting for the Planner to answer.
+- **Pending Summaries** — progress summaries the Coder has submitted, awaiting your response.
+- **Messages** — two columns (Coder→Planner, Planner→Coder), with `unacked`/`acked` badges and a redelivery-count chip when applicable.
+
+Auto-refreshes every 3 seconds. Read-only in v1.4 — write actions (answer/respond/ack from the UI) ship in v1.5+.
+
+A status banner appears at the top if the browser loses connection to the server; it retries automatically and clears the banner on success.
+
 ## Troubleshooting: MCP client doesn't see new tools after a redeploy
 
 If you've redeployed AgentsHive (e.g., `railway up`) and your MCP client still doesn't show new tools you know shipped, this is a **client-side cache**, not a server bug.

@@ -5,6 +5,7 @@ from starlette.routing import Route
 
 from .auth import BearerAuthMiddleware
 from .config import load_settings
+from .dashboard import register_routes as register_dashboard_routes
 from .db import init_engine
 from .tools import register_tools
 
@@ -32,8 +33,28 @@ def build_app():
     app.router.routes.append(Route("/", health))
     app.router.routes.append(Route("/healthz", health))
 
+    # Dashboard routes (v1.4). Registered BEFORE BearerAuthMiddleware so the
+    # PUBLIC_PATHS list can let them through to dashboard._require_dashboard_auth,
+    # which handles cookie-or-bearer auth separately. The dashboard needs the
+    # current MCP tool name list for tools_catalog_hash — capture it now, after
+    # register_tools has run.
+    register_dashboard_routes(app, settings, _capture_tool_names(mcp))
+
     app.add_middleware(BearerAuthMiddleware, api_key=settings.api_key)
     return app, settings
+
+
+def _capture_tool_names(mcp) -> list[str]:
+    """Synchronously fetch the registered tool name list for dashboard hash computation.
+
+    mcp.list_tools() is async; we're called from sync build_app() before uvicorn's
+    event loop exists. Use asyncio.run on a fresh loop just for this one call.
+    """
+    import asyncio
+    tools = asyncio.run(mcp.list_tools())
+    if isinstance(tools, list):
+        return [t.name for t in tools]
+    return list(tools.keys())
 
 
 def main():
