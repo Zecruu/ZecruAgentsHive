@@ -49,3 +49,23 @@ Hosted on Railway. Provision a Postgres plugin (auto-injects `DATABASE_URL`) and
 ## Auth
 
 v1 uses a single shared bearer token (`AGENTSHIVE_API_KEY`). Both the Planner connector and the Coder MCP client must send `Authorization: Bearer <key>`. Multi-tenancy and per-user auth are deferred.
+
+## Troubleshooting: MCP client doesn't see new tools after a redeploy
+
+If you've redeployed AgentsHive (e.g., `railway up`) and your MCP client still doesn't show new tools you know shipped, this is a **client-side cache**, not a server bug.
+
+Two diagnostic tools (v1.3+):
+
+- `get_server_info()` — returns `server_version`, `tools_catalog_hash`, `started_at`. Pure read. If `tools_catalog_hash` differs from what your client cached, the catalog drifted.
+- `refresh_tool_catalog()` — emits a `notifications/tools/list_changed` MCP notification to your session. Spec-compliant clients respond by re-fetching the tool list automatically.
+
+**Recovery path:**
+
+1. Call `get_server_info` — note the `tools_catalog_hash` and `server_version`.
+2. If those don't match what you expect, call `refresh_tool_catalog`. Compliant clients refresh their tool list immediately.
+3. If your client still doesn't show new tools — it's caching aggressively across reconnects and is ignoring `tools/list_changed`. Manual fix: **disconnect and reconnect the MCP server in your client.**
+   - Claude Code: close the Claude Code app and reopen it (or run `claude mcp remove agentshive` then re-add).
+   - Claude.ai / Claude desktop connector: toggle the connector off in Settings → Connectors, then back on.
+   - ChatGPT/Codex connector: same toggle-off-toggle-on flow.
+
+This limitation is a property of how each MCP client implements its tool cache; the server emits the right signal but cannot force a non-cooperating client to refresh.

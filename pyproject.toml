@@ -1,6 +1,6 @@
 [project]
 name = "agentshive"
-version = "0.1.0"
+version = "1.3.0"
 description = "Zecru AgentsHive — MCP bridge so coder AIs (Claude Code, Codex CLI) ask planner AIs (Claude/Codex desktop & mobile) instead of stopping to ask the human."
 requires-python = ">=3.11"
 dependencies = [
