@@ -13,6 +13,7 @@ itsdangerous, so rotating the env var also invalidates every existing session.
 """
 
 import hmac
+import importlib.resources
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -27,13 +28,20 @@ from .config import Settings
 from .db import Message, Mission, Question, Summary, get_engine
 from .tools import (
     AGENTSHIVE_VERSION,
+    MAX_TEXT_LEN,
     SERVER_STARTED_AT,
     _active_mission,
     _compute_tools_catalog_hash,
+    _do_ack_message,
+    _do_answer_question,
+    _do_mark_mission_done,
+    _do_respond_to_summary,
+    _do_send_to_coder,
     _message_dict,
     _mission_dict,
     _question_dict,
     _summary_dict,
+    _validate_text,
 )
 
 
@@ -71,6 +79,40 @@ def _cookie_kwargs(request: Request) -> dict[str, Any]:
     }
 
 
+def _require_same_origin(request: Request) -> bool:
+    """CSRF defense — verify the request's Origin (or Referer) matches our host.
+
+    Belt-to-suspenders on top of the SameSite=Lax cookie. Browsers always send
+    Origin on POST requests, so:
+      - Origin present and matches our host  → allow (legitimate browser call)
+      - Origin present and mismatches        → 403 (cross-origin attack)
+      - Origin absent but Referer matches    → allow (older browser fallback)
+      - Both absent                          → allow (non-browser caller like curl/cli
+                                               with bearer auth — they don't send Origin)
+    """
+    our_host = (request.headers.get("host") or request.url.netloc or "").lower()
+    if not our_host:
+        return True  # we can't compare without knowing our own host; let auth gate
+
+    def _host_of(url: str) -> str:
+        # Cheap parse — avoid pulling in urllib for one-liner usage. Strip scheme,
+        # take up to first '/' or '?'. Lowercase.
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        for sep in ("/", "?", "#"):
+            if sep in url:
+                url = url.split(sep, 1)[0]
+        return url.lower()
+
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        return _host_of(origin) == our_host
+    referer = request.headers.get("referer", "").strip()
+    if referer:
+        return _host_of(referer) == our_host
+    return True  # no Origin AND no Referer = non-browser caller
+
+
 def _require_dashboard_auth(request: Request, settings: Settings) -> bool:
     """Return True if the request carries a valid bearer header OR a valid signed cookie."""
     # Bearer header path — same key as /mcp, constant-time compare.
@@ -91,281 +133,21 @@ def _require_dashboard_auth(request: Request, settings: Settings) -> bool:
         return False
 
 
-# ---------- HTML page ----------
-# Inline string per scope decision (v1.4 spec): one file holds the whole feature.
-# Will move to a templates/ file once the page grows past ~300 lines or starts needing
-# server-side substitution. For now it's a static SPA — all dynamic content is fetched
-# from /api/dashboard/state via JS.
+# ---------- HTML templates ----------
+# v1.5: moved from inline strings to src/agentshive/templates/{dashboard,login}.html.
+# Trigger conditions from v1.4 spec both fired (page > 500 lines AND write actions
+# being added). Loaded once at module import via importlib.resources, which works
+# identically for wheel-installed and editable installs.
 
-DASHBOARD_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AgentsHive Dashboard</title>
-<style>
-:root { color-scheme: dark; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-       background: #0e0f12; color: #d6d9e0; margin: 0; padding: 16px; }
-main { max-width: 1100px; margin: 0 auto; }
-.card { background: #16181d; border: 1px solid #232732; border-radius: 8px;
-        padding: 14px 16px; margin-bottom: 12px; }
-.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-.spread { justify-content: space-between; }
-h1 { font-size: 18px; margin: 0 0 4px 0; font-weight: 600; }
-h2 { font-size: 14px; margin: 0 0 8px 0; color: #9aa0ab; text-transform: uppercase; letter-spacing: 0.04em; }
-.badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
-.badge.active   { background: #1e3a2b; color: #6fdc9f; }
-.badge.done     { background: #2a2a3a; color: #8a8fa7; }
-.badge.superseded { background: #3a2a2a; color: #d09a8a; }
-.badge.none     { background: #2a2a3a; color: #6a6f7a; }
-.heartbeat { font-size: 12px; padding: 4px 10px; border-radius: 6px; font-variant-numeric: tabular-nums; }
-.heartbeat.fresh  { background: #122a1c; color: #6fdc9f; }
-.heartbeat.warm   { background: #2a2418; color: #e8c47a; }
-.heartbeat.stale  { background: #2a1818; color: #ff8a78; }
-.heartbeat.none   { background: #1a1c22; color: #6a6f7a; }
-small.dim { color: #6a6f7a; font-size: 11px; }
-.spec-preview { white-space: pre-wrap; color: #b0b6c2; font-size: 13px;
-                margin-top: 8px; line-height: 1.45; max-height: 60px; overflow: hidden;
-                transition: max-height 0.2s; }
-.spec-preview.expanded { max-height: 60vh; overflow: auto; }
-.toggle { font-size: 12px; color: #7aa9ff; cursor: pointer; user-select: none; margin-top: 4px; display: inline-block; }
-.panel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.panel-grid > div { background: #16181d; border: 1px solid #232732; border-radius: 8px; padding: 14px 16px; }
-.item { border-top: 1px solid #232732; padding: 10px 0; font-size: 13px; }
-.item:first-child { border-top: none; }
-.item .body { white-space: pre-wrap; word-wrap: break-word; color: #d6d9e0; }
-.item .meta { color: #6a6f7a; font-size: 11px; margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
-.empty { color: #6a6f7a; font-size: 13px; padding: 6px 0; }
-.badge.unacked { background: #2a2418; color: #e8c47a; }
-.badge.acked   { background: #1a2a1c; color: #6fdc9f; }
-.badge.redeliv { background: #3a2a2a; color: #d09a8a; }
-.banner { position: fixed; top: 0; left: 0; right: 0; background: #ff8a78; color: #200; padding: 8px;
-          text-align: center; font-weight: 600; z-index: 10; display: none; }
-.banner.show { display: block; }
-button { background: #232732; color: #d6d9e0; border: 1px solid #2c303a;
-         padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
-button:hover { background: #2c303a; }
-form { margin: 0; }
-.logout-form { display: inline; }
-</style>
-</head>
-<body>
-<div id="connlost" class="banner">Lost connection — retrying…</div>
-<main>
-  <div class="card" id="header">
-    <div class="row spread">
-      <div>
-        <div class="row" style="gap:8px;">
-          <h1 id="mission-name">…</h1>
-          <span id="mission-status" class="badge none">…</span>
-        </div>
-        <small class="dim" id="mission-meta">loading…</small>
-      </div>
-      <div class="row">
-        <span id="heartbeat" class="heartbeat none">…</span>
-        <form class="logout-form" method="post" action="/dashboard/logout">
-          <button type="submit">Logout</button>
-        </form>
-      </div>
-    </div>
-    <div id="spec-preview" class="spec-preview"></div>
-    <span class="toggle" id="spec-toggle" style="display:none;">Show full spec</span>
-    <div class="row" style="margin-top:8px;">
-      <small class="dim" id="server-info">server: …</small>
-    </div>
-  </div>
-
-  <div class="panel-grid">
-    <div>
-      <h2>Pending Questions</h2>
-      <div id="questions"><div class="empty">Loading…</div></div>
-    </div>
-    <div>
-      <h2>Pending Summaries</h2>
-      <div id="summaries"><div class="empty">Loading…</div></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Messages</h2>
-    <div class="panel-grid">
-      <div>
-        <h2 style="color:#7aa9ff;">Coder → Planner</h2>
-        <div id="msgs-c2p"><div class="empty">Loading…</div></div>
-      </div>
-      <div>
-        <h2 style="color:#7aa9ff;">Planner → Coder</h2>
-        <div id="msgs-p2c"><div class="empty">Loading…</div></div>
-      </div>
-    </div>
-  </div>
-</main>
-
-<script>
-const POLL_MS = 3000;
-const $ = (id) => document.getElementById(id);
-let specExpanded = false;
-let fullSpec = "";
-
-function ago(iso) {
-  if (!iso) return "";
-  const sec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
-  if (sec < 60)  return sec + "s ago";
-  if (sec < 3600) return Math.floor(sec/60) + "m ago";
-  if (sec < 86400) return Math.floor(sec/3600) + "h ago";
-  return Math.floor(sec/86400) + "d ago";
-}
-
-function escapeHtml(s) {
-  return String(s || "").replace(/[&<>"']/g, c => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"
-  }[c]));
-}
-
-function renderItem(body, metas) {
-  return `<div class="item"><div class="body">${escapeHtml(body)}</div>` +
-         `<div class="meta">${metas.join("")}</div></div>`;
-}
-
-function renderQuestions(qs) {
-  if (!qs.length) return `<div class="empty">No pending questions.</div>`;
-  return qs.map(q => renderItem(q.body, [
-    `<span>${ago(q.created_at)}</span>`,
-    `<small class="dim">id ${q.question_id.slice(0,8)}</small>`,
-  ])).join("");
-}
-
-function renderSummaries(ss) {
-  if (!ss.length) return `<div class="empty">No pending summaries.</div>`;
-  return ss.map(s => renderItem(s.body, [
-    `<span>${ago(s.created_at)}</span>`,
-    `<small class="dim">id ${s.summary_id.slice(0,8)}</small>`,
-  ])).join("");
-}
-
-function renderMessages(ms) {
-  if (!ms.length) return `<div class="empty">No messages.</div>`;
-  return ms.map(m => {
-    const ackBadge = m.delivered_at
-      ? `<span class="badge acked">acked</span>`
-      : `<span class="badge unacked">unacked</span>`;
-    const redeliv = (m.redelivery_count || 0) > 0
-      ? `<span class="badge redeliv">redelivered ×${m.redelivery_count}</span>`
-      : "";
-    return renderItem(m.body, [
-      `<span>${ago(m.created_at)}</span>`,
-      ackBadge, redeliv,
-    ]);
-  }).join("");
-}
-
-function renderHeartbeat(hb) {
-  const el = $("heartbeat");
-  if (!hb || hb.last_seen === null) {
-    el.className = "heartbeat none";
-    el.textContent = "Coder not connected";
-    return;
-  }
-  const sec = hb.freshness_seconds;
-  el.textContent = `Coder seen ${sec}s ago`;
-  if (sec < 30) el.className = "heartbeat fresh";
-  else if (sec < 60) el.className = "heartbeat warm";
-  else el.className = "heartbeat stale";
-}
-
-async function tick() {
-  try {
-    const r = await fetch("/api/dashboard/state");
-    if (r.status === 401) { location.href = "/dashboard/login"; return; }
-    if (!r.ok) throw new Error("status " + r.status);
-    $("connlost").classList.remove("show");
-    const s = await r.json();
-
-    const m = s.active_mission;
-    if (m) {
-      $("mission-name").textContent = m.name;
-      $("mission-status").textContent = m.status;
-      $("mission-status").className = "badge " + m.status;
-      $("mission-meta").textContent = `mission ${m.mission_id.slice(0,8)} · created ${ago(m.created_at)}`;
-      fullSpec = m.spec || "";
-      const preview = m.spec_preview || "";
-      $("spec-preview").textContent = specExpanded ? fullSpec : preview;
-      $("spec-toggle").style.display = fullSpec.length > preview.length ? "inline-block" : "none";
-      $("spec-toggle").textContent = specExpanded ? "Collapse" : "Show full spec";
-    } else {
-      $("mission-name").textContent = "No active mission";
-      $("mission-status").textContent = "none";
-      $("mission-status").className = "badge none";
-      $("mission-meta").textContent = "Planner has not created a mission yet.";
-      $("spec-preview").textContent = "";
-      $("spec-toggle").style.display = "none";
-    }
-    renderHeartbeat(s.coder_heartbeat);
-
-    $("server-info").textContent =
-      `server v${s.server_info.server_version} · catalog ${s.server_info.tools_catalog_hash} · up since ${ago(s.server_info.started_at)}`;
-
-    $("questions").innerHTML = renderQuestions(s.pending_questions || []);
-    $("summaries").innerHTML = renderSummaries(s.pending_summaries || []);
-    $("msgs-c2p").innerHTML = renderMessages((s.messages && s.messages.coder_to_planner) || []);
-    $("msgs-p2c").innerHTML = renderMessages((s.messages && s.messages.planner_to_coder) || []);
-  } catch (e) {
-    $("connlost").classList.add("show");
-  }
-}
-
-$("spec-toggle").addEventListener("click", () => {
-  specExpanded = !specExpanded;
-  $("spec-preview").classList.toggle("expanded", specExpanded);
-  $("spec-preview").textContent = specExpanded ? fullSpec : fullSpec.slice(0, 300);
-  $("spec-toggle").textContent = specExpanded ? "Collapse" : "Show full spec";
-});
-
-tick();
-setInterval(tick, POLL_MS);
-</script>
-</body>
-</html>
-"""
+def _load_template(name: str) -> str:
+    """Read a static HTML template shipped inside the agentshive.templates package."""
+    return (importlib.resources.files("agentshive.templates") / name).read_text(encoding="utf-8")
 
 
-LOGIN_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AgentsHive Dashboard — Login</title>
-<style>
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-       background: #0e0f12; color: #d6d9e0; margin: 0;
-       display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-.card { background: #16181d; border: 1px solid #232732; border-radius: 8px;
-        padding: 28px 32px; width: 360px; }
-h1 { font-size: 18px; margin: 0 0 16px 0; font-weight: 600; }
-label { display: block; font-size: 12px; color: #9aa0ab; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; }
-input { width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 14px;
-        background: #0e0f12; color: #d6d9e0; border: 1px solid #232732; border-radius: 6px;
-        font-family: ui-monospace, SFMono-Regular, monospace; }
-button { width: 100%; margin-top: 14px; padding: 10px 12px; background: #2a3a5a; color: #d6d9e0;
-         border: 1px solid #3a4a6a; border-radius: 6px; font-size: 14px; cursor: pointer; }
-button:hover { background: #3a4a6a; }
-.error { color: #ff8a78; margin-top: 12px; font-size: 13px; }
-.help { color: #6a6f7a; margin-top: 16px; font-size: 12px; line-height: 1.4; }
-</style>
-</head>
-<body>
-<form class="card" method="post" action="/dashboard/login">
-  <h1>AgentsHive Dashboard</h1>
-  <label for="api_key">API Key</label>
-  <input id="api_key" type="password" name="api_key" autofocus autocomplete="current-password" required>
-  <button type="submit">Sign in</button>
-  {error_block}
-  <div class="help">Paste the AGENTSHIVE_API_KEY env value. Session valid 12 hours.</div>
-</form>
-</body>
-</html>
-"""
+DASHBOARD_HTML = _load_template("dashboard.html")
+LOGIN_HTML = _load_template("login.html")
+
+
 
 
 def _render_login(error: str | None = None) -> str:
@@ -547,6 +329,125 @@ def _make_state(settings: Settings):
     return state
 
 
+# ---------- v1.5 write endpoints ----------
+# Each wraps a _do_<name> function from tools.py — single source of truth between
+# the MCP tool surface and this HTTP surface. The handlers do their own auth +
+# CSRF check + input parsing, then delegate.
+#
+# Status code policy:
+#   401 — no/bad auth
+#   403 — same-origin CSRF check failed
+#   400 — malformed JSON, missing required field, or input failed length validation
+#         (validation errors must be 400 so the UI knows to block submission)
+#   200 ok=True  — operation succeeded
+#   200 ok=False — business-state error (already answered, no active mission, etc.) —
+#                  these are valid responses, just not the happy path; UI displays inline
+#                  rather than treating as a hard failure
+
+
+def _is_validation_error(err_dict: dict) -> bool:
+    """True if a _do_<name> error came from _validate_text (vs. business-state)."""
+    msg = err_dict.get("error", "")
+    return ("must be a non-empty string" in msg) or ("exceeds maximum length" in msg)
+
+
+async def _read_json_body(request: Request):
+    """Return (body_dict, error_response) — exactly one is None."""
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse({"error": "malformed JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+    return body, None
+
+
+def _make_write_handler(settings: Settings, action):
+    """Wrap an _do_<name> action with the common auth+CSRF+JSON+delegate pattern.
+
+    `action(body: dict) -> (return_key: str, result_dict)` — the handler does the
+    rest. `return_key` is the dict key the caller wants on success
+    (e.g., "question" / "message" / "mission").
+    """
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        body, err_resp = await _read_json_body(request)
+        if err_resp is not None:
+            return err_resp
+        try:
+            return_key, result = action(body)
+        except _BadRequest as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        if "error" in result:
+            status = 400 if _is_validation_error(result) else 200
+            payload = {"ok": False, **result}
+            return JSONResponse(payload, status_code=status)
+        return JSONResponse({"ok": True, return_key: result}, status_code=200)
+    return handler
+
+
+class _BadRequest(Exception):
+    """Raised inside an `action` callable when the request body is missing required fields."""
+
+
+def _require_str(body: dict, key: str) -> str:
+    val = body.get(key)
+    if not isinstance(val, str) or not val:
+        raise _BadRequest(f"missing or empty required field '{key}'")
+    return val
+
+
+def _make_answer_handler(settings):
+    def action(body):
+        question_id = _require_str(body, "question_id")
+        answer = body.get("answer", "")
+        return "question", _do_answer_question(question_id, answer)
+    return _make_write_handler(settings, action)
+
+
+def _make_respond_handler(settings):
+    def action(body):
+        summary_id = _require_str(body, "summary_id")
+        response = body.get("response", "")
+        return "summary", _do_respond_to_summary(summary_id, response)
+    return _make_write_handler(settings, action)
+
+
+def _make_ack_handler(settings):
+    def action(body):
+        message_id = _require_str(body, "message_id")
+        return "message", _do_ack_message(message_id)
+    return _make_write_handler(settings, action)
+
+
+def _make_send_handler(settings):
+    def action(body):
+        msg_body = body.get("body", "")
+        return "message", _do_send_to_coder(msg_body)
+    return _make_write_handler(settings, action)
+
+
+def _make_mark_done_handler(settings: Settings):
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        # mark-done takes no body — but still tolerate {} JSON if sent
+        try:
+            await request.body()
+        except Exception:
+            pass
+        result = _do_mark_mission_done()
+        if "error" in result:
+            return JSONResponse({"ok": False, **result}, status_code=200)
+        return JSONResponse({"ok": True, "mission": result}, status_code=200)
+    return handler
+
+
 def register_routes(app, settings: Settings, tool_names: list[str]) -> None:
     """Mount dashboard routes onto the given Starlette app.
 
@@ -561,3 +462,9 @@ def register_routes(app, settings: Settings, tool_names: list[str]) -> None:
     app.router.routes.append(Route("/dashboard/logout", _make_logout(settings), methods=["POST"]))
     app.router.routes.append(Route("/dashboard", _make_dashboard(settings), methods=["GET"]))
     app.router.routes.append(Route("/api/dashboard/state", _make_state(settings), methods=["GET"]))
+    # v1.5 write endpoints
+    app.router.routes.append(Route("/api/dashboard/answer", _make_answer_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/respond", _make_respond_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/ack", _make_ack_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/send", _make_send_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/mark-done", _make_mark_done_handler(settings), methods=["POST"]))

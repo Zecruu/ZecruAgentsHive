@@ -20,3 +20,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentshive"]
+
+# Hatch's wheel target includes .py files by default; .html template files need
+# to be explicitly listed or they won't ship in the built artifact.
+[tool.hatch.build.targets.wheel.force-include]
+"src/agentshive/templates" = "agentshive/templates"
