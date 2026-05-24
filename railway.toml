@@ -2,6 +2,6 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python -m agentshive.main"
+startCommand = "python run.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5

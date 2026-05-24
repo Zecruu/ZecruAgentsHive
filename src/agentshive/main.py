@@ -9,7 +9,7 @@ from .db import init_engine
 from .tools import register_tools
 
 
-def _build_app():
+def build_app():
     settings = load_settings()
     init_engine(settings)
 
@@ -37,7 +37,7 @@ def _build_app():
 
 
 def main():
-    app, settings = _build_app()
+    app, settings = build_app()
     uvicorn.run(app, host="0.0.0.0", port=settings.port, log_level="info")
 
 
