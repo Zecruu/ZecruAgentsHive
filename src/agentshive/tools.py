@@ -155,6 +155,93 @@ def register_tools(mcp, settings: Settings) -> None:
             return _summary_dict(s)
 
     @mcp.tool
+    def wait_for_next_question(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Block until any unanswered question exists for the currently-active mission.
+
+        Use this instead of polling list_pending_questions in a loop. Mirrors the
+        Coder-side ask_planner blocking semantics from the Planner's side: call
+        once, the server blocks until a real item arrives.
+
+        On hit: returns the single matching question (same shape as one entry from
+        list_pending_questions). Pass `question_id` directly to answer_question.
+        Returns the OLDEST unanswered question — answer in arrival order.
+
+        On timeout: returns {status: "pending", message: ...}. The MCP transport
+        will time out the call before the configured server-side timeout in most
+        clients; just call wait_for_next_question again — there is no question_id
+        to track because we are waiting on "whatever shows up next," not a
+        specific one.
+
+        Supersede behavior: if the active mission changes mid-wait (someone
+        called create_mission), the new active mission's pending items become
+        eligible. You wait for whoever's active, never for a specific mission.
+
+        Args:
+            timeout_seconds: optional override for how long the server blocks before
+                returning "pending". Falls back to TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    q = session.exec(
+                        select(Question)
+                        .where(Question.mission_id == mission.id, Question.answer.is_(None))
+                        .order_by(Question.created_at)
+                    ).first()
+                    if q is not None:
+                        return _question_dict(q)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "pending",
+                    "message": "no questions yet — call wait_for_next_question again to keep waiting",
+                }
+            time.sleep(poll_interval)
+
+    @mcp.tool
+    def wait_for_next_summary(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Block until any progress summary awaiting your response exists for the active mission.
+
+        The summary-side companion to wait_for_next_question. Use instead of
+        polling list_pending_summaries.
+
+        On hit: returns the single oldest unresponded summary; pass summary_id
+        directly to respond_to_summary.
+
+        On timeout: returns {status: "pending", message: ...}. Call again to
+        keep waiting.
+
+        Supersede: same as wait_for_next_question — if the active mission
+        changes mid-wait, the new active mission's pending summaries become
+        eligible.
+
+        Args:
+            timeout_seconds: optional override for the server-side block.
+                Falls back to TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    s = session.exec(
+                        select(Summary)
+                        .where(Summary.mission_id == mission.id, Summary.response.is_(None))
+                        .order_by(Summary.created_at)
+                    ).first()
+                    if s is not None:
+                        return _summary_dict(s)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "pending",
+                    "message": "no summaries yet — call wait_for_next_summary again to keep waiting",
+                }
+            time.sleep(poll_interval)
+
+    @mcp.tool
     def mark_mission_done() -> dict[str, Any]:
         """Mark the active mission as done. The Coder will see this on its next is_mission_done() check and stop."""
         with Session(get_engine()) as session:
