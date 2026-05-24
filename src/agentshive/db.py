@@ -127,6 +127,30 @@ def _apply_inline_migrations(engine: Engine) -> None:
                     continue
                 conn.execute(text(f"ALTER TABLE message ADD COLUMN {col_name} {col_def}"))
 
+    # v1.2 Feature 2: enforce "at most one active mission" at the DB level via partial unique
+    # index. Belt to the supersede-and-retry suspenders in create_mission — survives app bugs.
+    # Works on both SQLite (3.8+) and Postgres. Pre-cleanup first in case an old deployment
+    # somehow ended up with multiple active rows (shouldn't happen with the supersede logic
+    # always running, but be defensive — the CREATE INDEX would fail otherwise).
+    with engine.begin() as conn:
+        # Defensive cleanup: keep newest active, mark older actives 'superseded'
+        rows = conn.execute(
+            text("SELECT id FROM mission WHERE status='active' ORDER BY created_at DESC")
+        ).fetchall()
+        if len(rows) > 1:
+            ids_to_demote = [r[0] for r in rows[1:]]
+            for mid in ids_to_demote:
+                conn.execute(
+                    text("UPDATE mission SET status='superseded' WHERE id = :id"),
+                    {"id": mid},
+                )
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS one_active_mission "
+                "ON mission (status) WHERE status = 'active'"
+            )
+        )
+
 
 def get_engine() -> Engine:
     if _engine is None:

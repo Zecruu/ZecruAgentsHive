@@ -2,6 +2,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from .config import Settings
@@ -135,16 +136,36 @@ def register_tools(mcp, settings: Settings) -> None:
         err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
         if err:
             return err
-        with Session(get_engine()) as session:
-            current = _active_mission(session)
-            if current:
-                current.status = "superseded"
-                session.add(current)
-            mission = Mission(name=name, spec=spec, status="active")
-            session.add(mission)
-            session.commit()
-            session.refresh(mission)
-            return _mission_dict(mission)
+        # Belt-and-suspenders against concurrent create_mission races on Postgres:
+        # the partial unique index `one_active_mission ON mission(status) WHERE
+        # status='active'` enforces the invariant at the DB level. On collision we
+        # treat the racing winner as a "supersede target" and retry once — semantically
+        # faithful to create_mission's contract ("new mission, prior is superseded").
+        # One retry only: sustained contention should surface as an error so the caller
+        # decides what to do instead of us spinning.
+        for attempt in range(2):
+            try:
+                with Session(get_engine()) as session:
+                    current = _active_mission(session)
+                    if current:
+                        current.status = "superseded"
+                        session.add(current)
+                    mission = Mission(name=name, spec=spec, status="active")
+                    session.add(mission)
+                    session.commit()
+                    session.refresh(mission)
+                    return _mission_dict(mission)
+            except IntegrityError:
+                if attempt == 0:
+                    continue
+                return {
+                    "error": (
+                        "create_mission contention: another concurrent creator beat us "
+                        "twice in a row. The active mission belongs to someone else right "
+                        "now — call get_active_mission to see it, then create_mission again "
+                        "if you still want to supersede."
+                    )
+                }
 
     @mcp.tool
     def get_active_mission() -> dict[str, Any]:
