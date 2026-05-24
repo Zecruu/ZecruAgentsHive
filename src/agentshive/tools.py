@@ -5,7 +5,7 @@ from typing import Any, Optional
 from sqlmodel import Session, select
 
 from .config import Settings
-from .db import Mission, Question, Summary, get_engine
+from .db import Message, Mission, Question, Summary, get_engine
 
 
 def _utcnow() -> datetime:
@@ -20,6 +20,7 @@ def _mission_dict(m: Mission) -> dict[str, Any]:
         "status": m.status,
         "created_at": m.created_at.isoformat(),
         "done_at": m.done_at.isoformat() if m.done_at else None,
+        "coder_last_seen": m.coder_last_seen.isoformat() if m.coder_last_seen else None,
     }
 
 
@@ -45,10 +46,38 @@ def _summary_dict(s: Summary) -> dict[str, Any]:
     }
 
 
+def _message_dict(m: Message) -> dict[str, Any]:
+    return {
+        "message_id": m.id,
+        "mission_id": m.mission_id,
+        "direction": m.direction,
+        "body": m.body,
+        "created_at": m.created_at.isoformat(),
+        "delivered_at": m.delivered_at.isoformat() if m.delivered_at else None,
+    }
+
+
 def _active_mission(session: Session) -> Optional[Mission]:
     return session.exec(
         select(Mission).where(Mission.status == "active").order_by(Mission.created_at.desc())
     ).first()
+
+
+def _touch_coder(session: Session) -> None:
+    """Update the active mission's coder_last_seen to now.
+
+    Called once per Coder-side tool invocation so the Planner can see whether the
+    Coder process is alive without an explicit ping protocol. Called at the START
+    of a tool, not inside per-iteration polling loops — one touch per call is the
+    intended granularity ("the Coder placed this tool call N seconds ago").
+
+    No-op if no mission is active.
+    """
+    mission = _active_mission(session)
+    if mission is not None:
+        mission.coder_last_seen = _utcnow()
+        session.add(mission)
+        session.commit()
 
 
 def register_tools(mcp, settings: Settings) -> None:
@@ -93,6 +122,11 @@ def register_tools(mcp, settings: Settings) -> None:
         """List every question the Coder has asked that you have not yet answered.
 
         Returns questions for the currently-active mission, oldest first.
+
+        Transport note: list returns are wrapped by FastMCP's structured_content layer
+        under a "result" key in the MCP message envelope. Most clients unwrap this
+        automatically; if yours doesn't, look for {"result": [...]}. Prefer
+        wait_for_next_question for a push-style loop that returns one item at a time.
         """
         with Session(get_engine()) as session:
             mission = _active_mission(session)
@@ -123,7 +157,12 @@ def register_tools(mcp, settings: Settings) -> None:
 
     @mcp.tool
     def list_pending_summaries() -> list[dict[str, Any]]:
-        """List every progress summary the Coder has submitted that you have not yet responded to."""
+        """List every progress summary the Coder has submitted that you have not yet responded to.
+
+        Transport note: list returns are wrapped by FastMCP's structured_content layer
+        under a "result" key in the MCP message envelope. Most clients unwrap this
+        automatically. Prefer wait_for_next_summary for a push-style loop.
+        """
         with Session(get_engine()) as session:
             mission = _active_mission(session)
             if not mission:
@@ -155,6 +194,222 @@ def register_tools(mcp, settings: Settings) -> None:
             return _summary_dict(s)
 
     @mcp.tool
+    def wait_for_next_question(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Block until any unanswered question exists for the currently-active mission.
+
+        Use this instead of polling list_pending_questions in a loop. Mirrors the
+        Coder-side ask_planner blocking semantics from the Planner's side: call
+        once, the server blocks until a real item arrives.
+
+        On hit: returns the single matching question (same shape as one entry from
+        list_pending_questions). Pass `question_id` directly to answer_question.
+        Returns the OLDEST unanswered question — answer in arrival order.
+
+        On timeout: returns {status: "pending", message: ...}. The MCP transport
+        will time out the call before the configured server-side timeout in most
+        clients; just call wait_for_next_question again — there is no question_id
+        to track because we are waiting on "whatever shows up next," not a
+        specific one.
+
+        Supersede behavior: if the active mission changes mid-wait (someone
+        called create_mission), the new active mission's pending items become
+        eligible. You wait for whoever's active, never for a specific mission.
+
+        Args:
+            timeout_seconds: optional override for how long the server blocks before
+                returning "pending". Falls back to TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    q = session.exec(
+                        select(Question)
+                        .where(Question.mission_id == mission.id, Question.answer.is_(None))
+                        .order_by(Question.created_at)
+                    ).first()
+                    if q is not None:
+                        return _question_dict(q)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "pending",
+                    "message": "no questions yet — call wait_for_next_question again to keep waiting",
+                }
+            time.sleep(poll_interval)
+
+    @mcp.tool
+    def wait_for_next_summary(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Block until any progress summary awaiting your response exists for the active mission.
+
+        The summary-side companion to wait_for_next_question. Use instead of
+        polling list_pending_summaries.
+
+        On hit: returns the single oldest unresponded summary; pass summary_id
+        directly to respond_to_summary.
+
+        On timeout: returns {status: "pending", message: ...}. Call again to
+        keep waiting.
+
+        Supersede: same as wait_for_next_question — if the active mission
+        changes mid-wait, the new active mission's pending summaries become
+        eligible.
+
+        Args:
+            timeout_seconds: optional override for the server-side block.
+                Falls back to TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    s = session.exec(
+                        select(Summary)
+                        .where(Summary.mission_id == mission.id, Summary.response.is_(None))
+                        .order_by(Summary.created_at)
+                    ).first()
+                    if s is not None:
+                        return _summary_dict(s)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "pending",
+                    "message": "no summaries yet — call wait_for_next_summary again to keep waiting",
+                }
+            time.sleep(poll_interval)
+
+    @mcp.tool
+    def send_to_coder(body: str) -> dict[str, Any]:
+        """Planner-side: send a free-form message TO the Coder. Fire-and-forget.
+
+        Use this for casual "fyi…" / "while you're at it…" / "I noticed X" updates that
+        don't need a structured response. The Coder reads via wait_for_planner_message().
+        For structured Q&A or progress review, use answer_question / respond_to_summary
+        as before — this is the chat-style channel, not a replacement.
+
+        Inserts a Message addressed to the Coder against the currently-active mission.
+        Returns the message_id immediately; does NOT block.
+        """
+        with Session(get_engine()) as session:
+            mission = _active_mission(session)
+            if mission is None:
+                return {"error": "no active mission — cannot send"}
+            m = Message(mission_id=mission.id, direction="planner_to_coder", body=body)
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+            return _message_dict(m)
+
+    @mcp.tool
+    def wait_for_coder_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Planner-side: block until an undelivered Coder→Planner message exists for the active mission.
+
+        Returns the OLDEST undelivered message; marks delivered_at on return so the next
+        call gets the next one. Use in a loop to drain a backlog, or just for a single
+        push-style receive.
+
+        On timeout: {status: "pending", message: ...}. Call again to keep waiting.
+
+        Args:
+            timeout_seconds: optional override for the server-side block. Falls back to
+                TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    m = session.exec(
+                        select(Message)
+                        .where(
+                            Message.mission_id == mission.id,
+                            Message.direction == "coder_to_planner",
+                            Message.delivered_at.is_(None),
+                        )
+                        .order_by(Message.created_at)
+                    ).first()
+                    if m is not None:
+                        m.delivered_at = _utcnow()
+                        session.add(m)
+                        session.commit()
+                        session.refresh(m)
+                        return _message_dict(m)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "pending",
+                    "message": "no messages yet — call wait_for_coder_message again to keep waiting",
+                }
+            time.sleep(poll_interval)
+
+    @mcp.tool
+    def send_to_planner(body: str) -> dict[str, Any]:
+        """Coder-side: send a free-form message TO the Planner. Fire-and-forget.
+
+        Use this for "fyi…" / "I made a small tangential decision" / "here's an
+        observation about AgentsHive itself" updates that don't warrant a full
+        submit_progress checkpoint. The Planner reads via wait_for_coder_message().
+
+        Inserts a Message addressed to the Planner against the active mission. Also
+        bumps the Coder heartbeat. Returns the message_id immediately; does NOT block.
+        """
+        with Session(get_engine()) as session:
+            _touch_coder(session)
+            mission = _active_mission(session)
+            if mission is None:
+                return {"error": "no active mission — cannot send"}
+            m = Message(mission_id=mission.id, direction="coder_to_planner", body=body)
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+            return _message_dict(m)
+
+    @mcp.tool
+    def wait_for_planner_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Coder-side: block until an undelivered Planner→Coder message exists for the active mission.
+
+        Returns the OLDEST undelivered message; marks delivered_at on return. Also bumps
+        the Coder heartbeat (single touch on entry, not per poll iteration).
+
+        On timeout: {status: "pending", message: ...}. Call again to keep waiting.
+
+        Args:
+            timeout_seconds: optional override for the server-side block. Falls back to
+                TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        with Session(get_engine()) as session:
+            _touch_coder(session)
+        block_for = timeout_seconds if timeout_seconds is not None else block_timeout
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                mission = _active_mission(session)
+                if mission is not None:
+                    m = session.exec(
+                        select(Message)
+                        .where(
+                            Message.mission_id == mission.id,
+                            Message.direction == "planner_to_coder",
+                            Message.delivered_at.is_(None),
+                        )
+                        .order_by(Message.created_at)
+                    ).first()
+                    if m is not None:
+                        m.delivered_at = _utcnow()
+                        session.add(m)
+                        session.commit()
+                        session.refresh(m)
+                        return _message_dict(m)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "pending",
+                    "message": "no messages yet — call wait_for_planner_message again to keep waiting",
+                }
+            time.sleep(poll_interval)
+
+    @mcp.tool
     def mark_mission_done() -> dict[str, Any]:
         """Mark the active mission as done. The Coder will see this on its next is_mission_done() check and stop."""
         with Session(get_engine()) as session:
@@ -178,6 +433,7 @@ def register_tools(mcp, settings: Settings) -> None:
         the Planner has not created one yet — wait or stop.
         """
         with Session(get_engine()) as session:
+            _touch_coder(session)
             mission = _active_mission(session)
             if mission is None:
                 return {"mission": None, "message": "No active mission. The Planner has not started one yet."}
@@ -229,11 +485,13 @@ def register_tools(mcp, settings: Settings) -> None:
         your human substitute.
 
         Behavior: this call blocks until the Planner answers, up to an internal timeout
-        (~50s by default). If the timeout is hit before an answer arrives, you get a
-        {status: "pending", question_id: ...} response — call wait_for_answer(question_id)
-        repeatedly until you get a real answer. Do NOT treat 'pending' as failure.
+        (~4 minutes by default; controlled by TOOL_BLOCK_TIMEOUT_SECONDS). If the timeout
+        is hit before an answer arrives, you get a {status: "pending", question_id: ...}
+        response — call wait_for_answer(question_id) repeatedly until you get a real
+        answer. Do NOT treat 'pending' as failure.
         """
         with Session(get_engine()) as session:
+            _touch_coder(session)
             mission = _active_mission(session)
             if mission is None:
                 return {"error": "no active mission — cannot ask"}
@@ -251,6 +509,8 @@ def register_tools(mcp, settings: Settings) -> None:
         Use this when ask_planner returned status="pending" (the MCP transport timed out
         before the Planner answered). Keep calling until you get status="answered".
         """
+        with Session(get_engine()) as session:
+            _touch_coder(session)
         return _wait_for_question(question_id)
 
     def _wait_for_summary(summary_id: str) -> dict[str, Any]:
@@ -299,6 +559,7 @@ def register_tools(mcp, settings: Settings) -> None:
         to keep waiting.
         """
         with Session(get_engine()) as session:
+            _touch_coder(session)
             mission = _active_mission(session)
             if mission is None:
                 return {"error": "no active mission — cannot submit progress"}
@@ -312,6 +573,8 @@ def register_tools(mcp, settings: Settings) -> None:
     @mcp.tool
     def wait_for_summary_response(summary_id: str) -> dict[str, Any]:
         """Continue waiting for the Planner to respond to a previously-submitted summary."""
+        with Session(get_engine()) as session:
+            _touch_coder(session)
         return _wait_for_summary(summary_id)
 
     @mcp.tool
@@ -334,6 +597,7 @@ def register_tools(mcp, settings: Settings) -> None:
           from "Planner shipped this one, stop")
         """
         with Session(get_engine()) as session:
+            _touch_coder(session)
             if mission_id is not None:
                 m = session.get(Mission, mission_id)
                 if m is None:

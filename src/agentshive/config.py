@@ -32,7 +32,11 @@ def load_settings() -> Settings:
     )
     port = int(os.environ.get("PORT", "8000"))
     poll_interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
-    tool_block_timeout = float(os.environ.get("TOOL_BLOCK_TIMEOUT_SECONDS", "50"))
+    # 240s (4 min) by default. Tools long-poll for up to this duration before returning
+    # a {status: "pending"} sentinel. The bigger this is, the fewer round-trips a real
+    # Coder/Planner has to make against an MCP transport whose own timeout is usually
+    # higher (Claude Code allows several minutes). Keep below your MCP client's timeout.
+    tool_block_timeout = float(os.environ.get("TOOL_BLOCK_TIMEOUT_SECONDS", "240"))
     return Settings(
         api_key=api_key,
         database_url=database_url,
