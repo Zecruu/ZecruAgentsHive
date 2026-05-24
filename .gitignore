@@ -9,6 +9,7 @@ venv/
 *.sqlite
 *.sqlite3
 .DS_Store
+.claude/
 dist/
 build/
 .ruff_cache/
