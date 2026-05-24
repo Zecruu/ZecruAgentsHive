@@ -15,6 +15,7 @@ main { max-width: 1100px; margin: 0 auto; }
 .spread { justify-content: space-between; }
 h1 { font-size: 18px; margin: 0 0 4px 0; font-weight: 600; }
 h2 { font-size: 14px; margin: 0 0 8px 0; color: #9aa0ab; text-transform: uppercase; letter-spacing: 0.04em; }
+h2.panel-title { display: flex; justify-content: space-between; align-items: center; }
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
 .badge.active   { background: #1e3a2b; color: #6fdc9f; }
 .badge.done     { background: #2a2a3a; color: #8a8fa7; }
@@ -36,7 +37,7 @@ small.dim { color: #6a6f7a; font-size: 11px; }
 .item { border-top: 1px solid #232732; padding: 10px 0; font-size: 13px; }
 .item:first-child { border-top: none; }
 .item .body { white-space: pre-wrap; word-wrap: break-word; color: #d6d9e0; }
-.item .meta { color: #6a6f7a; font-size: 11px; margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
+.item .meta { color: #6a6f7a; font-size: 11px; margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .empty { color: #6a6f7a; font-size: 13px; padding: 6px 0; }
 .badge.unacked { background: #2a2418; color: #e8c47a; }
 .badge.acked   { background: #1a2a1c; color: #6fdc9f; }
@@ -47,8 +48,24 @@ small.dim { color: #6a6f7a; font-size: 11px; }
 button { background: #232732; color: #d6d9e0; border: 1px solid #2c303a;
          padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
 button:hover { background: #2c303a; }
+button:disabled { opacity: 0.55; cursor: wait; }
+button.primary { background: #2a3a5a; border-color: #3a4a6a; }
+button.primary:hover { background: #3a4a6a; }
+button.danger { background: #3a2222; border-color: #4a2828; color: #e89a8a; }
+button.danger:hover { background: #4a2828; }
+button.ship   { background: #1f3a28; border-color: #2c4a35; color: #6fdc9f; }
+button.ship:hover { background: #2c4a35; }
 form { margin: 0; }
 .logout-form { display: inline; }
+.actions { margin-top: 6px; display: flex; gap: 6px; }
+textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 10px;
+           background: #0e0f12; color: #d6d9e0; border: 1px solid #232732; border-radius: 6px;
+           font-family: inherit; font-size: 13px; resize: vertical; }
+.inline-form { margin-top: 8px; }
+.inline-form .actions { margin-top: 6px; }
+.inline-error { color: #ff8a78; font-size: 12px; margin-top: 4px; }
+.stale-note   { background: #2a2418; color: #e8c47a; font-size: 12px;
+                padding: 6px 10px; border-radius: 4px; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -60,6 +77,7 @@ form { margin: 0; }
         <div class="row" style="gap:8px;">
           <h1 id="mission-name">…</h1>
           <span id="mission-status" class="badge none">…</span>
+          <button id="btn-mark-done" class="danger" style="display:none;" onclick="doMarkDone()">Mark mission DONE</button>
         </div>
         <small class="dim" id="mission-meta">loading…</small>
       </div>
@@ -92,11 +110,17 @@ form { margin: 0; }
     <h2>Messages</h2>
     <div class="panel-grid">
       <div>
-        <h2 style="color:#7aa9ff;">Coder → Planner</h2>
+        <h2 class="panel-title" style="color:#7aa9ff;">
+          <span>Coder → Planner</span>
+        </h2>
         <div id="msgs-c2p"><div class="empty">Loading…</div></div>
       </div>
       <div>
-        <h2 style="color:#7aa9ff;">Planner → Coder</h2>
+        <h2 class="panel-title" style="color:#7aa9ff;">
+          <span>Planner → Coder</span>
+          <button onclick="openSendForm()">+ Send</button>
+        </h2>
+        <div id="send-form-slot"></div>
         <div id="msgs-p2c"><div class="empty">Loading…</div></div>
       </div>
     </div>
@@ -108,6 +132,9 @@ const POLL_MS = 3000;
 const $ = (id) => document.getElementById(id);
 let specExpanded = false;
 let fullSpec = "";
+// Track open inline forms so competing-actor checks know what to scan.
+// shape: openForms = { "answer:<question_id>": true, "respond:<summary_id>": true, "send": true }
+const openForms = Object.create(null);
 
 function ago(iso) {
   if (!iso) return "";
@@ -120,43 +147,83 @@ function ago(iso) {
 
 function escapeHtml(s) {
   return String(s || "").replace(/[&<>"']/g, c => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"
+    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
   }[c]));
 }
 
-function renderItem(body, metas) {
+async function postJSON(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body || {}),
+    credentials: "same-origin",
+  });
+  let data = null;
+  try { data = await r.json(); } catch (_) {}
+  return { status: r.status, data };
+}
+
+function showInlineError(slotId, msg) {
+  const el = $(slotId);
+  if (el) el.innerHTML = `<div class="inline-error">${escapeHtml(msg)}</div>`;
+}
+
+function renderItem(body, metas, extra) {
   return `<div class="item"><div class="body">${escapeHtml(body)}</div>` +
-         `<div class="meta">${metas.join("")}</div></div>`;
+         `<div class="meta">${metas.join("")}</div>` +
+         (extra || "") +
+         `</div>`;
+}
+
+function actionButtons(buttons) {
+  return `<div class="actions">${buttons.join("")}</div>`;
 }
 
 function renderQuestions(qs) {
   if (!qs.length) return `<div class="empty">No pending questions.</div>`;
-  return qs.map(q => renderItem(q.body, [
-    `<span>${ago(q.created_at)}</span>`,
-    `<small class="dim">id ${q.question_id.slice(0,8)}</small>`,
-  ])).join("");
+  return qs.map(q => {
+    const id = q.question_id;
+    const formSlot = `<div id="form-answer-${id}"></div>`;
+    return renderItem(q.body, [
+      `<span>${ago(q.created_at)}</span>`,
+      `<small class="dim">id ${id.slice(0,8)}</small>`,
+    ], actionButtons([
+      `<button onclick="openAnswerForm('${id}')">Answer</button>`
+    ]) + formSlot);
+  }).join("");
 }
 
 function renderSummaries(ss) {
   if (!ss.length) return `<div class="empty">No pending summaries.</div>`;
-  return ss.map(s => renderItem(s.body, [
-    `<span>${ago(s.created_at)}</span>`,
-    `<small class="dim">id ${s.summary_id.slice(0,8)}</small>`,
-  ])).join("");
+  return ss.map(s => {
+    const id = s.summary_id;
+    const formSlot = `<div id="form-respond-${id}"></div>`;
+    return renderItem(s.body, [
+      `<span>${ago(s.created_at)}</span>`,
+      `<small class="dim">id ${id.slice(0,8)}</small>`,
+    ], actionButtons([
+      `<button onclick="openRespondForm('${id}')">Respond</button>`,
+      `<button class="ship" onclick="doShipIt('${id}')">Ship it ✓</button>`,
+    ]) + formSlot);
+  }).join("");
 }
 
 function renderMessages(ms) {
   if (!ms.length) return `<div class="empty">No messages.</div>`;
   return ms.map(m => {
+    const id = m.message_id;
     const ackBadge = m.delivered_at
       ? `<span class="badge acked">acked</span>`
       : `<span class="badge unacked">unacked</span>`;
     const redeliv = (m.redelivery_count || 0) > 0
       ? `<span class="badge redeliv">redelivered ×${m.redelivery_count}</span>`
       : "";
+    const ackBtn = m.delivered_at
+      ? ""
+      : `<button onclick="doAck('${id}', this)">Ack</button>`;
     return renderItem(m.body, [
       `<span>${ago(m.created_at)}</span>`,
-      ackBadge, redeliv,
+      ackBadge, redeliv, ackBtn,
     ]);
   }).join("");
 }
@@ -175,9 +242,164 @@ function renderHeartbeat(hb) {
   else el.className = "heartbeat stale";
 }
 
+// ---------- Inline form openers ----------
+
+function openAnswerForm(qid) {
+  const slot = $(`form-answer-${qid}`);
+  if (!slot || slot.dataset.open === "1") return;
+  slot.dataset.open = "1";
+  openForms["answer:" + qid] = true;
+  slot.innerHTML = `
+    <div class="inline-form">
+      <textarea id="ta-answer-${qid}" placeholder="Answer to the Coder…" autofocus></textarea>
+      <div class="actions">
+        <button class="primary" onclick="submitAnswer('${qid}')">Submit</button>
+        <button onclick="closeAnswerForm('${qid}')">Cancel</button>
+      </div>
+      <div id="err-answer-${qid}"></div>
+    </div>`;
+  setTimeout(() => $(`ta-answer-${qid}`)?.focus(), 0);
+}
+function closeAnswerForm(qid) {
+  const slot = $(`form-answer-${qid}`);
+  if (slot) { slot.dataset.open = ""; slot.innerHTML = ""; }
+  delete openForms["answer:" + qid];
+}
+async function submitAnswer(qid) {
+  const text = $(`ta-answer-${qid}`)?.value || "";
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  const { status, data } = await postJSON("/api/dashboard/answer", { question_id: qid, answer: text });
+  if (status === 200 && data?.ok) {
+    closeAnswerForm(qid);
+    tick();
+    return;
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "Submit"; }
+  showInlineError(`err-answer-${qid}`, data?.error || `request failed (${status})`);
+}
+
+function openRespondForm(sid) {
+  const slot = $(`form-respond-${sid}`);
+  if (!slot || slot.dataset.open === "1") return;
+  slot.dataset.open = "1";
+  openForms["respond:" + sid] = true;
+  slot.innerHTML = `
+    <div class="inline-form">
+      <textarea id="ta-respond-${sid}" placeholder="Direction, request changes, or 'continue'…" autofocus></textarea>
+      <div class="actions">
+        <button class="primary" onclick="submitRespond('${sid}')">Submit</button>
+        <button onclick="closeRespondForm('${sid}')">Cancel</button>
+      </div>
+      <div id="err-respond-${sid}"></div>
+    </div>`;
+  setTimeout(() => $(`ta-respond-${sid}`)?.focus(), 0);
+}
+function closeRespondForm(sid) {
+  const slot = $(`form-respond-${sid}`);
+  if (slot) { slot.dataset.open = ""; slot.innerHTML = ""; }
+  delete openForms["respond:" + sid];
+}
+async function submitRespond(sid) {
+  const text = $(`ta-respond-${sid}`)?.value || "";
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  const { status, data } = await postJSON("/api/dashboard/respond", { summary_id: sid, response: text });
+  if (status === 200 && data?.ok) {
+    closeRespondForm(sid);
+    tick();
+    return;
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "Submit"; }
+  showInlineError(`err-respond-${sid}`, data?.error || `request failed (${status})`);
+}
+
+async function doShipIt(sid) {
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  const { status, data } = await postJSON("/api/dashboard/respond", { summary_id: sid, response: "Ship it." });
+  if (status === 200 && data?.ok) { tick(); return; }
+  if (btn) { btn.disabled = false; btn.textContent = "Ship it ✓"; }
+  alert(data?.error || `Ship it failed (${status})`);
+}
+
+async function doAck(mid, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  const { status, data } = await postJSON("/api/dashboard/ack", { message_id: mid });
+  if (status === 200 && data?.ok) { tick(); return; }
+  if (btn) { btn.disabled = false; btn.textContent = "Ack"; }
+  alert(data?.error || `Ack failed (${status})`);
+}
+
+function openSendForm() {
+  const slot = $("send-form-slot");
+  if (!slot || slot.dataset.open === "1") return;
+  slot.dataset.open = "1";
+  openForms["send"] = true;
+  slot.innerHTML = `
+    <div class="inline-form">
+      <textarea id="ta-send" placeholder="Send a note to the Coder…" autofocus></textarea>
+      <div class="actions">
+        <button class="primary" onclick="submitSend()">Send</button>
+        <button onclick="closeSendForm()">Cancel</button>
+      </div>
+      <div id="err-send"></div>
+    </div>`;
+  setTimeout(() => $("ta-send")?.focus(), 0);
+}
+function closeSendForm() {
+  const slot = $("send-form-slot");
+  if (slot) { slot.dataset.open = ""; slot.innerHTML = ""; }
+  delete openForms["send"];
+}
+async function submitSend() {
+  const text = $("ta-send")?.value || "";
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  const { status, data } = await postJSON("/api/dashboard/send", { body: text });
+  if (status === 200 && data?.ok) {
+    closeSendForm();
+    tick();
+    return;
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "Send"; }
+  showInlineError("err-send", data?.error || `request failed (${status})`);
+}
+
+async function doMarkDone() {
+  if (!confirm("Mark this mission done? The Coder will stop.")) return;
+  const btn = $("btn-mark-done");
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  const { status, data } = await postJSON("/api/dashboard/mark-done", {});
+  if (status === 200 && data?.ok) { tick(); return; }
+  if (btn) { btn.disabled = false; btn.textContent = "Mark mission DONE"; }
+  alert(data?.error || `Mark done failed (${status})`);
+}
+
+// ---------- Competing-actor detection ----------
+// If an open form refers to an item that the next poll shows is no longer pending,
+// paint a "stale" note above the textarea. Don't auto-close — user may want to copy
+// their draft. Only stamp the note once.
+
+function markStaleIfNeeded(kind, id, currentIds) {
+  const key = `${kind}:${id}`;
+  if (!openForms[key]) return;
+  if (currentIds.has(id)) return;  // still pending — nothing to do
+  const slotId = `form-${kind}-${id}`;
+  const slot = $(slotId);
+  if (!slot || !slot.querySelector(".inline-form")) return;
+  if (slot.querySelector(".stale-note")) return;
+  const note = document.createElement("div");
+  note.className = "stale-note";
+  note.textContent = `Resolved elsewhere (e.g., from Claude.ai Planner). Your draft is safe to copy; submit will likely fail.`;
+  slot.querySelector(".inline-form").appendChild(note);
+}
+
+// ---------- Main poll loop ----------
+
 async function tick() {
   try {
-    const r = await fetch("/api/dashboard/state");
+    const r = await fetch("/api/dashboard/state", { credentials: "same-origin" });
     if (r.status === 401) { location.href = "/dashboard/login"; return; }
     if (!r.ok) throw new Error("status " + r.status);
     $("connlost").classList.remove("show");
@@ -194,6 +416,7 @@ async function tick() {
       $("spec-preview").textContent = specExpanded ? fullSpec : preview;
       $("spec-toggle").style.display = fullSpec.length > preview.length ? "inline-block" : "none";
       $("spec-toggle").textContent = specExpanded ? "Collapse" : "Show full spec";
+      $("btn-mark-done").style.display = m.status === "active" ? "inline-block" : "none";
     } else {
       $("mission-name").textContent = "No active mission";
       $("mission-status").textContent = "none";
@@ -201,16 +424,28 @@ async function tick() {
       $("mission-meta").textContent = "Planner has not created a mission yet.";
       $("spec-preview").textContent = "";
       $("spec-toggle").style.display = "none";
+      $("btn-mark-done").style.display = "none";
     }
     renderHeartbeat(s.coder_heartbeat);
 
     $("server-info").textContent =
       `server v${s.server_info.server_version} · catalog ${s.server_info.tools_catalog_hash} · up since ${ago(s.server_info.started_at)}`;
 
-    $("questions").innerHTML = renderQuestions(s.pending_questions || []);
-    $("summaries").innerHTML = renderSummaries(s.pending_summaries || []);
+    const qs = s.pending_questions || [];
+    const ss = s.pending_summaries || [];
+    $("questions").innerHTML = renderQuestions(qs);
+    $("summaries").innerHTML = renderSummaries(ss);
     $("msgs-c2p").innerHTML = renderMessages((s.messages && s.messages.coder_to_planner) || []);
     $("msgs-p2c").innerHTML = renderMessages((s.messages && s.messages.planner_to_coder) || []);
+
+    // Competing-actor checks for any open inline form
+    const qIds = new Set(qs.map(q => q.question_id));
+    const sIds = new Set(ss.map(x => x.summary_id));
+    Object.keys(openForms).forEach(key => {
+      const [kind, id] = key.split(":", 2);
+      if (kind === "answer")  markStaleIfNeeded("answer",  id, qIds);
+      if (kind === "respond") markStaleIfNeeded("respond", id, sIds);
+    });
   } catch (e) {
     $("connlost").classList.add("show");
   }
