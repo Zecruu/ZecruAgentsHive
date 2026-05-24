@@ -63,6 +63,35 @@ def _active_mission(session: Session) -> Optional[Mission]:
     ).first()
 
 
+# ---------- Input validation (v1.2 Feature 3) ----------
+# Length caps live here, not in config, because they're protocol guarantees rather
+# than per-deployment tunables. If anyone hits a wall against these, we'll move
+# them to env vars then — until then a single source of truth keeps the surface flat.
+
+MAX_NAME_LEN = 200
+MAX_SPEC_LEN = 64 * 1024       # 64 KB
+MAX_TEXT_LEN = 16 * 1024       # 16 KB — applies to question, summary, message body,
+                               # answer, response. One cap simpler than seven nearly-equal ones.
+
+
+def _validate_text(value: str, field_name: str, max_len: int) -> Optional[dict]:
+    """Return an error dict if value is empty/whitespace or exceeds max_len; None if OK.
+
+    Tool entry points call this and short-circuit on a non-None return so callers
+    get a clean error before any DB write happens.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return {"error": f"{field_name} must be a non-empty string"}
+    if len(value) > max_len:
+        return {
+            "error": (
+                f"{field_name} exceeds maximum length of {max_len} characters "
+                f"(got {len(value)})"
+            )
+        }
+    return None
+
+
 def _touch_coder(session: Session) -> None:
     """Update the active mission's coder_last_seen to now.
 
@@ -96,9 +125,14 @@ def register_tools(mcp, settings: Settings) -> None:
         mission at a time. Call this once you and the human have locked the spec.
 
         Args:
-            name: short label for the mission (e.g., "Build the invoice exporter")
-            spec: the full natural-language specification the Coder should implement
+            name: short label for the mission (e.g., "Build the invoice exporter").
+                Must be non-empty, max {MAX_NAME_LEN} characters.
+            spec: the full natural-language specification the Coder should implement.
+                Must be non-empty, max {MAX_SPEC_LEN // 1024} KB.
         """
+        err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             current = _active_mission(session)
             if current:
@@ -142,6 +176,9 @@ def register_tools(mcp, settings: Settings) -> None:
     @mcp.tool
     def answer_question(question_id: str, answer: str) -> dict[str, Any]:
         """Answer a pending question from the Coder. The Coder will receive this and resume."""
+        err = _validate_text(answer, "answer", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             q = session.get(Question, question_id)
             if q is None:
@@ -180,6 +217,9 @@ def register_tools(mcp, settings: Settings) -> None:
 
         To mark the entire mission as finished, call mark_mission_done — not this.
         """
+        err = _validate_text(response, "response", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             s = session.get(Summary, summary_id)
             if s is None:
@@ -292,6 +332,9 @@ def register_tools(mcp, settings: Settings) -> None:
         Inserts a Message addressed to the Coder against the currently-active mission.
         Returns the message_id immediately; does NOT block.
         """
+        err = _validate_text(body, "body", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             mission = _active_mission(session)
             if mission is None:
@@ -355,6 +398,9 @@ def register_tools(mcp, settings: Settings) -> None:
         Inserts a Message addressed to the Planner against the active mission. Also
         bumps the Coder heartbeat. Returns the message_id immediately; does NOT block.
         """
+        err = _validate_text(body, "body", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             _touch_coder(session)
             mission = _active_mission(session)
@@ -490,6 +536,9 @@ def register_tools(mcp, settings: Settings) -> None:
         response — call wait_for_answer(question_id) repeatedly until you get a real
         answer. Do NOT treat 'pending' as failure.
         """
+        err = _validate_text(question, "question", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             _touch_coder(session)
             mission = _active_mission(session)
@@ -558,6 +607,9 @@ def register_tools(mcp, settings: Settings) -> None:
         you get status="pending" + summary_id — call wait_for_summary_response(summary_id)
         to keep waiting.
         """
+        err = _validate_text(summary, "summary", MAX_TEXT_LEN)
+        if err:
+            return err
         with Session(get_engine()) as session:
             _touch_coder(session)
             mission = _active_mission(session)
