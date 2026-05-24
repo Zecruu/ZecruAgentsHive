@@ -12,7 +12,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     in v1. Health-check paths are allowed through unauthenticated so Railway can probe.
     """
 
-    PUBLIC_PATHS = {"/", "/healthz"}
+    # Dashboard routes have their own (cookie-or-bearer) auth check via
+    # dashboard._require_dashboard_auth, so the global bearer middleware lets them
+    # through. The login/logout pages need to be reachable without prior auth.
+    PUBLIC_PATHS = {"/", "/healthz", "/dashboard", "/dashboard/login", "/dashboard/logout", "/api/dashboard/state"}
 
     def __init__(self, app, api_key: str):
         super().__init__(app)
