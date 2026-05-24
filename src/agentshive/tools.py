@@ -485,9 +485,10 @@ def register_tools(mcp, settings: Settings) -> None:
         your human substitute.
 
         Behavior: this call blocks until the Planner answers, up to an internal timeout
-        (~50s by default). If the timeout is hit before an answer arrives, you get a
-        {status: "pending", question_id: ...} response — call wait_for_answer(question_id)
-        repeatedly until you get a real answer. Do NOT treat 'pending' as failure.
+        (~4 minutes by default; controlled by TOOL_BLOCK_TIMEOUT_SECONDS). If the timeout
+        is hit before an answer arrives, you get a {status: "pending", question_id: ...}
+        response — call wait_for_answer(question_id) repeatedly until you get a real
+        answer. Do NOT treat 'pending' as failure.
         """
         with Session(get_engine()) as session:
             _touch_coder(session)
