@@ -20,6 +20,7 @@ def _mission_dict(m: Mission) -> dict[str, Any]:
         "status": m.status,
         "created_at": m.created_at.isoformat(),
         "done_at": m.done_at.isoformat() if m.done_at else None,
+        "coder_last_seen": m.coder_last_seen.isoformat() if m.coder_last_seen else None,
     }
 
 
@@ -49,6 +50,23 @@ def _active_mission(session: Session) -> Optional[Mission]:
     return session.exec(
         select(Mission).where(Mission.status == "active").order_by(Mission.created_at.desc())
     ).first()
+
+
+def _touch_coder(session: Session) -> None:
+    """Update the active mission's coder_last_seen to now.
+
+    Called once per Coder-side tool invocation so the Planner can see whether the
+    Coder process is alive without an explicit ping protocol. Called at the START
+    of a tool, not inside per-iteration polling loops — one touch per call is the
+    intended granularity ("the Coder placed this tool call N seconds ago").
+
+    No-op if no mission is active.
+    """
+    mission = _active_mission(session)
+    if mission is not None:
+        mission.coder_last_seen = _utcnow()
+        session.add(mission)
+        session.commit()
 
 
 def register_tools(mcp, settings: Settings) -> None:
@@ -265,6 +283,7 @@ def register_tools(mcp, settings: Settings) -> None:
         the Planner has not created one yet — wait or stop.
         """
         with Session(get_engine()) as session:
+            _touch_coder(session)
             mission = _active_mission(session)
             if mission is None:
                 return {"mission": None, "message": "No active mission. The Planner has not started one yet."}
@@ -321,6 +340,7 @@ def register_tools(mcp, settings: Settings) -> None:
         repeatedly until you get a real answer. Do NOT treat 'pending' as failure.
         """
         with Session(get_engine()) as session:
+            _touch_coder(session)
             mission = _active_mission(session)
             if mission is None:
                 return {"error": "no active mission — cannot ask"}
@@ -338,6 +358,8 @@ def register_tools(mcp, settings: Settings) -> None:
         Use this when ask_planner returned status="pending" (the MCP transport timed out
         before the Planner answered). Keep calling until you get status="answered".
         """
+        with Session(get_engine()) as session:
+            _touch_coder(session)
         return _wait_for_question(question_id)
 
     def _wait_for_summary(summary_id: str) -> dict[str, Any]:
@@ -386,6 +408,7 @@ def register_tools(mcp, settings: Settings) -> None:
         to keep waiting.
         """
         with Session(get_engine()) as session:
+            _touch_coder(session)
             mission = _active_mission(session)
             if mission is None:
                 return {"error": "no active mission — cannot submit progress"}
@@ -399,6 +422,8 @@ def register_tools(mcp, settings: Settings) -> None:
     @mcp.tool
     def wait_for_summary_response(summary_id: str) -> dict[str, Any]:
         """Continue waiting for the Planner to respond to a previously-submitted summary."""
+        with Session(get_engine()) as session:
+            _touch_coder(session)
         return _wait_for_summary(summary_id)
 
     @mcp.tool
@@ -421,6 +446,7 @@ def register_tools(mcp, settings: Settings) -> None:
           from "Planner shipped this one, stop")
         """
         with Session(get_engine()) as session:
+            _touch_coder(session)
             if mission_id is not None:
                 m = session.get(Mission, mission_id)
                 if m is None:
