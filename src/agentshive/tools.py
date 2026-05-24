@@ -141,6 +141,95 @@ def _touch_coder(session: Session) -> None:
         session.commit()
 
 
+# ---------- Module-level write operations (v1.5) ----------
+# Extracted from nested @mcp.tool functions so both the MCP wrappers AND the
+# dashboard HTTP handlers can call them. Single source of truth. Zero closure
+# dependencies on register_tools-scoped names (verified by reading every one);
+# they only touch module-level models, serializers, and helpers.
+#
+# The @mcp.tool decorated wrappers inside register_tools delegate directly to
+# these — two layers on purpose. Don't try to remove the wrappers; FastMCP needs
+# the decorated function for tool registration.
+
+
+def _do_answer_question(question_id: str, answer: str) -> dict[str, Any]:
+    err = _validate_text(answer, "answer", MAX_TEXT_LEN)
+    if err:
+        return err
+    with Session(get_engine()) as session:
+        q = session.get(Question, question_id)
+        if q is None:
+            return {"error": f"no question with id {question_id}"}
+        if q.answer is not None:
+            return {"error": "question already answered", "question": _question_dict(q)}
+        q.answer = answer
+        q.answered_at = _utcnow()
+        session.add(q)
+        session.commit()
+        session.refresh(q)
+        return _question_dict(q)
+
+
+def _do_respond_to_summary(summary_id: str, response: str) -> dict[str, Any]:
+    err = _validate_text(response, "response", MAX_TEXT_LEN)
+    if err:
+        return err
+    with Session(get_engine()) as session:
+        s = session.get(Summary, summary_id)
+        if s is None:
+            return {"error": f"no summary with id {summary_id}"}
+        if s.response is not None:
+            return {"error": "summary already responded to", "summary": _summary_dict(s)}
+        s.response = response
+        s.responded_at = _utcnow()
+        session.add(s)
+        session.commit()
+        session.refresh(s)
+        return _summary_dict(s)
+
+
+def _do_ack_message(message_id: str) -> dict[str, Any]:
+    with Session(get_engine()) as session:
+        m = session.get(Message, message_id)
+        if m is None:
+            return {"error": f"no message with id {message_id}"}
+        if m.delivered_at is not None:
+            return _message_dict(m)
+        m.delivered_at = _utcnow()
+        session.add(m)
+        session.commit()
+        session.refresh(m)
+        return _message_dict(m)
+
+
+def _do_send_to_coder(body: str) -> dict[str, Any]:
+    err = _validate_text(body, "body", MAX_TEXT_LEN)
+    if err:
+        return err
+    with Session(get_engine()) as session:
+        mission = _active_mission(session)
+        if mission is None:
+            return {"error": "no active mission — cannot send"}
+        m = Message(mission_id=mission.id, direction="planner_to_coder", body=body)
+        session.add(m)
+        session.commit()
+        session.refresh(m)
+        return _message_dict(m)
+
+
+def _do_mark_mission_done() -> dict[str, Any]:
+    with Session(get_engine()) as session:
+        mission = _active_mission(session)
+        if mission is None:
+            return {"error": "no active mission"}
+        mission.status = "done"
+        mission.done_at = _utcnow()
+        session.add(mission)
+        session.commit()
+        session.refresh(mission)
+        return _mission_dict(mission)
+
+
 def register_tools(mcp, settings: Settings) -> None:
     """Register every AgentsHive tool with the given FastMCP instance."""
 
@@ -299,21 +388,7 @@ def register_tools(mcp, settings: Settings) -> None:
     @mcp.tool
     def answer_question(question_id: str, answer: str) -> dict[str, Any]:
         """Answer a pending question from the Coder. The Coder will receive this and resume."""
-        err = _validate_text(answer, "answer", MAX_TEXT_LEN)
-        if err:
-            return err
-        with Session(get_engine()) as session:
-            q = session.get(Question, question_id)
-            if q is None:
-                return {"error": f"no question with id {question_id}"}
-            if q.answer is not None:
-                return {"error": "question already answered", "question": _question_dict(q)}
-            q.answer = answer
-            q.answered_at = _utcnow()
-            session.add(q)
-            session.commit()
-            session.refresh(q)
-            return _question_dict(q)
+        return _do_answer_question(question_id, answer)
 
     @mcp.tool
     def list_pending_summaries() -> list[dict[str, Any]]:
@@ -340,21 +415,7 @@ def register_tools(mcp, settings: Settings) -> None:
 
         To mark the entire mission as finished, call mark_mission_done — not this.
         """
-        err = _validate_text(response, "response", MAX_TEXT_LEN)
-        if err:
-            return err
-        with Session(get_engine()) as session:
-            s = session.get(Summary, summary_id)
-            if s is None:
-                return {"error": f"no summary with id {summary_id}"}
-            if s.response is not None:
-                return {"error": "summary already responded to", "summary": _summary_dict(s)}
-            s.response = response
-            s.responded_at = _utcnow()
-            session.add(s)
-            session.commit()
-            session.refresh(s)
-            return _summary_dict(s)
+        return _do_respond_to_summary(summary_id, response)
 
     @mcp.tool
     def wait_for_next_question(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
@@ -437,18 +498,7 @@ def register_tools(mcp, settings: Settings) -> None:
         Inserts a Message addressed to the Coder against the currently-active mission.
         Returns the message_id immediately; does NOT block.
         """
-        err = _validate_text(body, "body", MAX_TEXT_LEN)
-        if err:
-            return err
-        with Session(get_engine()) as session:
-            mission = _active_mission(session)
-            if mission is None:
-                return {"error": "no active mission — cannot send"}
-            m = Message(mission_id=mission.id, direction="planner_to_coder", body=body)
-            session.add(m)
-            session.commit()
-            session.refresh(m)
-            return _message_dict(m)
+        return _do_send_to_coder(body)
 
     @mcp.tool
     def wait_for_coder_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
@@ -572,18 +622,7 @@ def register_tools(mcp, settings: Settings) -> None:
 
         Returns the full message dict with the (possibly newly stamped) delivered_at.
         """
-        with Session(get_engine()) as session:
-            m = session.get(Message, message_id)
-            if m is None:
-                return {"error": f"no message with id {message_id}"}
-            if m.delivered_at is not None:
-                # idempotent: already acked, just return the row as-is
-                return _message_dict(m)
-            m.delivered_at = _utcnow()
-            session.add(m)
-            session.commit()
-            session.refresh(m)
-            return _message_dict(m)
+        return _do_ack_message(message_id)
 
     # ---------- Symmetric meta tools (v1.3) ----------
 
@@ -673,16 +712,7 @@ def register_tools(mcp, settings: Settings) -> None:
     @mcp.tool
     def mark_mission_done() -> dict[str, Any]:
         """Mark the active mission as done. The Coder will see this on its next is_mission_done() check and stop."""
-        with Session(get_engine()) as session:
-            mission = _active_mission(session)
-            if mission is None:
-                return {"error": "no active mission"}
-            mission.status = "done"
-            mission.done_at = _utcnow()
-            session.add(mission)
-            session.commit()
-            session.refresh(mission)
-            return _mission_dict(mission)
+        return _do_mark_mission_done()
 
     # ---------- Coder-side tools ----------
 

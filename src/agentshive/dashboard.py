@@ -28,13 +28,20 @@ from .config import Settings
 from .db import Message, Mission, Question, Summary, get_engine
 from .tools import (
     AGENTSHIVE_VERSION,
+    MAX_TEXT_LEN,
     SERVER_STARTED_AT,
     _active_mission,
     _compute_tools_catalog_hash,
+    _do_ack_message,
+    _do_answer_question,
+    _do_mark_mission_done,
+    _do_respond_to_summary,
+    _do_send_to_coder,
     _message_dict,
     _mission_dict,
     _question_dict,
     _summary_dict,
+    _validate_text,
 )
 
 
@@ -70,6 +77,40 @@ def _cookie_kwargs(request: Request) -> dict[str, Any]:
         "max_age": COOKIE_MAX_AGE_SECONDS,
         "path": "/",
     }
+
+
+def _require_same_origin(request: Request) -> bool:
+    """CSRF defense — verify the request's Origin (or Referer) matches our host.
+
+    Belt-to-suspenders on top of the SameSite=Lax cookie. Browsers always send
+    Origin on POST requests, so:
+      - Origin present and matches our host  → allow (legitimate browser call)
+      - Origin present and mismatches        → 403 (cross-origin attack)
+      - Origin absent but Referer matches    → allow (older browser fallback)
+      - Both absent                          → allow (non-browser caller like curl/cli
+                                               with bearer auth — they don't send Origin)
+    """
+    our_host = (request.headers.get("host") or request.url.netloc or "").lower()
+    if not our_host:
+        return True  # we can't compare without knowing our own host; let auth gate
+
+    def _host_of(url: str) -> str:
+        # Cheap parse — avoid pulling in urllib for one-liner usage. Strip scheme,
+        # take up to first '/' or '?'. Lowercase.
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        for sep in ("/", "?", "#"):
+            if sep in url:
+                url = url.split(sep, 1)[0]
+        return url.lower()
+
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        return _host_of(origin) == our_host
+    referer = request.headers.get("referer", "").strip()
+    if referer:
+        return _host_of(referer) == our_host
+    return True  # no Origin AND no Referer = non-browser caller
 
 
 def _require_dashboard_auth(request: Request, settings: Settings) -> bool:
@@ -288,6 +329,125 @@ def _make_state(settings: Settings):
     return state
 
 
+# ---------- v1.5 write endpoints ----------
+# Each wraps a _do_<name> function from tools.py — single source of truth between
+# the MCP tool surface and this HTTP surface. The handlers do their own auth +
+# CSRF check + input parsing, then delegate.
+#
+# Status code policy:
+#   401 — no/bad auth
+#   403 — same-origin CSRF check failed
+#   400 — malformed JSON, missing required field, or input failed length validation
+#         (validation errors must be 400 so the UI knows to block submission)
+#   200 ok=True  — operation succeeded
+#   200 ok=False — business-state error (already answered, no active mission, etc.) —
+#                  these are valid responses, just not the happy path; UI displays inline
+#                  rather than treating as a hard failure
+
+
+def _is_validation_error(err_dict: dict) -> bool:
+    """True if a _do_<name> error came from _validate_text (vs. business-state)."""
+    msg = err_dict.get("error", "")
+    return ("must be a non-empty string" in msg) or ("exceeds maximum length" in msg)
+
+
+async def _read_json_body(request: Request):
+    """Return (body_dict, error_response) — exactly one is None."""
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse({"error": "malformed JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+    return body, None
+
+
+def _make_write_handler(settings: Settings, action):
+    """Wrap an _do_<name> action with the common auth+CSRF+JSON+delegate pattern.
+
+    `action(body: dict) -> (return_key: str, result_dict)` — the handler does the
+    rest. `return_key` is the dict key the caller wants on success
+    (e.g., "question" / "message" / "mission").
+    """
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        body, err_resp = await _read_json_body(request)
+        if err_resp is not None:
+            return err_resp
+        try:
+            return_key, result = action(body)
+        except _BadRequest as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        if "error" in result:
+            status = 400 if _is_validation_error(result) else 200
+            payload = {"ok": False, **result}
+            return JSONResponse(payload, status_code=status)
+        return JSONResponse({"ok": True, return_key: result}, status_code=200)
+    return handler
+
+
+class _BadRequest(Exception):
+    """Raised inside an `action` callable when the request body is missing required fields."""
+
+
+def _require_str(body: dict, key: str) -> str:
+    val = body.get(key)
+    if not isinstance(val, str) or not val:
+        raise _BadRequest(f"missing or empty required field '{key}'")
+    return val
+
+
+def _make_answer_handler(settings):
+    def action(body):
+        question_id = _require_str(body, "question_id")
+        answer = body.get("answer", "")
+        return "question", _do_answer_question(question_id, answer)
+    return _make_write_handler(settings, action)
+
+
+def _make_respond_handler(settings):
+    def action(body):
+        summary_id = _require_str(body, "summary_id")
+        response = body.get("response", "")
+        return "summary", _do_respond_to_summary(summary_id, response)
+    return _make_write_handler(settings, action)
+
+
+def _make_ack_handler(settings):
+    def action(body):
+        message_id = _require_str(body, "message_id")
+        return "message", _do_ack_message(message_id)
+    return _make_write_handler(settings, action)
+
+
+def _make_send_handler(settings):
+    def action(body):
+        msg_body = body.get("body", "")
+        return "message", _do_send_to_coder(msg_body)
+    return _make_write_handler(settings, action)
+
+
+def _make_mark_done_handler(settings: Settings):
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        # mark-done takes no body — but still tolerate {} JSON if sent
+        try:
+            await request.body()
+        except Exception:
+            pass
+        result = _do_mark_mission_done()
+        if "error" in result:
+            return JSONResponse({"ok": False, **result}, status_code=200)
+        return JSONResponse({"ok": True, "mission": result}, status_code=200)
+    return handler
+
+
 def register_routes(app, settings: Settings, tool_names: list[str]) -> None:
     """Mount dashboard routes onto the given Starlette app.
 
@@ -302,3 +462,9 @@ def register_routes(app, settings: Settings, tool_names: list[str]) -> None:
     app.router.routes.append(Route("/dashboard/logout", _make_logout(settings), methods=["POST"]))
     app.router.routes.append(Route("/dashboard", _make_dashboard(settings), methods=["GET"]))
     app.router.routes.append(Route("/api/dashboard/state", _make_state(settings), methods=["GET"]))
+    # v1.5 write endpoints
+    app.router.routes.append(Route("/api/dashboard/answer", _make_answer_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/respond", _make_respond_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/ack", _make_ack_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/send", _make_send_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/mark-done", _make_mark_done_handler(settings), methods=["POST"]))

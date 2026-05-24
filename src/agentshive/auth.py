@@ -15,7 +15,19 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     # Dashboard routes have their own (cookie-or-bearer) auth check via
     # dashboard._require_dashboard_auth, so the global bearer middleware lets them
     # through. The login/logout pages need to be reachable without prior auth.
-    PUBLIC_PATHS = {"/", "/healthz", "/dashboard", "/dashboard/login", "/dashboard/logout", "/api/dashboard/state"}
+    PUBLIC_PATHS = {
+        "/", "/healthz",
+        "/dashboard", "/dashboard/login", "/dashboard/logout",
+        "/api/dashboard/state",
+        # v1.5 write endpoints — dashboard handlers enforce cookie-or-bearer auth
+        # themselves; global bearer-only middleware would reject browser POSTs (which
+        # carry the session cookie, not Authorization).
+        "/api/dashboard/answer",
+        "/api/dashboard/respond",
+        "/api/dashboard/ack",
+        "/api/dashboard/send",
+        "/api/dashboard/mark-done",
+    }
 
     def __init__(self, app, api_key: str):
         super().__init__(app)
