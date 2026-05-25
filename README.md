@@ -48,7 +48,44 @@ Hosted on Railway. Provision a Postgres plugin (auto-injects `DATABASE_URL`) and
 
 ## Auth
 
-v1 uses a single shared bearer token (`AGENTSHIVE_API_KEY`). Both the Planner connector and the Coder MCP client must send `Authorization: Bearer <key>`. Multi-tenancy and per-user auth are deferred.
+Two parallel paths, both backed by the same MCP server:
+
+**1. Shared bearer key (`AGENTSHIVE_API_KEY`)** — original v1.0–v1.6 mechanism, still works forever. Any caller that sends `Authorization: Bearer <key>` is authenticated. This is what Claude Code CLI, the test suite, and direct `curl` against `/mcp` use.
+
+**2. OAuth 2.1 (v1.7+)** — required to register AgentsHive as a Claude Desktop "custom connector" (the desktop UI does not accept bearer-token fields). AgentsHive runs as a self-contained OAuth 2.1 authorization server with PKCE + Dynamic Client Registration (RFC 7591) + Protected Resource Metadata (RFC 9728) + token revocation (RFC 7009). The Claude Desktop "Add custom connector" dialog discovers our metadata, registers itself via DCR, opens our consent page in a browser, exchanges the code for tokens, and uses the access token going forward — no manual client config.
+
+Set `AGENTSHIVE_BASE_URL` to the public HTTPS URL of your deployment (e.g. `https://agentshive-production.up.railway.app`) so issued tokens have the correct audience claim per RFC 8707. Without it, the server defaults to `http://localhost:{PORT}` and Claude Desktop will refuse the issued tokens.
+
+### Adding AgentsHive as a Claude Desktop custom connector
+
+1. **Claude Desktop → Settings → Connectors → Add custom connector**
+2. **URL:** `https://<your-railway-domain>/mcp`
+3. **Client ID / Client Secret:** leave blank (DCR registers the client automatically)
+4. A browser tab opens to `/oauth/consent`. If you have a valid dashboard session cookie, just click **Approve**. Otherwise, paste `AGENTSHIVE_API_KEY` in the form and click **Approve**.
+5. The connector shows a green "Connected" badge. The access token lasts 1 hour and silently refreshes for up to 30 days.
+
+### OAuth surface
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata (issuer, endpoints, supported scopes) |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 PRM — Claude Desktop reads this to find the AS |
+| `POST /register` | RFC 7591 Dynamic Client Registration. Soft cap of 100 clients with LRU eviction (by `last_used_at`) |
+| `GET /authorize` | OAuth 2.1 PKCE authorization endpoint. Validates the `resource` indicator matches this server before redirecting to `/oauth/consent` |
+| `GET /oauth/consent` | Browser-facing consent page. Shows API-key entry field when no dashboard cookie is present, otherwise just Approve/Deny |
+| `POST /oauth/consent` | Mints the authorization code on Approve; 302s to `redirect_uri` with `error=access_denied` on Deny |
+| `POST /token` | Exchanges code for tokens or refreshes (RFC 6749). Refresh tokens **rotate** on every exchange per OAuth 2.1 BCP |
+| `POST /revoke` | RFC 7009 token revocation. Takes effect on the very next `/mcp` request |
+
+Tokens are stored as SHA-256 hashes — the raw bearer values exist only in transit and in the requesting client. Access tokens are 1 hour, refresh tokens 30 days, authorization codes 10 minutes single-use.
+
+### Audience validation
+
+The server validates RFC 8707 audience in two places to defeat confused-deputy:
+- `/authorize` refuses to start a flow whose `resource` doesn't match this server's canonical MCP URL.
+- `load_access_token` refuses to return any token whose stored `resource` claim mismatches the canonical URL — so a token issued for a different audience cannot authenticate against `/mcp`.
+
+The legacy bearer key path is unaffected by audience validation (it's pre-OAuth and uses the canonical audience by definition).
 
 ## Dashboard (v1.4+)
 
