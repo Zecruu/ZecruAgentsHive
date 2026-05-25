@@ -18,7 +18,7 @@ import importlib.resources
 import json
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlmodel import Session, desc, select
@@ -747,6 +747,96 @@ def _make_mark_done_handler(settings: Settings):
     return handler
 
 
+# ---------- v1.10 Desktop launch endpoints ----------
+# Three endpoints all gated on AGENTSHIVE_DESKTOP=1 (the server subprocess
+# launched by desktop.py sets this). On Railway the env is absent and these
+# endpoints return 403 — the dashboard JS guards on /api/dashboard/mode and
+# doesn't render the Launch buttons in that case, so this is defense-in-depth.
+
+
+def _require_desktop_mode() -> Optional[Response]:
+    import os as _os
+    if _os.environ.get("AGENTSHIVE_DESKTOP", "") != "1":
+        return JSONResponse(
+            {"error": "endpoint only available in AgentsHive Desktop"},
+            status_code=403,
+        )
+    return None
+
+
+def _make_claude_status_handler(settings: Settings):
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        not_desktop = _require_desktop_mode()
+        if not_desktop is not None:
+            return not_desktop
+        from .launcher import claude_status
+        return JSONResponse(claude_status())
+    return handler
+
+
+def _make_launch_planner_handler(settings: Settings):
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        not_desktop = _require_desktop_mode()
+        if not_desktop is not None:
+            return not_desktop
+        slug = request.path_params.get("slug", "").strip().lower()
+        if not slug:
+            return JSONResponse({"error": "missing slug"}, status_code=400)
+        # Validate slug exists (avoids launching for a typo'd URL).
+        with Session(get_engine()) as session:
+            proj = session.exec(select(Project).where(Project.slug == slug)).first()
+            if proj is None:
+                return JSONResponse({"error": f"unknown project '{slug}'"}, status_code=404)
+        from .launcher import launch_planner
+        result = launch_planner(
+            project_slug=slug,
+            local_port=settings.port,
+            bearer_key=settings.api_key,
+        )
+        status = 200 if result.get("ok") else 200  # always 200; ok=false is a business-state error
+        return JSONResponse(result, status_code=status)
+    return handler
+
+
+def _make_launch_coder_handler(settings: Settings):
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        not_desktop = _require_desktop_mode()
+        if not_desktop is not None:
+            return not_desktop
+        slug = request.path_params.get("slug", "").strip().lower()
+        if not slug:
+            return JSONResponse({"error": "missing slug"}, status_code=400)
+        with Session(get_engine()) as session:
+            proj = session.exec(select(Project).where(Project.slug == slug)).first()
+            if proj is None:
+                return JSONResponse({"error": f"unknown project '{slug}'"}, status_code=404)
+            if not proj.local_path:
+                return JSONResponse({
+                    "ok": False,
+                    "error": "project has no local_path set; edit project to bind a folder first",
+                }, status_code=200)
+            local_path = proj.local_path
+        from .launcher import launch_coder
+        result = launch_coder(
+            project_slug=slug,
+            local_path=local_path,
+            local_port=settings.port,
+            bearer_key=settings.api_key,
+        )
+        return JSONResponse(result)
+    return handler
+
+
 # ---------- v1.10 Mode probe ----------
 # The dashboard JS calls this on load. desktop_mode is True when the server
 # was launched by the desktop shell (AGENTSHIVE_DESKTOP=1 env), False on
@@ -930,6 +1020,10 @@ def register_routes(app, settings: Settings, tool_names: list[str], oauth_provid
     # v1.10 Mode probe — dashboard JS calls this on load to decide whether to
     # render desktop-only UI (folder picker, Launch buttons, install pills).
     app.router.routes.append(Route("/api/dashboard/mode", _make_mode_handler(settings), methods=["GET"]))
+    # v1.10 Desktop launch endpoints (all gated on AGENTSHIVE_DESKTOP=1).
+    app.router.routes.append(Route("/api/desktop/claude-status", _make_claude_status_handler(settings), methods=["GET"]))
+    app.router.routes.append(Route("/api/desktop/launch-planner/{slug}", _make_launch_planner_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/desktop/launch-coder/{slug}", _make_launch_coder_handler(settings), methods=["POST"]))
     # v1.7 OAuth consent page (only mounted when an OAuth provider is supplied).
     if oauth_provider is not None:
         app.router.routes.append(Route("/oauth/consent", _make_consent_get(settings, oauth_provider), methods=["GET"]))

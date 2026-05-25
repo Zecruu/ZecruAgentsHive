@@ -122,7 +122,10 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
         <option value="default">default</option>
       </select>
       <span id="proj-local-path" style="display:none; font-size:12px; color:#9aa0ab; font-family:ui-monospace,monospace; padding-left:10px;"></span>
+      <span id="claude-status" style="display:none; font-size:11px; margin-left:auto; margin-right:8px;"></span>
       <div class="proj-actions">
+        <button type="button" onclick="launchPlannerForCurrent()" id="btn-launch-planner" style="display:none">▶ Launch Planner</button>
+        <button type="button" onclick="launchCoderForCurrent()" id="btn-launch-coder" style="display:none">▶ Launch Coder</button>
         <button type="button" onclick="toggleNewProjForm()" id="btn-new-proj">+ New project</button>
         <button type="button" onclick="archiveCurrentProject()" id="btn-archive-proj" style="display:none">Archive</button>
       </div>
@@ -673,9 +676,80 @@ async function loadDesktopMode() {
     if (DESKTOP_MODE) {
       const btn = $("btn-pick-folder");
       if (btn) btn.style.display = "inline-block";
+      // Load Claude install status; surface pill + show launch buttons per status.
+      await loadClaudeStatus();
+      // CLAUDE_STATUS may not have been populated when loadProjects() ran
+      // first; re-render the project switcher so the Launch buttons surface.
+      loadProjects();
     }
   } catch (e) {
     // Non-fatal: stay in browser/Railway mode.
+  }
+}
+
+// v1.10 Commit 3: cached Claude install status. Loaded once at boot.
+let CLAUDE_STATUS = { desktop_install: null, cli_install: null };
+
+async function loadClaudeStatus() {
+  try {
+    const r = await fetch("/api/desktop/claude-status", { credentials: "same-origin" });
+    if (!r.ok) return;
+    CLAUDE_STATUS = await r.json();
+    const pill = $("claude-status");
+    if (pill) {
+      const d = CLAUDE_STATUS.desktop_install;
+      const c = CLAUDE_STATUS.cli_install;
+      const dBadge = d ? `<span style="color:#6fdc9f">✓ Desktop (${escapeHtml(d.variant)})</span>` : `<span style="color:#ff8a78">✗ Desktop</span>`;
+      const cBadge = c ? `<span style="color:#6fdc9f">✓ CLI</span>` : `<span style="color:#ff8a78">✗ CLI</span>`;
+      pill.innerHTML = `Claude: ${dBadge} · ${cBadge}`;
+      pill.style.display = "inline-block";
+    }
+  } catch (e) {
+    // Non-fatal
+  }
+}
+
+async function launchPlannerForCurrent() {
+  const slug = currentProjectSlug();
+  if (slug === "default") {
+    alert("Default project is for legacy/unscoped traffic — create a real project to launch the Planner on it.");
+    return;
+  }
+  const btn = $("btn-launch-planner");
+  if (btn) { btn.disabled = true; btn.textContent = "Launching…"; }
+  try {
+    const { status, data } = await postJSON(`/api/desktop/launch-planner/${encodeURIComponent(slug)}`, {});
+    if (!data || !data.ok) {
+      alert((data && data.error) || `Launch Planner failed (HTTP ${status}).`);
+    } else {
+      alert(data.message || "Planner launched.");
+    }
+  } catch (e) {
+    alert("Network error launching Planner — try again.");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "▶ Launch Planner"; }
+  }
+}
+
+async function launchCoderForCurrent() {
+  const slug = currentProjectSlug();
+  if (slug === "default") {
+    alert("Default project is for legacy/unscoped traffic — create a real project to launch the Coder on it.");
+    return;
+  }
+  const btn = $("btn-launch-coder");
+  if (btn) { btn.disabled = true; btn.textContent = "Launching…"; }
+  try {
+    const { status, data } = await postJSON(`/api/desktop/launch-coder/${encodeURIComponent(slug)}`, {});
+    if (!data || !data.ok) {
+      alert((data && data.error) || `Launch Coder failed (HTTP ${status}).`);
+    } else {
+      alert(data.message || "Coder launched.");
+    }
+  } catch (e) {
+    alert("Network error launching Coder — try again.");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "▶ Launch Coder"; }
   }
 }
 
@@ -719,6 +793,22 @@ async function loadProjects() {
       } else {
         pathSlot.style.display = "none";
       }
+    }
+    // v1.10: Launch buttons visible only in desktop mode, only when the
+    // corresponding Claude install is detected, and only for non-default
+    // projects. Coder also needs a local_path.
+    const lp = $("btn-launch-planner");
+    const lc = $("btn-launch-coder");
+    if (lp) {
+      lp.style.display =
+        (DESKTOP_MODE && cur !== "default" && CLAUDE_STATUS.desktop_install)
+        ? "inline-block" : "none";
+    }
+    if (lc) {
+      lc.style.display =
+        (DESKTOP_MODE && cur !== "default" && CLAUDE_STATUS.cli_install
+         && activeProj && activeProj.local_path)
+        ? "inline-block" : "none";
     }
   } catch (e) {
     // Non-fatal — dropdown stays with the default option

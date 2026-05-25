@@ -79,6 +79,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         "/api/dashboard/projects",
         # v1.10 — desktop-mode probe; dashboard handler enforces cookie-or-bearer auth.
         "/api/dashboard/mode",
+        # v1.10 desktop launch surface — handlers enforce cookie-or-bearer +
+        # AGENTSHIVE_DESKTOP=1 gating themselves. Path-prefix exemption below
+        # also catches the slug-parameterized /launch-planner/<slug> + /launch-coder/<slug>.
+        "/api/desktop/claude-status",
         # v1.7 OAuth surface — these endpoints MUST be reachable without a prior
         # bearer token (it's the user-facing path to GET one). Auth, where needed,
         # is enforced inside the SDK handlers (PKCE, client validation) or the
@@ -108,6 +112,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             path in self.PUBLIC_PATHS
             or path.startswith("/.well-known/oauth-")
             or path.startswith("/api/dashboard/projects/")  # /<slug>/archive
+            or path.startswith("/api/desktop/")  # v1.10 launch surface, slug-parameterized
         ):
             return await call_next(request)
         header = request.headers.get("authorization", "")
