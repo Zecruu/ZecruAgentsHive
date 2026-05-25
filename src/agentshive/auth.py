@@ -32,6 +32,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         "/api/dashboard/respond",
         "/api/dashboard/ack",
         "/api/dashboard/send",
+        # v1.8 inbox: user → planner chat post. Per-route auth (cookie or bearer)
+        # enforced inside the dashboard handler.
+        "/api/dashboard/send-to-planner",
         "/api/dashboard/mark-done",
         # v1.6 SSE push channel — dashboard handler enforces cookie-or-bearer auth.
         "/api/dashboard/events",
