@@ -298,22 +298,24 @@ def _apply_inline_migrations(engine: Engine) -> None:
     mission_cols = {c["name"] for c in mission_cols_full}
     dialect_name = engine.dialect.name
     if "project_id" not in mission_cols:
+        # default_project_id is a uuid hex (32 hex chars from uuid4().hex) so it's
+        # safe to interpolate directly. Bind parameters don't work in DDL on
+        # Postgres ("could not determine data type of parameter $1") so the
+        # literal-string path is the only one that works for both dialects.
+        assert all(c in "0123456789abcdef" for c in default_project_id), \
+            f"unsafe project id for SQL interpolation: {default_project_id!r}"
         with engine.begin() as conn:
             if dialect_name == "postgresql":
-                # ADD COLUMN with a DEFAULT backfills every existing row atomically,
-                # then DROP DEFAULT so future inserts have no implicit fallback.
                 conn.execute(text(
-                    "ALTER TABLE mission ADD COLUMN project_id TEXT NOT NULL "
-                    "DEFAULT :default REFERENCES project(id)"
-                ).bindparams(default=default_project_id))
+                    f"ALTER TABLE mission ADD COLUMN project_id TEXT NOT NULL "
+                    f"DEFAULT '{default_project_id}' REFERENCES project(id)"
+                ))
                 conn.execute(text("ALTER TABLE mission ALTER COLUMN project_id DROP DEFAULT"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_mission_project_id ON mission (project_id)"))
             else:
-                # SQLite ALTER TABLE ADD COLUMN supports NOT NULL only with a DEFAULT.
-                # We add with the default, then can't easily drop the default on
-                # SQLite — but SQLite ignores DEFAULTs that aren't explicitly bound
-                # at INSERT time when the column is set via the ORM, so functionally
-                # equivalent for our use case.
+                # SQLite: ALTER TABLE ADD COLUMN supports NOT NULL with a DEFAULT.
+                # We can't easily DROP DEFAULT on SQLite but the ORM always
+                # supplies project_id explicitly, so the DEFAULT just sits unused.
                 conn.execute(text(
                     f"ALTER TABLE mission ADD COLUMN project_id TEXT NOT NULL DEFAULT '{default_project_id}'"
                 ))
