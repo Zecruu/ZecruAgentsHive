@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import JSON, Column
 from sqlalchemy.engine import Engine
 from sqlmodel import Field, SQLModel, create_engine
 
@@ -73,6 +74,69 @@ class Message(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
     delivered_at: Optional[datetime] = None
     redelivery_count: Optional[int] = Field(default=0)
+
+
+# --- v1.7 OAuth 2.1 storage ---------------------------------------------
+#
+# Four tables back the AgentsHiveOAuthProvider. Access tokens and refresh
+# tokens are stored as SHA256 hex digests so a DB leak does not surrender
+# the live bearer values; the raw token string only exists in transit and
+# in the requesting client. Authorization codes are also hashed for the
+# same reason, even though their 10-minute TTL limits exposure.
+#
+# JSON columns (redirect_uris, scopes, grant_types, response_types) use
+# SQLAlchemy's generic JSON type and so work transparently on both SQLite
+# and Postgres without a dialect-specific column class.
+
+
+class OAuthClient(SQLModel, table=True):
+    # client_id is the public identifier issued at registration time.
+    client_id: str = Field(primary_key=True)
+    # client_secret is None for public clients (PKCE-only, no secret).
+    client_secret: Optional[str] = None
+    client_name: Optional[str] = None
+    redirect_uris: list = Field(default_factory=list, sa_column=Column(JSON))
+    grant_types: list = Field(default_factory=list, sa_column=Column(JSON))
+    response_types: list = Field(default_factory=list, sa_column=Column(JSON))
+    scope: Optional[str] = None
+    token_endpoint_auth_method: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    # Bumped on every successful /authorize and /token use — drives the
+    # LRU eviction policy when the registered-clients cap is exceeded.
+    last_used_at: datetime = Field(default_factory=_utcnow)
+
+
+class OAuthAuthorizationCode(SQLModel, table=True):
+    # SHA256 hex of the raw code value — never the code itself.
+    code_hash: str = Field(primary_key=True)
+    client_id: str = Field(index=True)
+    scopes: list = Field(default_factory=list, sa_column=Column(JSON))
+    expires_at: int  # unix seconds
+    code_challenge: str
+    redirect_uri: str
+    redirect_uri_provided_explicitly: bool = True
+    resource: Optional[str] = None
+    used: bool = False  # single-use enforcement
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class OAuthAccessToken(SQLModel, table=True):
+    token_hash: str = Field(primary_key=True)
+    client_id: str = Field(index=True)
+    scopes: list = Field(default_factory=list, sa_column=Column(JSON))
+    expires_at: int  # unix seconds
+    resource: Optional[str] = None
+    revoked: bool = False
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class OAuthRefreshToken(SQLModel, table=True):
+    token_hash: str = Field(primary_key=True)
+    client_id: str = Field(index=True)
+    scopes: list = Field(default_factory=list, sa_column=Column(JSON))
+    expires_at: int  # unix seconds
+    revoked: bool = False
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 _engine: Optional[Engine] = None
