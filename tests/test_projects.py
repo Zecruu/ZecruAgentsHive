@@ -223,6 +223,23 @@ def test_send_to_unknown_project_returns_error():
     print("  [OK]")
 
 
+def test_create_revives_archived_slug():
+    print("--- T13.5: re-creating with an archived slug revives it (200 + revived:true) ---")
+    s = _slug()
+    assert _post_project(s, "Initial").status_code == 201
+    # Archive
+    r = httpx.post(f"{BASE}/api/dashboard/projects/{s}/archive", headers=ORIGIN, timeout=5)
+    assert r.status_code == 200
+    # Re-create with the same slug — should revive, not 409
+    r = _post_project(s, "Revived", "now with description")
+    assert r.status_code == 200, r.text[:200]
+    body = r.json()
+    assert body.get("ok") is True and body.get("revived") is True, body
+    assert body["project"]["archived_at"] is None
+    assert body["project"]["name"] == "Revived"
+    print(f"  [OK] {s} archived → re-created → revived in place")
+
+
 async def test_oauth_endpoints_unaffected_by_project():
     print("--- T13: OAuth metadata is project-orthogonal ---")
     # AS metadata is reachable with or without ?project= — same response
@@ -246,6 +263,7 @@ async def main():
     test_legacy_callers_land_in_default()
     test_state_unknown_project_is_empty_not_error()
     test_send_to_unknown_project_returns_error()
+    test_create_revives_archived_slug()
     await test_oauth_endpoints_unaffected_by_project()
     print("\nALL PROJECTS TESTS PASS")
 

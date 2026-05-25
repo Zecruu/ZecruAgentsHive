@@ -804,14 +804,26 @@ def _make_projects_create_handler(settings: Settings):
         with Session(get_engine()) as session:
             existing = session.exec(select(Project).where(Project.slug == slug)).first()
             if existing is not None:
-                return JSONResponse({"error": f"slug '{slug}' already exists"}, status_code=409)
+                if existing.archived_at is None:
+                    # Active row with this slug — genuine collision.
+                    return JSONResponse({"error": f"slug '{slug}' already exists"}, status_code=409)
+                # Revive an archived project on slug match: clear archived_at and
+                # update name/description so the user can effectively "re-create"
+                # under the same URL identifier. The history (missions, messages)
+                # is preserved — which is sometimes the desired behavior. If a
+                # user wants a fresh start, they can pick a different slug.
+                existing.archived_at = None
+                existing.name = name
+                existing.description = description if isinstance(description, str) else None
+                session.add(existing)
+                session.commit()
+                session.refresh(existing)
+                return JSONResponse({"ok": True, "project": _project_dict(existing), "revived": True}, status_code=200)
             proj = Project(slug=slug, name=name, description=description if isinstance(description, str) else None)
             session.add(proj)
             session.commit()
             session.refresh(proj)
             result = _project_dict(proj)
-        # No broadcast — new project has no subscribers yet, and the existing
-        # dashboards on other projects don't need to know.
         return JSONResponse({"ok": True, "project": result}, status_code=201)
     return handler
 
