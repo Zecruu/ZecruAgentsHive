@@ -395,7 +395,57 @@ function markStaleIfNeeded(kind, id, currentIds) {
   slot.querySelector(".inline-form").appendChild(note);
 }
 
-// ---------- Main poll loop ----------
+// ---------- State rendering (factored out so SSE 'state' events and polling can both call it) ----------
+
+function renderState(s) {
+  const m = s.active_mission;
+  if (m) {
+    $("mission-name").textContent = m.name;
+    $("mission-status").textContent = m.status;
+    $("mission-status").className = "badge " + m.status;
+    $("mission-meta").textContent = `mission ${m.mission_id.slice(0,8)} · created ${ago(m.created_at)}`;
+    fullSpec = m.spec || "";
+    const preview = m.spec_preview || "";
+    $("spec-preview").textContent = specExpanded ? fullSpec : preview;
+    $("spec-toggle").style.display = fullSpec.length > preview.length ? "inline-block" : "none";
+    $("spec-toggle").textContent = specExpanded ? "Collapse" : "Show full spec";
+    $("btn-mark-done").style.display = m.status === "active" ? "inline-block" : "none";
+  } else {
+    $("mission-name").textContent = "No active mission";
+    $("mission-status").textContent = "none";
+    $("mission-status").className = "badge none";
+    $("mission-meta").textContent = "Planner has not created a mission yet.";
+    $("spec-preview").textContent = "";
+    $("spec-toggle").style.display = "none";
+    $("btn-mark-done").style.display = "none";
+  }
+  renderHeartbeat(s.coder_heartbeat);
+
+  $("server-info").textContent =
+    `server v${s.server_info.server_version} · catalog ${s.server_info.tools_catalog_hash} · up since ${ago(s.server_info.started_at)}`;
+
+  const qs = s.pending_questions || [];
+  const ss = s.pending_summaries || [];
+  $("questions").innerHTML = renderQuestions(qs);
+  $("summaries").innerHTML = renderSummaries(ss);
+  $("msgs-c2p").innerHTML = renderMessages((s.messages && s.messages.coder_to_planner) || []);
+  $("msgs-p2c").innerHTML = renderMessages((s.messages && s.messages.planner_to_coder) || []);
+
+  const qIds = new Set(qs.map(q => q.question_id));
+  const sIds = new Set(ss.map(x => x.summary_id));
+  Object.keys(openForms).forEach(key => {
+    const [kind, id] = key.split(":", 2);
+    if (kind === "answer")  markStaleIfNeeded("answer",  id, qIds);
+    if (kind === "respond") markStaleIfNeeded("respond", id, sIds);
+  });
+}
+
+// ---------- Transport: SSE primary, polling fallback (no oscillation) ----------
+
+let es = null;
+let sseFailedCount = 0;
+let pollingHandle = null;
+const SSE_FAIL_BEFORE_FALLBACK = 2;
 
 async function tick() {
   try {
@@ -403,52 +453,46 @@ async function tick() {
     if (r.status === 401) { location.href = "/dashboard/login"; return; }
     if (!r.ok) throw new Error("status " + r.status);
     $("connlost").classList.remove("show");
-    const s = await r.json();
-
-    const m = s.active_mission;
-    if (m) {
-      $("mission-name").textContent = m.name;
-      $("mission-status").textContent = m.status;
-      $("mission-status").className = "badge " + m.status;
-      $("mission-meta").textContent = `mission ${m.mission_id.slice(0,8)} · created ${ago(m.created_at)}`;
-      fullSpec = m.spec || "";
-      const preview = m.spec_preview || "";
-      $("spec-preview").textContent = specExpanded ? fullSpec : preview;
-      $("spec-toggle").style.display = fullSpec.length > preview.length ? "inline-block" : "none";
-      $("spec-toggle").textContent = specExpanded ? "Collapse" : "Show full spec";
-      $("btn-mark-done").style.display = m.status === "active" ? "inline-block" : "none";
-    } else {
-      $("mission-name").textContent = "No active mission";
-      $("mission-status").textContent = "none";
-      $("mission-status").className = "badge none";
-      $("mission-meta").textContent = "Planner has not created a mission yet.";
-      $("spec-preview").textContent = "";
-      $("spec-toggle").style.display = "none";
-      $("btn-mark-done").style.display = "none";
-    }
-    renderHeartbeat(s.coder_heartbeat);
-
-    $("server-info").textContent =
-      `server v${s.server_info.server_version} · catalog ${s.server_info.tools_catalog_hash} · up since ${ago(s.server_info.started_at)}`;
-
-    const qs = s.pending_questions || [];
-    const ss = s.pending_summaries || [];
-    $("questions").innerHTML = renderQuestions(qs);
-    $("summaries").innerHTML = renderSummaries(ss);
-    $("msgs-c2p").innerHTML = renderMessages((s.messages && s.messages.coder_to_planner) || []);
-    $("msgs-p2c").innerHTML = renderMessages((s.messages && s.messages.planner_to_coder) || []);
-
-    // Competing-actor checks for any open inline form
-    const qIds = new Set(qs.map(q => q.question_id));
-    const sIds = new Set(ss.map(x => x.summary_id));
-    Object.keys(openForms).forEach(key => {
-      const [kind, id] = key.split(":", 2);
-      if (kind === "answer")  markStaleIfNeeded("answer",  id, qIds);
-      if (kind === "respond") markStaleIfNeeded("respond", id, sIds);
-    });
+    renderState(await r.json());
   } catch (e) {
     $("connlost").classList.add("show");
   }
+}
+
+function startPolling() {
+  if (pollingHandle !== null) return;  // already polling, don't double-up
+  tick();
+  pollingHandle = setInterval(tick, POLL_MS);
+}
+
+function startSSE() {
+  try {
+    es = new EventSource("/api/dashboard/events", { withCredentials: true });
+  } catch (e) {
+    startPolling();
+    return;
+  }
+  es.addEventListener("state", evt => {
+    try {
+      renderState(JSON.parse(evt.data));
+      $("connlost").classList.remove("show");
+      sseFailedCount = 0;  // a successful event resets the failure counter
+    } catch (e) {
+      // Bad JSON shouldn't happen but don't crash the listener if it does.
+      console.error("renderState failed", e);
+    }
+  });
+  es.onerror = () => {
+    // EventSource auto-reconnects per the server's retry: directive. We count
+    // failures and only fall back to polling after a few in a row, so a brief
+    // network blip doesn't permanently demote us.
+    sseFailedCount += 1;
+    if (sseFailedCount >= SSE_FAIL_BEFORE_FALLBACK) {
+      if (es) { try { es.close(); } catch (_) {} es = null; }
+      $("connlost").classList.add("show");
+      startPolling();
+    }
+  };
 }
 
 $("spec-toggle").addEventListener("click", () => {
@@ -458,8 +502,14 @@ $("spec-toggle").addEventListener("click", () => {
   $("spec-toggle").textContent = specExpanded ? "Collapse" : "Show full spec";
 });
 
-tick();
-setInterval(tick, POLL_MS);
+// Page load: try SSE first. If the browser doesn't have EventSource (very old
+// browsers), or if it fails to connect SSE_FAIL_BEFORE_FALLBACK times in a row,
+// startPolling() takes over and stays there.
+if (typeof EventSource !== "undefined") {
+  startSSE();
+} else {
+  startPolling();
+}
 </script>
 </body>
 </html>

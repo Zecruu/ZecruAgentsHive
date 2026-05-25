@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from . import __version__ as AGENTSHIVE_VERSION
+from . import dashboard_events
 from .config import Settings
 from .db import Message, Mission, Question, Summary, get_engine
 
@@ -152,6 +153,12 @@ def _touch_coder(session: Session) -> None:
 # the decorated function for tool registration.
 
 
+# All _do_<name> functions END by calling dashboard_events.broadcast() on the
+# happy path. Co-locating the SSE push with the state mutation means any caller
+# (MCP tool wrapper, HTTP handler, future caller) gets the push for free — no
+# duplicated-side-effect risk where a new callsite forgets to broadcast.
+
+
 def _do_answer_question(question_id: str, answer: str) -> dict[str, Any]:
     err = _validate_text(answer, "answer", MAX_TEXT_LEN)
     if err:
@@ -167,7 +174,9 @@ def _do_answer_question(question_id: str, answer: str) -> dict[str, Any]:
         session.add(q)
         session.commit()
         session.refresh(q)
-        return _question_dict(q)
+        result = _question_dict(q)
+    dashboard_events.broadcast()
+    return result
 
 
 def _do_respond_to_summary(summary_id: str, response: str) -> dict[str, Any]:
@@ -185,7 +194,9 @@ def _do_respond_to_summary(summary_id: str, response: str) -> dict[str, Any]:
         session.add(s)
         session.commit()
         session.refresh(s)
-        return _summary_dict(s)
+        result = _summary_dict(s)
+    dashboard_events.broadcast()
+    return result
 
 
 def _do_ack_message(message_id: str) -> dict[str, Any]:
@@ -194,12 +205,15 @@ def _do_ack_message(message_id: str) -> dict[str, Any]:
         if m is None:
             return {"error": f"no message with id {message_id}"}
         if m.delivered_at is not None:
+            # Idempotent no-op ack — already broadcast when first acked, don't re-broadcast.
             return _message_dict(m)
         m.delivered_at = _utcnow()
         session.add(m)
         session.commit()
         session.refresh(m)
-        return _message_dict(m)
+        result = _message_dict(m)
+    dashboard_events.broadcast()
+    return result
 
 
 def _do_send_to_coder(body: str) -> dict[str, Any]:
@@ -214,7 +228,87 @@ def _do_send_to_coder(body: str) -> dict[str, Any]:
         session.add(m)
         session.commit()
         session.refresh(m)
-        return _message_dict(m)
+        result = _message_dict(m)
+    dashboard_events.broadcast()
+    return result
+
+
+def _do_create_mission(name: str, spec: str) -> dict[str, Any]:
+    """Insert a new mission, superseding any prior active one. Atomic via partial
+    unique index + IntegrityError retry-once. See v1.2 PR #3 for full rationale.
+    """
+    err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
+    if err:
+        return err
+    for attempt in range(2):
+        try:
+            with Session(get_engine()) as session:
+                current = _active_mission(session)
+                if current:
+                    current.status = "superseded"
+                    session.add(current)
+                mission = Mission(name=name, spec=spec, status="active")
+                session.add(mission)
+                session.commit()
+                session.refresh(mission)
+                result = _mission_dict(mission)
+            dashboard_events.broadcast()
+            return result
+        except IntegrityError:
+            if attempt == 0:
+                continue
+            return {
+                "error": (
+                    "create_mission contention: another concurrent creator beat us "
+                    "twice in a row. The active mission belongs to someone else right "
+                    "now — call get_active_mission to see it, then create_mission again "
+                    "if you still want to supersede."
+                )
+            }
+
+
+def _do_ask_planner(question: str) -> dict[str, Any]:
+    """Insert a Question against the active mission. Does NOT block — the wait
+    loop is MCP-protocol-specific and stays in the @mcp.tool ask_planner wrapper.
+    Returns the question dict (with the new question_id) on success.
+    """
+    err = _validate_text(question, "question", MAX_TEXT_LEN)
+    if err:
+        return err
+    with Session(get_engine()) as session:
+        _touch_coder(session)
+        mission = _active_mission(session)
+        if mission is None:
+            return {"error": "no active mission — cannot ask"}
+        q = Question(mission_id=mission.id, body=question)
+        session.add(q)
+        session.commit()
+        session.refresh(q)
+        result = _question_dict(q)
+    dashboard_events.broadcast()
+    return result
+
+
+def _do_submit_progress(summary: str) -> dict[str, Any]:
+    """Insert a Summary against the active mission. Does NOT block — the wait
+    loop is MCP-protocol-specific and stays in the @mcp.tool submit_progress wrapper.
+    Returns the summary dict (with the new summary_id) on success.
+    """
+    err = _validate_text(summary, "summary", MAX_TEXT_LEN)
+    if err:
+        return err
+    with Session(get_engine()) as session:
+        _touch_coder(session)
+        mission = _active_mission(session)
+        if mission is None:
+            return {"error": "no active mission — cannot submit progress"}
+        s = Summary(mission_id=mission.id, body=summary)
+        session.add(s)
+        session.commit()
+        session.refresh(s)
+        result = _summary_dict(s)
+    dashboard_events.broadcast()
+    return result
 
 
 def _do_mark_mission_done() -> dict[str, Any]:
@@ -227,7 +321,9 @@ def _do_mark_mission_done() -> dict[str, Any]:
         session.add(mission)
         session.commit()
         session.refresh(mission)
-        return _mission_dict(mission)
+        result = _mission_dict(mission)
+    dashboard_events.broadcast()
+    return result
 
 
 def register_tools(mcp, settings: Settings) -> None:
@@ -322,39 +418,7 @@ def register_tools(mcp, settings: Settings) -> None:
             spec: the full natural-language specification the Coder should implement.
                 Must be non-empty, max {MAX_SPEC_LEN // 1024} KB.
         """
-        err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
-        if err:
-            return err
-        # Belt-and-suspenders against concurrent create_mission races on Postgres:
-        # the partial unique index `one_active_mission ON mission(status) WHERE
-        # status='active'` enforces the invariant at the DB level. On collision we
-        # treat the racing winner as a "supersede target" and retry once — semantically
-        # faithful to create_mission's contract ("new mission, prior is superseded").
-        # One retry only: sustained contention should surface as an error so the caller
-        # decides what to do instead of us spinning.
-        for attempt in range(2):
-            try:
-                with Session(get_engine()) as session:
-                    current = _active_mission(session)
-                    if current:
-                        current.status = "superseded"
-                        session.add(current)
-                    mission = Mission(name=name, spec=spec, status="active")
-                    session.add(mission)
-                    session.commit()
-                    session.refresh(mission)
-                    return _mission_dict(mission)
-            except IntegrityError:
-                if attempt == 0:
-                    continue
-                return {
-                    "error": (
-                        "create_mission contention: another concurrent creator beat us "
-                        "twice in a row. The active mission belongs to someone else right "
-                        "now — call get_active_mission to see it, then create_mission again "
-                        "if you still want to supersede."
-                    )
-                }
+        return _do_create_mission(name, spec)
 
     @mcp.tool
     def get_active_mission() -> dict[str, Any]:
@@ -758,20 +822,11 @@ def register_tools(mcp, settings: Settings) -> None:
         response — call wait_for_answer(question_id) repeatedly until you get a real
         answer. Do NOT treat 'pending' as failure.
         """
-        err = _validate_text(question, "question", MAX_TEXT_LEN)
-        if err:
-            return err
-        with Session(get_engine()) as session:
-            _touch_coder(session)
-            mission = _active_mission(session)
-            if mission is None:
-                return {"error": "no active mission — cannot ask"}
-            q = Question(mission_id=mission.id, body=question)
-            session.add(q)
-            session.commit()
-            session.refresh(q)
-            question_id = q.id
-        return _wait_for_question(question_id)
+        # Insert via the module-level _do_ function so the dashboard SSE push fires.
+        inserted = _do_ask_planner(question)
+        if "error" in inserted:
+            return inserted
+        return _wait_for_question(inserted["question_id"])
 
     @mcp.tool
     def wait_for_answer(question_id: str) -> dict[str, Any]:
@@ -810,20 +865,11 @@ def register_tools(mcp, settings: Settings) -> None:
         you get status="pending" + summary_id — call wait_for_summary_response(summary_id)
         to keep waiting.
         """
-        err = _validate_text(summary, "summary", MAX_TEXT_LEN)
-        if err:
-            return err
-        with Session(get_engine()) as session:
-            _touch_coder(session)
-            mission = _active_mission(session)
-            if mission is None:
-                return {"error": "no active mission — cannot submit progress"}
-            s = Summary(mission_id=mission.id, body=summary)
-            session.add(s)
-            session.commit()
-            session.refresh(s)
-            summary_id = s.id
-        return _wait_for_summary(summary_id)
+        # Insert via the module-level _do_ function so the dashboard SSE push fires.
+        inserted = _do_submit_progress(summary)
+        if "error" in inserted:
+            return inserted
+        return _wait_for_summary(inserted["summary_id"])
 
     @mcp.tool
     def wait_for_summary_response(summary_id: str) -> dict[str, Any]:
