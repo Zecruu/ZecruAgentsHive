@@ -11,7 +11,8 @@ from sqlmodel import Session, select
 from . import __version__ as AGENTSHIVE_VERSION
 from . import dashboard_events
 from .config import Settings
-from .db import Message, Mission, Question, Summary, get_engine
+from .db import Message, Mission, Project, Question, Summary, get_engine
+from .project import current_project
 
 
 # Captured at module load. See get_server_info — surfaced as `started_at` so a client
@@ -90,9 +91,31 @@ def _message_dict(m: Message) -> dict[str, Any]:
     }
 
 
-def _active_mission(session: Session) -> Optional[Mission]:
+def _project_id(session: Session, slug: Optional[str] = None) -> Optional[str]:
+    """v1.9: resolve the current request's project slug to its row id.
+
+    Defaults to the slug from the request-time ContextVar. Returns None if the
+    project doesn't exist (callers treat that as "no active mission" — same as
+    pre-v1.9 behavior when no mission existed).
+    """
+    s = slug if slug is not None else current_project()
+    row = session.exec(select(Project).where(Project.slug == s)).first()
+    return row.id if row is not None else None
+
+
+def _active_mission(session: Session, project_slug: Optional[str] = None) -> Optional[Mission]:
+    """v1.9: scoped to the current request's project (or an explicit slug).
+
+    Each project has at most one active mission (enforced by the
+    one_active_mission_per_project partial unique index).
+    """
+    pid = _project_id(session, project_slug)
+    if pid is None:
+        return None
     return session.exec(
-        select(Mission).where(Mission.status == "active").order_by(Mission.created_at.desc())
+        select(Mission)
+        .where(Mission.status == "active", Mission.project_id == pid)
+        .order_by(Mission.created_at.desc())
     ).first()
 
 
@@ -159,6 +182,28 @@ def _touch_coder(session: Session) -> None:
 # duplicated-side-effect risk where a new callsite forgets to broadcast.
 
 
+def _broadcast_for_mission(session: Session, mission_id: Optional[str]) -> Optional[str]:
+    """Return the project slug for a mission_id so callers can broadcast on the
+    right per-project SSE channel. Falls back to the request ContextVar when
+    the mission is missing (deleted) or the FK chain breaks.
+    """
+    if mission_id is None:
+        return current_project()
+    m = session.get(Mission, mission_id)
+    if m is None or m.project_id is None:
+        return current_project()
+    proj = session.get(Project, m.project_id)
+    return proj.slug if proj is not None else current_project()
+
+
+def _broadcast_for_project_id(session: Session, project_id: Optional[str]) -> Optional[str]:
+    """Resolve a project_id (uuid) to its slug for SSE channel addressing."""
+    if project_id is None:
+        return current_project()
+    proj = session.get(Project, project_id)
+    return proj.slug if proj is not None else current_project()
+
+
 def _do_answer_question(question_id: str, answer: str) -> dict[str, Any]:
     err = _validate_text(answer, "answer", MAX_TEXT_LEN)
     if err:
@@ -175,7 +220,8 @@ def _do_answer_question(question_id: str, answer: str) -> dict[str, Any]:
         session.commit()
         session.refresh(q)
         result = _question_dict(q)
-    dashboard_events.broadcast()
+        slug = _broadcast_for_mission(session, q.mission_id)
+    dashboard_events.broadcast(slug)
     return result
 
 
@@ -195,7 +241,8 @@ def _do_respond_to_summary(summary_id: str, response: str) -> dict[str, Any]:
         session.commit()
         session.refresh(s)
         result = _summary_dict(s)
-    dashboard_events.broadcast()
+        slug = _broadcast_for_mission(session, s.mission_id)
+    dashboard_events.broadcast(slug)
     return result
 
 
@@ -212,7 +259,12 @@ def _do_ack_message(message_id: str) -> dict[str, Any]:
         session.commit()
         session.refresh(m)
         result = _message_dict(m)
-    dashboard_events.broadcast()
+        # Broadcast on the message's project (which is intrinsic to the row) so
+        # the dashboard subscribed to that project sees the ack live, even if
+        # the request's ContextVar happens to be a different project (cross-
+        # project ack is a degenerate but possible case).
+        slug = _broadcast_for_project_id(session, m.project_id)
+    dashboard_events.broadcast(slug)
     return result
 
 
@@ -224,28 +276,40 @@ def _do_send_to_coder(body: str) -> dict[str, Any]:
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot send"}
-        m = Message(mission_id=mission.id, direction="planner_to_coder", body=body)
+        m = Message(
+            mission_id=mission.id,
+            project_id=mission.project_id,
+            direction="planner_to_coder",
+            body=body,
+        )
         session.add(m)
         session.commit()
         session.refresh(m)
         result = _message_dict(m)
-    dashboard_events.broadcast()
+        project_slug = current_project()
+    dashboard_events.broadcast(project_slug)
     return result
 
 
 def _do_send_to_user(body: str) -> dict[str, Any]:
     """v1.8: Planner → dashboard user. Mirrors _do_send_to_coder but does NOT
-    require an active mission — the inbox channel is global. If a mission is
-    active, we tag the message with its id so the UI can render a faint
-    mission-boundary divider; if not, mission_id stays None.
+    require an active mission — the inbox channel is global wrt missions.
+
+    v1.9: scoped to the current request's project. mission_id soft-set from
+    active mission if present; project_id is always set (defaults to "default"
+    via the ContextVar) so per-project inbox isolation holds.
     """
     err = _validate_text(body, "body", MAX_TEXT_LEN)
     if err:
         return err
     with Session(get_engine()) as session:
+        pid = _project_id(session)
+        if pid is None:
+            return {"error": f"project '{current_project()}' does not exist"}
         mission = _active_mission(session)
         m = Message(
             mission_id=mission.id if mission is not None else None,
+            project_id=pid,
             direction="planner_to_user",
             body=body,
         )
@@ -253,22 +317,27 @@ def _do_send_to_user(body: str) -> dict[str, Any]:
         session.commit()
         session.refresh(m)
         result = _message_dict(m)
-    dashboard_events.broadcast()
+        project_slug = current_project()
+    dashboard_events.broadcast(project_slug)
     return result
 
 
 def _do_send_to_planner_from_user(body: str) -> dict[str, Any]:
-    """v1.8: dashboard user → Planner inbox. Same shape as _do_send_to_user but the
-    opposite direction. Called from the POST /api/dashboard/send-to-planner handler
-    (NOT from any MCP tool — the dashboard user posts via the browser).
+    """v1.8: dashboard user → Planner inbox. v1.9: scoped to current project;
+    returns an error if the project slug doesn't resolve (rather than silently
+    orphaning the row with project_id=None).
     """
     err = _validate_text(body, "body", MAX_TEXT_LEN)
     if err:
         return err
     with Session(get_engine()) as session:
+        pid = _project_id(session)
+        if pid is None:
+            return {"error": f"project '{current_project()}' does not exist"}
         mission = _active_mission(session)
         m = Message(
             mission_id=mission.id if mission is not None else None,
+            project_id=pid,
             direction="user_to_planner",
             body=body,
         )
@@ -276,13 +345,18 @@ def _do_send_to_planner_from_user(body: str) -> dict[str, Any]:
         session.commit()
         session.refresh(m)
         result = _message_dict(m)
-    dashboard_events.broadcast()
+        project_slug = current_project()
+    dashboard_events.broadcast(project_slug)
     return result
 
 
 def _do_create_mission(name: str, spec: str) -> dict[str, Any]:
-    """Insert a new mission, superseding any prior active one. Atomic via partial
-    unique index + IntegrityError retry-once. See v1.2 PR #3 for full rationale.
+    """Insert a new mission, superseding any prior active one IN THE SAME PROJECT.
+
+    v1.9: scoped to the current request's project. Two projects can each have
+    their own active mission simultaneously — they don't supersede each other.
+    Atomic via the one_active_mission_per_project partial unique index +
+    IntegrityError retry-once.
     """
     err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
     if err:
@@ -290,16 +364,20 @@ def _do_create_mission(name: str, spec: str) -> dict[str, Any]:
     for attempt in range(2):
         try:
             with Session(get_engine()) as session:
+                pid = _project_id(session)
+                if pid is None:
+                    return {"error": f"project '{current_project()}' does not exist"}
                 current = _active_mission(session)
                 if current:
                     current.status = "superseded"
                     session.add(current)
-                mission = Mission(name=name, spec=spec, status="active")
+                mission = Mission(name=name, spec=spec, status="active", project_id=pid)
                 session.add(mission)
                 session.commit()
                 session.refresh(mission)
                 result = _mission_dict(mission)
-            dashboard_events.broadcast()
+                project_slug = current_project()
+            dashboard_events.broadcast(project_slug)
             return result
         except IntegrityError:
             if attempt == 0:
@@ -318,6 +396,8 @@ def _do_ask_planner(question: str) -> dict[str, Any]:
     """Insert a Question against the active mission. Does NOT block — the wait
     loop is MCP-protocol-specific and stays in the @mcp.tool ask_planner wrapper.
     Returns the question dict (with the new question_id) on success.
+
+    v1.9: scoped to current project via _active_mission().
     """
     err = _validate_text(question, "question", MAX_TEXT_LEN)
     if err:
@@ -332,15 +412,13 @@ def _do_ask_planner(question: str) -> dict[str, Any]:
         session.commit()
         session.refresh(q)
         result = _question_dict(q)
-    dashboard_events.broadcast()
+        slug = current_project()
+    dashboard_events.broadcast(slug)
     return result
 
 
 def _do_submit_progress(summary: str) -> dict[str, Any]:
-    """Insert a Summary against the active mission. Does NOT block — the wait
-    loop is MCP-protocol-specific and stays in the @mcp.tool submit_progress wrapper.
-    Returns the summary dict (with the new summary_id) on success.
-    """
+    """Insert a Summary against the active mission. v1.9: scoped to current project."""
     err = _validate_text(summary, "summary", MAX_TEXT_LEN)
     if err:
         return err
@@ -354,11 +432,13 @@ def _do_submit_progress(summary: str) -> dict[str, Any]:
         session.commit()
         session.refresh(s)
         result = _summary_dict(s)
-    dashboard_events.broadcast()
+        slug = current_project()
+    dashboard_events.broadcast(slug)
     return result
 
 
 def _do_mark_mission_done() -> dict[str, Any]:
+    """v1.9: scoped to current project's active mission."""
     with Session(get_engine()) as session:
         mission = _active_mission(session)
         if mission is None:
@@ -369,7 +449,8 @@ def _do_mark_mission_done() -> dict[str, Any]:
         session.commit()
         session.refresh(mission)
         result = _mission_dict(mission)
-    dashboard_events.broadcast()
+        slug = current_project()
+    dashboard_events.broadcast(slug)
     return result
 
 
@@ -694,11 +775,19 @@ def register_tools(mcp, settings: Settings) -> None:
             mission = _active_mission(session)
             if mission is None:
                 return {"error": "no active mission — cannot send"}
-            m = Message(mission_id=mission.id, direction="coder_to_planner", body=body)
+            m = Message(
+                mission_id=mission.id,
+                project_id=mission.project_id,
+                direction="coder_to_planner",
+                body=body,
+            )
             session.add(m)
             session.commit()
             session.refresh(m)
-            return _message_dict(m)
+            result = _message_dict(m)
+            slug = current_project()
+        dashboard_events.broadcast(slug)
+        return result
 
     @mcp.tool
     def wait_for_planner_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
@@ -781,8 +870,11 @@ def register_tools(mcp, settings: Settings) -> None:
         subsequent calls keep returning the same row (with redelivery_count incrementing).
         Reader pattern: wait → process → reply via send_to_user (optional) → ack.
 
-        v1.8: NOT scoped to active mission. The inbox is global — works whether
-        there's an active mission or not.
+        v1.8: NOT scoped to active mission — the inbox is global wrt missions.
+        v1.9: NOW scoped to the current request's project. A Planner connected
+        to project A's MCP URL only sees project A's inbox; switching projects
+        means a different MCP URL (Q4: one MCP entry per project per Coder/
+        Planner session).
 
         On timeout: {status: "pending", message: ...}. Call again to keep waiting.
 
@@ -796,14 +888,19 @@ def register_tools(mcp, settings: Settings) -> None:
             session.commit()
             session.refresh(m)
         return _wait_global(
-            lambda session: session.exec(
-                select(Message)
-                .where(
-                    Message.direction == "user_to_planner",
-                    Message.delivered_at.is_(None),
-                )
-                .order_by(Message.created_at)
-            ).first(),
+            lambda session: (
+                session.exec(
+                    select(Message)
+                    .where(
+                        Message.direction == "user_to_planner",
+                        Message.delivered_at.is_(None),
+                        Message.project_id == _project_id(session),
+                    )
+                    .order_by(Message.created_at)
+                ).first()
+                if _project_id(session) is not None
+                else None
+            ),
             _message_dict,
             "no inbox messages yet — call wait_for_user_message again to keep waiting",
             timeout_seconds if timeout_seconds is not None else block_timeout,
@@ -827,9 +924,15 @@ def register_tools(mcp, settings: Settings) -> None:
         automatically.
         """
         with Session(get_engine()) as session:
+            pid = _project_id(session)
+            if pid is None:
+                return []
             rows = session.exec(
                 select(Message)
-                .where(Message.direction.in_(("user_to_planner", "planner_to_user")))
+                .where(
+                    Message.direction.in_(("user_to_planner", "planner_to_user")),
+                    Message.project_id == pid,
+                )
                 .order_by(Message.created_at.desc())
                 .limit(max(1, min(limit, 500)))
             ).all()

@@ -87,6 +87,40 @@ The server validates RFC 8707 audience in two places to defeat confused-deputy:
 
 The legacy bearer key path is unaffected by audience validation (it's pre-OAuth and uses the canonical audience by definition).
 
+## Using AgentsHive for multiple projects (v1.9+)
+
+AgentsHive scopes every mission, question, summary, message, and dashboard view by **project**. One AgentsHive deployment can host many independent projects — Zecru Widget, internal tools, side projects — without their missions or chats colliding. A v1.0–v1.8 deployment with no project awareness still works: all legacy data lives in a reserved `default` project, and any client that doesn't supply a project parameter lands there automatically.
+
+### Adding a Coder MCP entry for a project
+
+Append `?project=<slug>` to the `/mcp` URL when registering the connector:
+
+```bash
+claude mcp add agentshive-zecru-widget \
+  https://<your-railway>.up.railway.app/mcp?project=zecru-widget \
+  --header "Authorization: Bearer $AGENTSHIVE_API_KEY"
+```
+
+One MCP entry per project per Claude Code window. The Coder window is bound to one project for its lifetime — to switch projects, add a different `agentshive-<slug>` entry pointing at the new project's URL. This is intrinsic to FastMCP transport semantics (one connection per server URL).
+
+### Dashboard project switcher
+
+The dashboard header has a **Project** dropdown that lists every non-archived project. Switching reloads the page to the new project's URL (`?project=<slug>`), which:
+
+- Re-subscribes the SSE channel to the new project (so only that project's events arrive live).
+- Re-fetches `/api/dashboard/state` so the page shows only the new project's missions, questions, summaries, inbox.
+- Inline **+ New project** and **Archive** buttons next to the dropdown handle creation and soft-delete from the dashboard directly.
+
+### Project lifecycle
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/dashboard/projects` | List non-archived projects (add `?include_archived=true` to see them all) |
+| `POST /api/dashboard/projects` | Body `{slug, name, description?}`. Slug validated against `^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$` (kebab-case, 1-42 chars). The `default` slug is reserved. Returns 201 on success, 400 on validation error, 409 on slug collision |
+| `POST /api/dashboard/projects/<slug>/archive` | Soft-delete: sets `archived_at`, hides from switcher, preserves data. The `default` project cannot be archived |
+
+OAuth tokens are project-orthogonal: an OAuth client issued during a consent flow for project A works for project B too. Project scope is a request-level concern (read from the URL), not an authentication concern.
+
 ## Dashboard (v1.4+)
 
 A read-only web view of the unified Planner / Coder state, served by the same Starlette app at:

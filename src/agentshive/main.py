@@ -5,7 +5,7 @@ from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .auth import BearerAuthMiddleware
+from .auth import BearerAuthMiddleware, ProjectContextMiddleware
 from .config import load_settings
 from .dashboard import register_routes as register_dashboard_routes
 from .db import init_engine
@@ -56,7 +56,14 @@ def build_app():
     # API-key-or-cookie-via-form for /oauth/consent).
     register_dashboard_routes(app, settings, _capture_tool_names(mcp), oauth_provider=oauth_provider)
 
+    # Middleware order (Starlette wraps in LIFO, so add the innermost LAST):
+    #   1. ProjectContextMiddleware (added first → wraps outermost → runs FIRST
+    #      on every request, so the ContextVar is populated before BearerAuth or
+    #      any downstream handler reads it).
+    #   2. BearerAuthMiddleware (added second → wraps innermost → runs SECOND,
+    #      gates access to non-public paths with the legacy shared key).
     app.add_middleware(BearerAuthMiddleware, api_key=settings.api_key)
+    app.add_middleware(ProjectContextMiddleware)
     return app, settings
 
 

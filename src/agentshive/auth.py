@@ -4,6 +4,40 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from .project import (
+    DEFAULT_PROJECT_SLUG,
+    PROJECT_CONTEXT,
+    SLUG_PATTERN,
+)
+
+
+class ProjectContextMiddleware(BaseHTTPMiddleware):
+    """v1.9: read `?project=<slug>` from every incoming request and set the
+    PROJECT_CONTEXT ContextVar before downstream middleware / routes run.
+
+    Falls back to `default` when:
+      - no `?project=` is supplied (legacy callers, pre-v1.9 clients)
+      - the supplied slug fails the format regex (malformed input is silently
+        coerced to default rather than 400'd — this is safer for the OAuth +
+        well-known surface, which never carries a project anyway, and it
+        matches Q1's "default is reserved for legacy/unscoped" semantics)
+
+    The ContextVar token is reset in finally so concurrent requests don't
+    leak each other's project context. Since we register this middleware
+    in main.py BEFORE BearerAuthMiddleware, every downstream handler — MCP
+    transport, dashboard routes, OAuth endpoints — sees a populated
+    PROJECT_CONTEXT.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        raw = (request.query_params.get("project") or "").strip().lower()
+        slug = raw if (raw and SLUG_PATTERN.fullmatch(raw)) else DEFAULT_PROJECT_SLUG
+        token = PROJECT_CONTEXT.set(slug)
+        try:
+            return await call_next(request)
+        finally:
+            PROJECT_CONTEXT.reset(token)
+
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Reject any request whose Authorization header doesn't carry the shared API key.
@@ -38,6 +72,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         "/api/dashboard/mark-done",
         # v1.6 SSE push channel — dashboard handler enforces cookie-or-bearer auth.
         "/api/dashboard/events",
+        # v1.9 Projects CRUD — dashboard handlers enforce cookie-or-bearer auth
+        # themselves. The archive route is path-parameterized; the dispatch
+        # loop below uses startswith for the /api/dashboard/projects/ prefix
+        # since exact-match wouldn't cover /<slug>/archive.
+        "/api/dashboard/projects",
         # v1.7 OAuth surface — these endpoints MUST be reachable without a prior
         # bearer token (it's the user-facing path to GET one). Auth, where needed,
         # is enforced inside the SDK handlers (PKCE, client validation) or the
@@ -63,7 +102,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if path in self.PUBLIC_PATHS or path.startswith("/.well-known/oauth-"):
+        if (
+            path in self.PUBLIC_PATHS
+            or path.startswith("/.well-known/oauth-")
+            or path.startswith("/api/dashboard/projects/")  # /<slug>/archive
+        ):
             return await call_next(request)
         header = request.headers.get("authorization", "")
         if not header.lower().startswith("bearer "):
