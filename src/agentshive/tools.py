@@ -233,6 +233,53 @@ def _do_send_to_coder(body: str) -> dict[str, Any]:
     return result
 
 
+def _do_send_to_user(body: str) -> dict[str, Any]:
+    """v1.8: Planner → dashboard user. Mirrors _do_send_to_coder but does NOT
+    require an active mission — the inbox channel is global. If a mission is
+    active, we tag the message with its id so the UI can render a faint
+    mission-boundary divider; if not, mission_id stays None.
+    """
+    err = _validate_text(body, "body", MAX_TEXT_LEN)
+    if err:
+        return err
+    with Session(get_engine()) as session:
+        mission = _active_mission(session)
+        m = Message(
+            mission_id=mission.id if mission is not None else None,
+            direction="planner_to_user",
+            body=body,
+        )
+        session.add(m)
+        session.commit()
+        session.refresh(m)
+        result = _message_dict(m)
+    dashboard_events.broadcast()
+    return result
+
+
+def _do_send_to_planner_from_user(body: str) -> dict[str, Any]:
+    """v1.8: dashboard user → Planner inbox. Same shape as _do_send_to_user but the
+    opposite direction. Called from the POST /api/dashboard/send-to-planner handler
+    (NOT from any MCP tool — the dashboard user posts via the browser).
+    """
+    err = _validate_text(body, "body", MAX_TEXT_LEN)
+    if err:
+        return err
+    with Session(get_engine()) as session:
+        mission = _active_mission(session)
+        m = Message(
+            mission_id=mission.id if mission is not None else None,
+            direction="user_to_planner",
+            body=body,
+        )
+        session.add(m)
+        session.commit()
+        session.refresh(m)
+        result = _message_dict(m)
+    dashboard_events.broadcast()
+    return result
+
+
 def _do_create_mission(name: str, spec: str) -> dict[str, Any]:
     """Insert a new mission, superseding any prior active one. Atomic via partial
     unique index + IntegrityError retry-once. See v1.2 PR #3 for full rationale.
@@ -399,6 +446,33 @@ def register_tools(mcp, settings: Settings) -> None:
                         if on_hit_mutate is not None:
                             on_hit_mutate(row, session)
                         return to_dict(row)
+            if time.monotonic() >= deadline:
+                return {"status": "pending", "message": pending_msg}
+            time.sleep(poll_interval)
+
+    def _wait_global(
+        query_fn,
+        to_dict,
+        pending_msg,
+        block_for,
+        on_hit_mutate=None,
+    ):
+        """v1.8: Pattern B variant that does NOT require an active mission.
+
+        Used by the dashboard inbox channel (wait_for_user_message). Identical
+        shape to _wait_for_active except the query_fn takes only a session — no
+        mission gate. Kept as a sibling rather than overloading _wait_for_active
+        with a "skip mission check" flag because explicit beats clever in
+        protocol code (validated repeatedly across v1.1/v1.2/v1.3).
+        """
+        deadline = time.monotonic() + block_for
+        while True:
+            with Session(get_engine()) as session:
+                row = query_fn(session)
+                if row is not None:
+                    if on_hit_mutate is not None:
+                        on_hit_mutate(row, session)
+                    return to_dict(row)
             if time.monotonic() >= deadline:
                 return {"status": "pending", "message": pending_msg}
             time.sleep(poll_interval)
@@ -665,6 +739,101 @@ def register_tools(mcp, settings: Settings) -> None:
             timeout_seconds if timeout_seconds is not None else block_timeout,
             on_hit_mutate=_bump,
         )
+
+    # ---------- v1.8 Inbox channel — Planner ↔ dashboard user ----------
+    #
+    # Two new Message direction values, both global (no active mission required):
+    #   - user_to_planner — sent from the dashboard chat composer; received by
+    #     the Planner via wait_for_user_message
+    #   - planner_to_user — sent from this Planner-side tool send_to_user;
+    #     rendered live in the dashboard chat panel via SSE
+    #
+    # ack_message is direction-agnostic and handles both directions transparently
+    # (verified by reading _do_ack_message — no direction filter). The dashboard
+    # auto-acks planner_to_user rows on render so the Planner doesn't see them
+    # bounce back as unacked. user_to_planner rows MUST be acked by the Planner
+    # AFTER processing (v1.2 at-least-once contract) — never auto-acked.
+
+    @mcp.tool
+    def send_to_user(body: str) -> dict[str, Any]:
+        """Planner-side: send a free-form message TO the dashboard user. Fire-and-forget.
+
+        v1.8 global inbox: this is the back-channel to the human running the
+        dashboard. Use it for async replies to things the user typed in the
+        dashboard chat panel, or to drop a note for them to see whenever they
+        next open the dashboard. The user reads via the dashboard chat panel
+        (rendered live via SSE); they do not need to "fetch" anything.
+
+        Does NOT require an active mission — the inbox is global. If a mission
+        is active when you call this, the message is tagged with its id so the
+        UI can render mission boundaries; if not, mission_id stays None.
+
+        Returns the message_id immediately; does NOT block.
+        """
+        return _do_send_to_user(body)
+
+    @mcp.tool
+    def wait_for_user_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Planner-side: block until an unacked dashboard-user message exists in the inbox.
+
+        AT-LEAST-ONCE SEMANTICS (v1.2): returns the OLDEST unacked user_to_planner
+        message but does NOT stamp delivered_at. Until you call ack_message(message_id),
+        subsequent calls keep returning the same row (with redelivery_count incrementing).
+        Reader pattern: wait → process → reply via send_to_user (optional) → ack.
+
+        v1.8: NOT scoped to active mission. The inbox is global — works whether
+        there's an active mission or not.
+
+        On timeout: {status: "pending", message: ...}. Call again to keep waiting.
+
+        Args:
+            timeout_seconds: optional override for the server-side block. Falls back to
+                TOOL_BLOCK_TIMEOUT_SECONDS.
+        """
+        def _bump(m, session):
+            m.redelivery_count = (m.redelivery_count or 0) + 1
+            session.add(m)
+            session.commit()
+            session.refresh(m)
+        return _wait_global(
+            lambda session: session.exec(
+                select(Message)
+                .where(
+                    Message.direction == "user_to_planner",
+                    Message.delivered_at.is_(None),
+                )
+                .order_by(Message.created_at)
+            ).first(),
+            _message_dict,
+            "no inbox messages yet — call wait_for_user_message again to keep waiting",
+            timeout_seconds if timeout_seconds is not None else block_timeout,
+            on_hit_mutate=_bump,
+        )
+
+    @mcp.tool
+    def list_inbox_history(limit: int = 50) -> list[dict[str, Any]]:
+        """Planner-side: snapshot of the recent chat history with the dashboard user.
+
+        Returns up to `limit` (default 50) most-recent inbox messages — BOTH directions
+        (user_to_planner and planner_to_user) — ordered oldest to newest. Use this on
+        session return to see what the user wrote while you were away, or to scroll back
+        through earlier turns of a long chat.
+
+        Does not affect delivered_at — read-only. Pair with wait_for_user_message for
+        new arrivals and ack_message after processing.
+
+        Transport note: list returns are wrapped by FastMCP's structured_content layer
+        under a "result" key in the MCP message envelope. Most clients unwrap this
+        automatically.
+        """
+        with Session(get_engine()) as session:
+            rows = session.exec(
+                select(Message)
+                .where(Message.direction.in_(("user_to_planner", "planner_to_user")))
+                .order_by(Message.created_at.desc())
+                .limit(max(1, min(limit, 500)))
+            ).all()
+            return [_message_dict(m) for m in reversed(rows)]
 
     @mcp.tool
     def ack_message(message_id: str) -> dict[str, Any]:

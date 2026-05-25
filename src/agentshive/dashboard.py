@@ -41,6 +41,7 @@ from .tools import (
     _do_mark_mission_done,
     _do_respond_to_summary,
     _do_send_to_coder,
+    _do_send_to_planner_from_user,
     _message_dict,
     _mission_dict,
     _question_dict,
@@ -273,12 +274,18 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
             "started_at": SERVER_STARTED_AT.isoformat(),
         }
 
+        # v1.8: global inbox channel (user ↔ planner chat). Always populated
+        # regardless of active mission. Single chronological list (oldest first)
+        # so the frontend can render it as a chat transcript without re-sorting.
+        inbox = _recent_inbox_messages(session)
+
         return {
             "active_mission": active_dict,
             "recent_missions": recent,
             "pending_questions": pending_q,
             "pending_summaries": pending_s,
             "messages": {"coder_to_planner": c2p, "planner_to_coder": p2c},
+            "inbox": inbox,
             "server_info": server_info,
             "coder_heartbeat": heartbeat,
         }
@@ -314,6 +321,23 @@ def _recent_messages_global(session: Session, direction: str, total: int = 10) -
     rows = session.exec(
         select(Message)
         .where(Message.direction == direction)
+        .order_by(desc(Message.created_at))
+        .limit(total)
+    ).all()
+    return [_message_dict(m) for m in reversed(rows)]
+
+
+def _recent_inbox_messages(session: Session, total: int = 20) -> list[dict[str, Any]]:
+    """v1.8 inbox feed for the dashboard chat panel.
+
+    Combines both directions (user_to_planner + planner_to_user) into a single
+    chronological list, oldest first. NOT scoped to active mission — the inbox
+    is global. The frontend renders this as a chat transcript and uses
+    direction to decide bubble alignment (You = right, Planner = left).
+    """
+    rows = session.exec(
+        select(Message)
+        .where(Message.direction.in_(("user_to_planner", "planner_to_user")))
         .order_by(desc(Message.created_at))
         .limit(total)
     ).all()
@@ -432,6 +456,19 @@ def _make_send_handler(settings):
     def action(body):
         msg_body = body.get("body", "")
         return "message", _do_send_to_coder(msg_body)
+    return _make_write_handler(settings, action)
+
+
+def _make_send_to_planner_handler(settings):
+    """v1.8: dashboard user posts a chat message into the global inbox.
+
+    Distinct from _make_send_handler (which sends planner_to_coder during an
+    active mission) — this one writes user_to_planner and works without an
+    active mission. Same auth+CSRF+JSON envelope.
+    """
+    def action(body):
+        msg_body = body.get("body", "")
+        return "message", _do_send_to_planner_from_user(msg_body)
     return _make_write_handler(settings, action)
 
 
@@ -707,6 +744,9 @@ def register_routes(app, settings: Settings, tool_names: list[str], oauth_provid
     app.router.routes.append(Route("/api/dashboard/respond", _make_respond_handler(settings), methods=["POST"]))
     app.router.routes.append(Route("/api/dashboard/ack", _make_ack_handler(settings), methods=["POST"]))
     app.router.routes.append(Route("/api/dashboard/send", _make_send_handler(settings), methods=["POST"]))
+    # v1.8 inbox: dashboard user posts a chat message to the Planner. Distinct
+    # from /api/dashboard/send (which is planner→coder during a mission).
+    app.router.routes.append(Route("/api/dashboard/send-to-planner", _make_send_to_planner_handler(settings), methods=["POST"]))
     app.router.routes.append(Route("/api/dashboard/mark-done", _make_mark_done_handler(settings), methods=["POST"]))
     # v1.6 SSE push channel
     app.router.routes.append(Route("/api/dashboard/events", _make_events_handler(settings), methods=["GET"]))

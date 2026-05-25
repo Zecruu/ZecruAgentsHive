@@ -66,6 +66,27 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
 .inline-error { color: #ff8a78; font-size: 12px; margin-top: 4px; }
 .stale-note   { background: #2a2418; color: #e8c47a; font-size: 12px;
                 padding: 6px 10px; border-radius: 4px; margin-top: 6px; }
+/* v1.8 Inbox chat panel — single-column conversation, bubbles aligned by direction. */
+#inbox-feed { display: flex; flex-direction: column; gap: 8px; max-height: 50vh;
+              overflow-y: auto; padding: 4px 2px; }
+.bubble { max-width: 78%; padding: 8px 12px; border-radius: 12px; font-size: 13px;
+          line-height: 1.4; white-space: pre-wrap; word-wrap: break-word; }
+.bubble.you     { align-self: flex-end; background: #2a3a5a; color: #e8eaf0;
+                  border-bottom-right-radius: 4px; }
+.bubble.planner { align-self: flex-start; background: #1f2a22; color: #d6dcd8;
+                  border-bottom-left-radius: 4px; }
+.bubble .bubble-meta { font-size: 10px; color: #6a7080; margin-top: 4px;
+                       display: flex; gap: 6px; align-items: center; }
+.bubble.you .bubble-meta { justify-content: flex-end; }
+.bubble.planner .bubble-meta { justify-content: flex-start; }
+.bubble-author { font-weight: 600; opacity: 0.75; }
+.mission-divider { align-self: center; font-size: 10px; color: #6a7080;
+                   padding: 2px 8px; background: #16181d;
+                   border: 1px solid #232732; border-radius: 10px; }
+#inbox-composer { display: flex; gap: 8px; margin-top: 10px;
+                  border-top: 1px solid #232732; padding-top: 10px; }
+#inbox-composer textarea { min-height: 38px; max-height: 140px; }
+#inbox-composer button { align-self: flex-end; }
 </style>
 </head>
 <body>
@@ -124,6 +145,21 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
         <div id="msgs-p2c"><div class="empty">Loading…</div></div>
       </div>
     </div>
+  </div>
+
+  <!-- v1.8 Inbox: chat back-channel between dashboard user and the Planner. -->
+  <div class="card" id="inbox-card">
+    <h2 class="panel-title">
+      <span>Chat with Planner</span>
+      <small class="dim">async · global (no mission required)</small>
+    </h2>
+    <div id="inbox-feed"><div class="empty">Loading…</div></div>
+    <form id="inbox-composer" onsubmit="return sendInboxMessage(event)">
+      <textarea id="inbox-input" placeholder="Message the Planner… (Enter to send, Shift+Enter for newline)"
+                onkeydown="handleInboxKeydown(event)"></textarea>
+      <button class="primary" type="submit">Send</button>
+    </form>
+    <div id="inbox-error" class="inline-error" style="display:none"></div>
   </div>
 </main>
 
@@ -430,6 +466,7 @@ function renderState(s) {
   $("summaries").innerHTML = renderSummaries(ss);
   $("msgs-c2p").innerHTML = renderMessages((s.messages && s.messages.coder_to_planner) || []);
   $("msgs-p2c").innerHTML = renderMessages((s.messages && s.messages.planner_to_coder) || []);
+  renderInbox(s.inbox || []);
 
   const qIds = new Set(qs.map(q => q.question_id));
   const sIds = new Set(ss.map(x => x.summary_id));
@@ -438,6 +475,110 @@ function renderState(s) {
     if (kind === "answer")  markStaleIfNeeded("answer",  id, qIds);
     if (kind === "respond") markStaleIfNeeded("respond", id, sIds);
   });
+}
+
+// ---------- v1.8 Inbox: chat with the Planner ----------
+
+// Tracks which planner_to_user message_ids the dashboard has already kicked off
+// an auto-ack for. The 2s delay (per Planner Q4) catches fast tab-crashes while
+// still keeping the unacked badge from sticking around in the UI. user_to_planner
+// messages are NEVER auto-acked — the Planner must ack them via ack_message after
+// processing per the v1.2 at-least-once contract.
+const inboxScheduledAck = new Set();
+let inboxLastRenderedId = null;
+
+function renderInbox(items) {
+  const feed = $("inbox-feed");
+  if (!feed) return;
+  if (!items.length) {
+    feed.innerHTML = `<div class="empty">No messages yet. Type below to start a conversation.</div>`;
+    return;
+  }
+  // Track scroll: only auto-scroll to bottom if user was already near the bottom
+  // OR a new message arrived (so reading scrollback isn't disrupted by a poll).
+  const wasNearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+  const newestId = items[items.length - 1].message_id;
+  const hasNew = newestId !== inboxLastRenderedId;
+  inboxLastRenderedId = newestId;
+
+  let lastMissionId = undefined;
+  const parts = [];
+  for (const m of items) {
+    if (m.mission_id && m.mission_id !== lastMissionId && lastMissionId !== undefined) {
+      parts.push(`<div class="mission-divider">─── mission ${escapeHtml(m.mission_id.slice(0,8))} ───</div>`);
+    }
+    lastMissionId = m.mission_id;
+    const isYou = m.direction === "user_to_planner";
+    const cls = isYou ? "you" : "planner";
+    const author = isYou ? "You" : "Planner";
+    const ackBadge = m.delivered_at
+      ? `<span class="badge acked">acked</span>`
+      : `<span class="badge unacked">unacked</span>`;
+    parts.push(
+      `<div class="bubble ${cls}">` +
+        escapeHtml(m.body) +
+        `<div class="bubble-meta">` +
+          `<span class="bubble-author">${author}</span>` +
+          `<span>${ago(m.created_at)}</span>` +
+          ackBadge +
+        `</div>` +
+      `</div>`
+    );
+
+    // Auto-ack only planner_to_user rows, only once per id, only after 2s.
+    if (!isYou && !m.delivered_at && !inboxScheduledAck.has(m.message_id)) {
+      inboxScheduledAck.add(m.message_id);
+      const mid = m.message_id;
+      setTimeout(() => {
+        postJSON("/api/dashboard/ack", { message_id: mid }).catch(() => {
+          // Network blip — clear the flag so the next render retries.
+          inboxScheduledAck.delete(mid);
+        });
+      }, 2000);
+    }
+  }
+  feed.innerHTML = parts.join("");
+  if (wasNearBottom || hasNew) {
+    feed.scrollTop = feed.scrollHeight;
+  }
+}
+
+function handleInboxKeydown(e) {
+  // Enter sends; Shift+Enter inserts a newline.
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendInboxMessage(e);
+  }
+}
+
+async function sendInboxMessage(e) {
+  if (e && e.preventDefault) e.preventDefault();
+  const input = $("inbox-input");
+  const err = $("inbox-error");
+  const body = (input.value || "").trim();
+  err.style.display = "none";
+  if (!body) return false;
+  // Disable composer during send so double-Enter doesn't double-post.
+  input.disabled = true;
+  try {
+    const r = await postJSON("/api/dashboard/send-to-planner", { body });
+    if (!r.ok) {
+      err.textContent = r.error || "Send failed.";
+      err.style.display = "block";
+      return false;
+    }
+    input.value = "";
+    // Optimistic refresh: SSE will deliver the new state momentarily, but
+    // poke the polling fallback once so users not on SSE see it immediately.
+    tick();
+  } catch (e2) {
+    err.textContent = "Network error — try again.";
+    err.style.display = "block";
+  } finally {
+    input.disabled = false;
+    input.focus();
+  }
+  return false;
 }
 
 // ---------- Transport: SSE primary, polling fallback (no oscillation) ----------

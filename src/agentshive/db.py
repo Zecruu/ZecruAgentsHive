@@ -68,7 +68,12 @@ class Summary(SQLModel, table=True):
 #                   client crashed mid-response.
 class Message(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
-    mission_id: str = Field(foreign_key="mission.id", index=True)
+    # v1.8: mission_id is OPTIONAL — the new "user_to_planner" / "planner_to_user"
+    # inbox channel is global, not scoped to any mission. Mission-scoped sends
+    # (coder/planner directions) still populate this field; inbox sends leave it
+    # NULL if there's no active mission, OR set it to the active mission's id as
+    # a soft "this happened during mission X" association.
+    mission_id: Optional[str] = Field(default=None, foreign_key="mission.id", index=True)
     direction: str = Field(index=True)
     body: str
     created_at: datetime = Field(default_factory=_utcnow)
@@ -181,7 +186,8 @@ def _apply_inline_migrations(engine: Engine) -> None:
             conn.execute(text(f"ALTER TABLE mission ADD COLUMN {col_name} {col_def}"))
 
     if "message" in inspector.get_table_names():
-        msg_cols = {col["name"] for col in inspector.get_columns("message")}
+        msg_cols_full = inspector.get_columns("message")
+        msg_cols = {col["name"] for col in msg_cols_full}
         message_additive = {
             "redelivery_count": "INTEGER DEFAULT 0",
         }
@@ -190,6 +196,31 @@ def _apply_inline_migrations(engine: Engine) -> None:
                 if col_name in msg_cols:
                     continue
                 conn.execute(text(f"ALTER TABLE message ADD COLUMN {col_name} {col_def}"))
+
+        # v1.8: relax NOT NULL on message.mission_id so the global inbox can store
+        # mission_id=None. Two cases:
+        #   - Postgres: a single ALTER COLUMN ... DROP NOT NULL, idempotent.
+        #   - SQLite: NOT NULL on an existing column requires a table-rebuild
+        #     dance we deliberately skipped (Planner Q5: prod is Postgres, dev is
+        #     throwaway). Emit a clear warning so the dev knows to rm the DB file
+        #     instead of getting a cryptic OperationalError on first send_to_user.
+        mission_id_col = next((c for c in msg_cols_full if c["name"] == "mission_id"), None)
+        is_nullable = bool(mission_id_col and mission_id_col.get("nullable", True))
+        if not is_nullable:
+            dialect_name = engine.dialect.name
+            if dialect_name == "postgresql":
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE message ALTER COLUMN mission_id DROP NOT NULL"))
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Pre-v1.8 %s DB detected: message.mission_id is still NOT NULL. "
+                    "The new global inbox (user_to_planner / planner_to_user) requires "
+                    "a nullable mission_id. Delete your local DB file and restart to "
+                    "regenerate the schema. Production Postgres handles this via inline "
+                    "ALTER; SQLite intentionally does not.",
+                    dialect_name,
+                )
 
     # v1.2 Feature 2: enforce "at most one active mission" at the DB level via partial unique
     # index. Belt to the supersede-and-retry suspenders in create_mission — survives app bugs.
