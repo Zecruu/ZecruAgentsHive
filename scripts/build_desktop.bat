@@ -39,6 +39,11 @@ REM packaging lesson. PyInstaller doesn't auto-discover non-.py resources.
   --noconfirm ^
   --clean ^
   --add-data "src/agentshive/templates;agentshive/templates" ^
+  --collect-all fastmcp ^
+  --collect-all mcp ^
+  --collect-all sqlmodel ^
+  --collect-all fastapi ^
+  --copy-metadata fastmcp-slim ^
   --hidden-import uvicorn.lifespan.on ^
   --hidden-import uvicorn.lifespan.off ^
   --hidden-import uvicorn.protocols.http.auto ^

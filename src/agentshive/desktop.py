@@ -270,16 +270,22 @@ def _serve_raise_pipe(on_raise) -> None:
 
 
 def start_server_subprocess(local_key: str) -> subprocess.Popen:
-    """Spawn the existing `agentshive.main` server entrypoint as a subprocess.
+    """Spawn the server as a subprocess of THIS executable in --server mode.
 
-    `main()` reads PORT from env and calls `uvicorn.run(app, host, port)`, so
-    we don't need to invoke `python -m uvicorn` directly (which would require
-    `app` to be a module-level attribute — it isn't; it's built by build_app()).
-    This way the same code path is used in Railway and Desktop.
+    Why `[sys.executable, "--server"]` instead of `python -m agentshive.main`:
+      - In a PyInstaller bundle there's no Python interpreter to invoke via
+        `-c "..."` or `-m module` — sys.executable IS the bundled .exe. The
+        only way to "spawn a child Python" is to re-exec ourselves with a
+        flag the entry script branches on.
+      - In source-tree dev runs, sys.executable is the venv's python.exe, so
+        `[sys.executable, "--server"]` becomes `python.exe --server` which
+        hits desktop.py's argparse (the same script is the entry point).
+      - Either way the child process eventually calls `agentshive.main.main()`
+        which runs uvicorn — same code path as Railway, same kill semantics
+        as a normal subprocess.
 
-    PyInstaller-bundled executables run with `sys.executable` pointing at the
-    bundled exe — passing `-c "from agentshive.main import main; main()"` works
-    because agentshive is a packaged module inside the bundle.
+    The --server mode handler is implemented in main() below; it short-circuits
+    before the GUI bootstrap.
     """
     env = os.environ.copy()
     env["AGENTSHIVE_API_KEY"] = local_key
@@ -293,7 +299,7 @@ def start_server_subprocess(local_key: str) -> subprocess.Popen:
     # --windowed and otherwise wouldn't have a console anyway).
     creationflags = 0x08000000  # CREATE_NO_WINDOW
     return subprocess.Popen(
-        [sys.executable, "-c", "from agentshive.main import main; main()"],
+        [sys.executable, "--server"],
         env=env,
         creationflags=creationflags,
         stdin=subprocess.DEVNULL,
@@ -375,9 +381,22 @@ def main() -> int:
     )
     parser.add_argument("--headless", action="store_true",
                         help="Run the server only, no GUI (for testing / dev)")
+    parser.add_argument("--server", action="store_true",
+                        help="Internal: run as the server-only subprocess "
+                             "(used by the desktop shell to spawn uvicorn inside "
+                             "the PyInstaller bundle). Reads PORT + AGENTSHIVE_* "
+                             "from env.")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose logging + pywebview debug mode")
     args = parser.parse_args()
+
+    # --server mode: hand off to agentshive.main.main() and never return.
+    # This branch is what the parent desktop process Popen-spawns; it has to
+    # short-circuit BEFORE the GUI bootstrap / lock acquisition.
+    if args.server:
+        from agentshive.main import main as server_main
+        server_main()
+        return 0
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
