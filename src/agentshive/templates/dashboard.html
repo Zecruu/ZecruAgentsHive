@@ -121,6 +121,7 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
       <select id="proj-select" onchange="switchProject(this.value)">
         <option value="default">default</option>
       </select>
+      <span id="proj-local-path" style="display:none; font-size:12px; color:#9aa0ab; font-family:ui-monospace,monospace; padding-left:10px;"></span>
       <div class="proj-actions">
         <button type="button" onclick="toggleNewProjForm()" id="btn-new-proj">+ New project</button>
         <button type="button" onclick="archiveCurrentProject()" id="btn-archive-proj" style="display:none">Archive</button>
@@ -130,6 +131,11 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
       <input class="slug" id="new-proj-slug" placeholder="slug (kebab-case)" autocomplete="off" required>
       <input class="name" id="new-proj-name" placeholder="display name" autocomplete="off" required>
       <input class="desc" id="new-proj-desc" placeholder="description (optional)" autocomplete="off">
+      <!-- v1.10 desktop-only: native folder picker. Hidden until /api/dashboard/mode
+           reports desktop_mode=true. Path input always present so Railway/browser
+           users can paste a path manually. -->
+      <input class="desc" id="new-proj-path" placeholder="local folder path (optional)" autocomplete="off">
+      <button type="button" id="btn-pick-folder" onclick="pickFolder()" style="display:none">Pick Folder…</button>
       <button class="primary" type="submit">Create</button>
       <button type="button" onclick="toggleNewProjForm()">Cancel</button>
     </form>
@@ -655,6 +661,41 @@ function urlWithProject(slug) {
   return u.toString();
 }
 
+// v1.10: cached desktop_mode flag. Loaded once at page boot via /api/dashboard/mode.
+// Drives conditional rendering of the Pick Folder button + Launch buttons.
+let DESKTOP_MODE = false;
+
+async function loadDesktopMode() {
+  try {
+    const r = await fetch("/api/dashboard/mode", { credentials: "same-origin" });
+    if (!r.ok) return;
+    DESKTOP_MODE = !!(await r.json()).desktop_mode;
+    if (DESKTOP_MODE) {
+      const btn = $("btn-pick-folder");
+      if (btn) btn.style.display = "inline-block";
+    }
+  } catch (e) {
+    // Non-fatal: stay in browser/Railway mode.
+  }
+}
+
+async function pickFolder() {
+  // Calls the pywebview JS bridge → Python DesktopAPI.pick_folder() →
+  // window.create_file_dialog(FOLDER_DIALOG). Returns the selected path or null.
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.pick_folder) {
+    alert("Folder picker only available in the AgentsHive Desktop app.");
+    return;
+  }
+  try {
+    const path = await window.pywebview.api.pick_folder();
+    if (path) {
+      $("new-proj-path").value = path;
+    }
+  } catch (e) {
+    alert("Folder picker failed: " + e);
+  }
+}
+
 async function loadProjects() {
   try {
     const r = await fetch("/api/dashboard/projects", { credentials: "same-origin" });
@@ -665,8 +706,20 @@ async function loadProjects() {
     sel.innerHTML = projects.map(p =>
       `<option value="${escapeHtml(p.slug)}"${p.slug === cur ? " selected" : ""}>${escapeHtml(p.slug === "default" ? "default" : p.name + " (" + p.slug + ")")}</option>`
     ).join("");
-    // Show archive button only when not on default
     $("btn-archive-proj").style.display = cur === "default" ? "none" : "inline-block";
+    // v1.10: surface the active project's bound folder in the header so the
+    // user knows where Launch Coder will spawn Claude Code. Only shown in
+    // desktop mode and when a path is set.
+    const activeProj = projects.find(p => p.slug === cur);
+    const pathSlot = $("proj-local-path");
+    if (pathSlot) {
+      if (DESKTOP_MODE && activeProj && activeProj.local_path) {
+        pathSlot.textContent = "📁 " + activeProj.local_path;
+        pathSlot.style.display = "inline-block";
+      } else {
+        pathSlot.style.display = "none";
+      }
+    }
   } catch (e) {
     // Non-fatal — dropdown stays with the default option
   }
@@ -691,12 +744,13 @@ async function createProject(e) {
   const slug = ($("new-proj-slug").value || "").trim().toLowerCase();
   const name = ($("new-proj-name").value || "").trim();
   const desc = ($("new-proj-desc").value || "").trim() || null;
+  const localPath = ($("new-proj-path").value || "").trim() || null;
   const errBox = $("new-proj-error");
   errBox.style.display = "none";
   try {
     // postJSON returns {status, data} — the server's {ok, error} envelope lives
     // on data, NOT on the wrapper. Earlier draft mis-read this as r.ok.
-    const { status, data } = await postJSON("/api/dashboard/projects", { slug, name, description: desc });
+    const { status, data } = await postJSON("/api/dashboard/projects", { slug, name, description: desc, local_path: localPath });
     if (!data || !data.ok) {
       errBox.textContent = (data && data.error) || `Create failed (HTTP ${status}).`;
       errBox.style.display = "block";
@@ -795,7 +849,8 @@ $("spec-toggle").addEventListener("click", () => {
   $("spec-toggle").textContent = specExpanded ? "Collapse" : "Show full spec";
 });
 
-// Page load: populate the project switcher dropdown, then try SSE.
+// Page load: detect desktop mode, populate the project switcher, then try SSE.
+loadDesktopMode();
 loadProjects();
 if (typeof EventSource !== "undefined") {
   startSSE();

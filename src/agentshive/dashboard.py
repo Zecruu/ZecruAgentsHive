@@ -778,6 +778,7 @@ def _project_dict(p: Project) -> dict[str, Any]:
         "description": p.description,
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "archived_at": p.archived_at.isoformat() if p.archived_at else None,
+        "local_path": p.local_path,  # v1.10 — desktop folder bound to this project
     }
 
 
@@ -813,11 +814,24 @@ def _make_projects_create_handler(settings: Settings):
         slug = (body.get("slug") or "").strip().lower()
         name = (body.get("name") or "").strip()
         description = body.get("description")
+        local_path = body.get("local_path")  # v1.10 — optional
         if not name or len(name) > 200:
             return JSONResponse({"error": "name must be a non-empty string under 200 chars"}, status_code=400)
         slug_err = validate_slug(slug)
         if slug_err:
             return JSONResponse({"error": slug_err}, status_code=400)
+        # v1.10: local_path validation — must be a string, absolute, and exist on disk.
+        # Validated server-side so a malicious / typo'd path can't sneak past the UI's
+        # native folder picker (e.g. someone POSTs JSON directly).
+        if local_path is not None:
+            if not isinstance(local_path, str) or not local_path.strip():
+                local_path = None
+            else:
+                import os as _os
+                if not _os.path.isabs(local_path) or not _os.path.isdir(local_path):
+                    return JSONResponse({
+                        "error": f"local_path must be an absolute path to an existing directory (got {local_path!r})",
+                    }, status_code=400)
         with Session(get_engine()) as session:
             existing = session.exec(select(Project).where(Project.slug == slug)).first()
             if existing is not None:
@@ -825,18 +839,24 @@ def _make_projects_create_handler(settings: Settings):
                     # Active row with this slug — genuine collision.
                     return JSONResponse({"error": f"slug '{slug}' already exists"}, status_code=409)
                 # Revive an archived project on slug match: clear archived_at and
-                # update name/description so the user can effectively "re-create"
-                # under the same URL identifier. The history (missions, messages)
-                # is preserved — which is sometimes the desired behavior. If a
-                # user wants a fresh start, they can pick a different slug.
+                # update name/description/local_path so the user can effectively
+                # "re-create" under the same URL identifier. The history (missions,
+                # messages) is preserved.
                 existing.archived_at = None
                 existing.name = name
                 existing.description = description if isinstance(description, str) else None
+                if local_path is not None:
+                    existing.local_path = local_path
                 session.add(existing)
                 session.commit()
                 session.refresh(existing)
                 return JSONResponse({"ok": True, "project": _project_dict(existing), "revived": True}, status_code=200)
-            proj = Project(slug=slug, name=name, description=description if isinstance(description, str) else None)
+            proj = Project(
+                slug=slug,
+                name=name,
+                description=description if isinstance(description, str) else None,
+                local_path=local_path,
+            )
             session.add(proj)
             session.commit()
             session.refresh(proj)

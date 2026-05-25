@@ -336,14 +336,34 @@ def stop_server_subprocess(proc: subprocess.Popen) -> None:
 class DesktopAPI:
     """Methods exposed to dashboard JS via pywebview's js_api bridge.
 
-    Dashboard JS calls them as `await window.pywebview.api.<method>()`. v1.10
-    Commit 1 starts with just `is_desktop_mode()` so the JS can conditionally
-    render desktop-only UI. Commits 2+3 add `pick_folder()`, `claude_status()`,
-    `launch_planner()`, `launch_coder()`.
+    Dashboard JS calls them as `await window.pywebview.api.<method>()`. The
+    methods run in the GUI thread, which is what pywebview's
+    `window.create_file_dialog` and Win32 calls require. The folder picker
+    therefore goes through this bridge rather than an HTTP endpoint — the
+    server subprocess doesn't own the pywebview window.
     """
+
+    # Set by main() once the window is created so pick_folder can call
+    # window.create_file_dialog. None until then.
+    window: object = None
 
     def is_desktop_mode(self) -> bool:
         return True
+
+    def pick_folder(self) -> str | None:
+        """v1.10 Commit 2: native OS folder picker. Returns the selected
+        absolute path or None on cancel. Called by the dashboard "+ New
+        project" form's Pick Folder button when desktop mode is detected.
+        """
+        if self.window is None:  # pragma: no cover — window must be created first
+            return None
+        import webview
+        result = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+        if not result:
+            return None
+        # create_file_dialog returns a tuple of selected paths (folder mode
+        # always yields exactly one) — return the first element as a plain str.
+        return str(result[0]) if result else None
 
 
 # --------------------------------------------------------------------- main entry
@@ -411,6 +431,7 @@ def main() -> int:
             height=800,
             min_size=(800, 600),
         )
+        api.window = window  # pick_folder needs this to call create_file_dialog
 
         def _raise_window():
             try:
