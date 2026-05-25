@@ -121,6 +121,43 @@ The dashboard header has a **Project** dropdown that lists every non-archived pr
 
 OAuth tokens are project-orthogonal: an OAuth client issued during a consent flow for project A works for project B too. Project scope is a request-level concern (read from the URL), not an authentication concern.
 
+## AgentsHive Desktop (v1.10+)
+
+Downloadable Windows desktop app that bundles the AgentsHive server, runs it locally on `127.0.0.1:8765`, and renders the dashboard in a native window via pywebview / Edge WebView2. Detects local Claude Desktop + Claude Code CLI installs and exposes per-project **Launch Planner** / **Launch Coder** buttons that spawn each pre-wired for the right project — collapsing the "create project → add MCP entry to Claude Desktop → add MCP entry in your editor → start coding" dance into one click.
+
+**Two deployments coexist:** the Railway-hosted server (`https://agentshive-production.up.railway.app/dashboard`) for cross-device / mobile access via OAuth, and the desktop app for local-first power-user workflow on the same machine you code from. They share zero state — desktop's database is `%LOCALAPPDATA%\AgentsHive\data.db`, Railway's is its Postgres.
+
+### Install
+
+1. Download `AgentsHive-Setup-1.10.0.exe` from the [latest GitHub release](https://github.com/Zecruu/ZecruAgentsHive/releases/latest).
+2. Run the installer. **Windows SmartScreen will warn** that the publisher is unverified (we don't ship with an EV code-signing cert yet — that's queued for v1.10.x once we have telemetry showing user friction). Click **More info** → **Run anyway**.
+3. Per-user install (no admin / UAC prompt). Installs to `%LOCALAPPDATA%\Programs\AgentsHive\` and creates a Start Menu shortcut.
+4. Launch from Start Menu or desktop icon. First launch generates a local bearer key at `%LOCALAPPDATA%\AgentsHive\local.key` (never rotated; delete the file to regenerate) and a SQLite database at `%LOCALAPPDATA%\AgentsHive\data.db`.
+
+### What you can do
+
+- **Create projects from the dashboard** with the native **Pick Folder…** button that opens the OS folder dialog (pywebview's JS bridge → `window.create_file_dialog`).
+- **Launch Planner** opens Claude Desktop pre-configured for the project's MCP endpoint. For the Microsoft Store Claude install (which silently drops `mcpServers` config — see the v1.7 OAuth section), the MCP URL is copied to your clipboard and you paste it into **Settings → Connectors → Add custom connector**. For the .exe installer variant, the connector is written into `claude_desktop_config.json` automatically (untested on dev machine; queued for v1.10.x VM verification).
+- **Launch Coder** opens a new terminal in the project's bound folder, runs `claude mcp add agentshive-<slug> ...`, then `claude --dangerously-skip-permissions`. The Coder is bound to that project for its lifetime.
+- **Install status pill** in the header shows ✓/✗ for Claude Desktop and Claude Code CLI detection — instant feedback on what's available before you click Launch.
+
+### Caveats
+
+- **Windows-only in v1.10.** Mac/Linux is queued for v1.11+ (same architecture, different OS-specific branches for paths + detection + installer).
+- **WebView2 runtime** ships with Windows 11 and recent Windows 10 updates. If you're on a very old Win10, install the [WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/).
+- **Single instance.** Launching the installed app twice raises the existing window instead of spawning a second server (file lock at `%LOCALAPPDATA%\AgentsHive\instance.lock` + named-pipe IPC).
+- **Local bearer key never rotates** (Planner Q3 decision). It stays in `%LOCALAPPDATA%\AgentsHive\local.key` so `claude mcp add` registrations don't break across restarts. Delete the file manually to regenerate (will invalidate existing MCP entries).
+- **Microsoft Store Claude Desktop** silently drops `mcpServers` config files (the v1.7 OAuth flow was the real fix for this; the desktop launcher uses clipboard handoff as the UX workaround in v1.10).
+
+### Building the installer
+
+```bat
+:: From repo root, with pywebview + pyinstaller installed via pip install -e .[desktop]:
+scripts\build_desktop.bat
+```
+
+Produces `dist\AgentsHive-Setup-1.10.0.exe`. Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) on PATH or at the default install location.
+
 ## Dashboard (v1.4+)
 
 A read-only web view of the unified Planner / Coder state, served by the same Starlette app at:

@@ -40,6 +40,12 @@ class Project(SQLModel, table=True):
     # Soft-archive (Planner Q3): hides from the switcher but preserves all child data.
     # Hard delete is v1.9.x.
     archived_at: Optional[datetime] = None
+    # v1.10 desktop: the local filesystem path the project lives at. Optional
+    # because Railway-hosted projects don't have a meaningful one; even in
+    # desktop mode it's optional until the user picks a folder. Used by the
+    # Coder launcher (commit 3) to `cd` into the right directory before
+    # spawning Claude Code.
+    local_path: Optional[str] = None
 
 
 class Mission(SQLModel, table=True):
@@ -337,6 +343,13 @@ def _apply_inline_migrations(engine: Engine) -> None:
                     text("UPDATE message SET project_id = :pid WHERE project_id IS NULL"),
                     {"pid": default_project_id},
                 )
+
+    # v1.10: Project.local_path nullable column. Pre-v1.10 project rows just
+    # get NULL — no backfill required since the column is Optional from day one.
+    proj_cols = {c["name"] for c in inspector.get_columns("project")}
+    if "local_path" not in proj_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE project ADD COLUMN local_path TEXT"))
 
     # Step 3+4: swap the partial unique index from "global single active" to
     # "single active per project". DROP + CREATE in one transaction; the defensive
