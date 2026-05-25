@@ -84,13 +84,16 @@ async def test_ack_unknown_message():
 # ---------- FEATURE 2: create_mission atomicity ----------
 
 def test_partial_unique_index_present():
-    print("--- F2.a: partial unique index one_active_mission exists ---")
+    print("--- F2.a: partial unique index one_active_mission_per_project exists ---")
+    # v1.9: renamed from `one_active_mission` (global) to
+    # `one_active_mission_per_project` (composite (project_id, status)).
+    # The single-active-globally invariant became single-active-per-project.
     eng = create_engine(DB_PATH)
     idxs = inspect(eng).get_indexes("mission")
-    found = [i for i in idxs if i.get("name") == "one_active_mission"]
+    found = [i for i in idxs if i.get("name") == "one_active_mission_per_project"]
     assert found, f"index missing: {idxs}"
     assert found[0]["unique"], f"index not unique: {found}"
-    print(f"  [OK] one_active_mission index present and unique")
+    print(f"  [OK] one_active_mission_per_project index present and unique")
 
 
 def test_db_rejects_manual_second_active():

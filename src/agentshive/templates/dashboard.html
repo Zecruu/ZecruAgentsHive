@@ -66,6 +66,25 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
 .inline-error { color: #ff8a78; font-size: 12px; margin-top: 4px; }
 .stale-note   { background: #2a2418; color: #e8c47a; font-size: 12px;
                 padding: 6px 10px; border-radius: 4px; margin-top: 6px; }
+/* v1.9 project switcher — header dropdown + inline create form */
+.proj-switcher { display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+                 padding-bottom: 10px; border-bottom: 1px solid #232732; }
+.proj-switcher label { color: #9aa0ab; font-size: 11px; text-transform: uppercase;
+                       letter-spacing: 0.04em; font-weight: 600; }
+.proj-switcher select { background: #0e0f12; color: #d6d9e0; border: 1px solid #232732;
+                        border-radius: 6px; padding: 5px 10px; font-size: 13px;
+                        font-family: ui-monospace, SFMono-Regular, monospace; }
+.proj-switcher .proj-actions { margin-left: auto; display: flex; gap: 6px; }
+#new-proj-form { display: none; margin-top: 8px; gap: 6px; flex-wrap: wrap;
+                 padding: 10px; background: #0e0f12; border: 1px solid #232732; border-radius: 6px; }
+#new-proj-form.open { display: flex; }
+#new-proj-form input { background: #16181d; color: #d6d9e0; border: 1px solid #232732;
+                       border-radius: 4px; padding: 5px 8px; font-size: 12px;
+                       font-family: ui-monospace, SFMono-Regular, monospace; }
+#new-proj-form input.slug { width: 160px; }
+#new-proj-form input.name { width: 180px; }
+#new-proj-form input.desc { flex: 1; min-width: 140px; }
+#new-proj-error { color: #ff8a78; font-size: 12px; margin-top: 6px; display: none; }
 /* v1.8 Inbox chat panel — single-column conversation, bubbles aligned by direction. */
 #inbox-feed { display: flex; flex-direction: column; gap: 8px; max-height: 50vh;
               overflow-y: auto; padding: 4px 2px; }
@@ -93,6 +112,29 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
 <div id="connlost" class="banner">Lost connection — retrying…</div>
 <main>
   <div class="card" id="header">
+    <!-- v1.9 project switcher: header dropdown lists active projects; switching
+         updates the URL ?project=<slug> and reloads. Per Planner Q4, each
+         project is a separate full-page context so existing routes/SSE pick
+         up the new slug naturally. -->
+    <div class="proj-switcher">
+      <label for="proj-select">Project</label>
+      <select id="proj-select" onchange="switchProject(this.value)">
+        <option value="default">default</option>
+      </select>
+      <div class="proj-actions">
+        <button type="button" onclick="toggleNewProjForm()" id="btn-new-proj">+ New project</button>
+        <button type="button" onclick="archiveCurrentProject()" id="btn-archive-proj" style="display:none">Archive</button>
+      </div>
+    </div>
+    <form id="new-proj-form" onsubmit="return createProject(event)">
+      <input class="slug" id="new-proj-slug" placeholder="slug (kebab-case)" autocomplete="off" required>
+      <input class="name" id="new-proj-name" placeholder="display name" autocomplete="off" required>
+      <input class="desc" id="new-proj-desc" placeholder="description (optional)" autocomplete="off">
+      <button class="primary" type="submit">Create</button>
+      <button type="button" onclick="toggleNewProjForm()">Cancel</button>
+    </form>
+    <div id="new-proj-error"></div>
+
     <div class="row spread">
       <div>
         <div class="row" style="gap:8px;">
@@ -187,8 +229,19 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// v1.9: append ?project=<slug> to any same-origin URL so the server-side
+// ProjectContextMiddleware picks it up. No-op on the default project (cleaner
+// URLs) and on the /projects management endpoints (which don't need a scope).
+function withProject(url) {
+  const slug = currentProjectSlug();
+  if (slug === "default") return url;
+  if (url.startsWith("/api/dashboard/projects")) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}project=${encodeURIComponent(slug)}`;
+}
+
 async function postJSON(url, body) {
-  const r = await fetch(url, {
+  const r = await fetch(withProject(url), {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(body || {}),
@@ -561,9 +614,10 @@ async function sendInboxMessage(e) {
   // Disable composer during send so double-Enter doesn't double-post.
   input.disabled = true;
   try {
-    const r = await postJSON("/api/dashboard/send-to-planner", { body });
-    if (!r.ok) {
-      err.textContent = r.error || "Send failed.";
+    // postJSON returns {status, data}; the server's {ok, error} envelope is on data.
+    const { status, data } = await postJSON("/api/dashboard/send-to-planner", { body });
+    if (!data || !data.ok) {
+      err.textContent = (data && data.error) || `Send failed (HTTP ${status}).`;
       err.style.display = "block";
       return false;
     }
@@ -581,6 +635,104 @@ async function sendInboxMessage(e) {
   return false;
 }
 
+// ---------- v1.9 Project switcher ----------
+
+// Current project slug derived from the URL ?project= param. When switching,
+// we update the URL and full-page reload so the SSE connection re-subscribes
+// to the new project's channel and the state payload is fresh-fetched.
+function currentProjectSlug() {
+  const params = new URLSearchParams(window.location.search);
+  return (params.get("project") || "default").toLowerCase();
+}
+
+function urlWithProject(slug) {
+  const u = new URL(window.location.href);
+  if (slug === "default") {
+    u.searchParams.delete("project");
+  } else {
+    u.searchParams.set("project", slug);
+  }
+  return u.toString();
+}
+
+async function loadProjects() {
+  try {
+    const r = await fetch("/api/dashboard/projects", { credentials: "same-origin" });
+    if (!r.ok) return;
+    const { projects } = await r.json();
+    const sel = $("proj-select");
+    const cur = currentProjectSlug();
+    sel.innerHTML = projects.map(p =>
+      `<option value="${escapeHtml(p.slug)}"${p.slug === cur ? " selected" : ""}>${escapeHtml(p.slug === "default" ? "default" : p.name + " (" + p.slug + ")")}</option>`
+    ).join("");
+    // Show archive button only when not on default
+    $("btn-archive-proj").style.display = cur === "default" ? "none" : "inline-block";
+  } catch (e) {
+    // Non-fatal — dropdown stays with the default option
+  }
+}
+
+function switchProject(slug) {
+  if (slug === currentProjectSlug()) return;
+  window.location.href = urlWithProject(slug);
+}
+
+function toggleNewProjForm() {
+  const form = $("new-proj-form");
+  form.classList.toggle("open");
+  if (form.classList.contains("open")) {
+    $("new-proj-slug").focus();
+    $("new-proj-error").style.display = "none";
+  }
+}
+
+async function createProject(e) {
+  if (e && e.preventDefault) e.preventDefault();
+  const slug = ($("new-proj-slug").value || "").trim().toLowerCase();
+  const name = ($("new-proj-name").value || "").trim();
+  const desc = ($("new-proj-desc").value || "").trim() || null;
+  const errBox = $("new-proj-error");
+  errBox.style.display = "none";
+  try {
+    // postJSON returns {status, data} — the server's {ok, error} envelope lives
+    // on data, NOT on the wrapper. Earlier draft mis-read this as r.ok.
+    const { status, data } = await postJSON("/api/dashboard/projects", { slug, name, description: desc });
+    if (!data || !data.ok) {
+      errBox.textContent = (data && data.error) || `Create failed (HTTP ${status}).`;
+      errBox.style.display = "block";
+      return false;
+    }
+    window.location.href = urlWithProject(slug);
+  } catch (err) {
+    errBox.textContent = "Network error — try again.";
+    errBox.style.display = "block";
+  }
+  return false;
+}
+
+async function archiveCurrentProject() {
+  const slug = currentProjectSlug();
+  if (slug === "default") return;
+  if (!confirm(`Archive project '${slug}'? Its data is preserved but it disappears from the switcher.`)) return;
+  try {
+    const r = await fetch(`/api/dashboard/projects/${encodeURIComponent(slug)}/archive`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+    });
+    if (r.status === 401) { location.href = "/dashboard/login"; return; }
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      alert(body.error || "Archive failed.");
+      return;
+    }
+    // Land back in default after archiving.
+    window.location.href = urlWithProject("default");
+  } catch (err) {
+    alert("Network error — try again.");
+  }
+}
+
 // ---------- Transport: SSE primary, polling fallback (no oscillation) ----------
 
 let es = null;
@@ -590,7 +742,7 @@ const SSE_FAIL_BEFORE_FALLBACK = 2;
 
 async function tick() {
   try {
-    const r = await fetch("/api/dashboard/state", { credentials: "same-origin" });
+    const r = await fetch(withProject("/api/dashboard/state"), { credentials: "same-origin" });
     if (r.status === 401) { location.href = "/dashboard/login"; return; }
     if (!r.ok) throw new Error("status " + r.status);
     $("connlost").classList.remove("show");
@@ -608,7 +760,7 @@ function startPolling() {
 
 function startSSE() {
   try {
-    es = new EventSource("/api/dashboard/events", { withCredentials: true });
+    es = new EventSource(withProject("/api/dashboard/events"), { withCredentials: true });
   } catch (e) {
     startPolling();
     return;
@@ -643,9 +795,8 @@ $("spec-toggle").addEventListener("click", () => {
   $("spec-toggle").textContent = specExpanded ? "Collapse" : "Show full spec";
 });
 
-// Page load: try SSE first. If the browser doesn't have EventSource (very old
-// browsers), or if it fails to connect SSE_FAIL_BEFORE_FALLBACK times in a row,
-// startPolling() takes over and stays there.
+// Page load: populate the project switcher dropdown, then try SSE.
+loadProjects();
 if (typeof EventSource !== "undefined") {
   startSSE();
 } else {

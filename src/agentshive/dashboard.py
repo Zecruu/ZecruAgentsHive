@@ -29,7 +29,8 @@ from starlette.routing import Route
 from . import dashboard_events
 
 from .config import Settings
-from .db import Message, Mission, Question, Summary, get_engine
+from .db import Message, Mission, Project, Question, Summary, get_engine
+from .project import current_project, validate_slug
 from .tools import (
     AGENTSHIVE_VERSION,
     MAX_TEXT_LEN,
@@ -204,6 +205,10 @@ def _make_dashboard(settings: Settings):
 def _build_state_payload(_settings: Settings) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     with Session(get_engine()) as session:
+        # v1.9: scope every read by the current request's project. If the slug
+        # doesn't resolve (unknown project), serve an empty-state payload —
+        # the UI handles "no active mission" already.
+        project_id = _resolve_project_id(session)
         active = _active_mission(session)
         active_dict: dict[str, Any] | None = None
         if active is not None:
@@ -211,13 +216,19 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
             d["spec_preview"] = (active.spec or "")[:SPEC_PREVIEW_CHARS]
             active_dict = d
 
-        recent_rows = session.exec(
-            select(Mission)
-            .where(Mission.status.in_(("done", "superseded")))
-            .order_by(desc(Mission.created_at))
-            .limit(5)
-        ).all()
-        recent = [_mission_dict(m) for m in recent_rows]
+        if project_id is None:
+            recent: list[dict[str, Any]] = []
+        else:
+            recent_rows = session.exec(
+                select(Mission)
+                .where(
+                    Mission.status.in_(("done", "superseded")),
+                    Mission.project_id == project_id,
+                )
+                .order_by(desc(Mission.created_at))
+                .limit(5)
+            ).all()
+            recent = [_mission_dict(m) for m in recent_rows]
 
         pending_q: list[dict[str, Any]] = []
         pending_s: list[dict[str, Any]] = []
@@ -242,10 +253,12 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
             ]
             c2p = _recent_messages(session, active.id, direction="coder_to_planner")
             p2c = _recent_messages(session, active.id, direction="planner_to_coder")
-        else:
-            # No active mission: surface the last few messages across recent missions for context.
-            c2p = _recent_messages_global(session, direction="coder_to_planner")
-            p2c = _recent_messages_global(session, direction="planner_to_coder")
+        elif project_id is not None:
+            # No active mission in this project: surface the last few messages
+            # across the project's recent missions for context. Project-scoped
+            # so other projects' chatter doesn't leak in.
+            c2p = _recent_messages_global(session, direction="coder_to_planner", project_id=project_id)
+            p2c = _recent_messages_global(session, direction="planner_to_coder", project_id=project_id)
 
         # Heartbeat from active mission. SQLite reads TIMESTAMP back as naive datetimes
         # even when we wrote them with tzinfo=UTC, so coerce before subtracting against
@@ -274,10 +287,9 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
             "started_at": SERVER_STARTED_AT.isoformat(),
         }
 
-        # v1.8: global inbox channel (user ↔ planner chat). Always populated
-        # regardless of active mission. Single chronological list (oldest first)
-        # so the frontend can render it as a chat transcript without re-sorting.
-        inbox = _recent_inbox_messages(session)
+        # v1.8: inbox channel (user ↔ planner chat). v1.9: scoped to the
+        # current request's project (passed in to avoid re-resolving the slug).
+        inbox = _recent_inbox_messages(session, project_id=project_id)
 
         return {
             "active_mission": active_dict,
@@ -317,27 +329,42 @@ def _recent_messages(session: Session, mission_id: str, direction: str, total: i
     return [_message_dict(m) for m in (undelivered + delivered)]
 
 
-def _recent_messages_global(session: Session, direction: str, total: int = 10) -> list[dict[str, Any]]:
-    rows = session.exec(
-        select(Message)
-        .where(Message.direction == direction)
-        .order_by(desc(Message.created_at))
-        .limit(total)
-    ).all()
+def _recent_messages_global(session: Session, direction: str, total: int = 10, project_id: str | None = None) -> list[dict[str, Any]]:
+    """Last `total` messages of the given direction. v1.9: scoped to project if provided."""
+    stmt = select(Message).where(Message.direction == direction)
+    if project_id is not None:
+        stmt = stmt.where(Message.project_id == project_id)
+    rows = session.exec(stmt.order_by(desc(Message.created_at)).limit(total)).all()
     return [_message_dict(m) for m in reversed(rows)]
 
 
-def _recent_inbox_messages(session: Session, total: int = 20) -> list[dict[str, Any]]:
+def _resolve_project_id(session: Session) -> str | None:
+    """v1.9 helper: current request's project slug → row id, or None if the
+    project doesn't exist (e.g., user mistyped the URL slug).
+    """
+    slug = current_project()
+    row = session.exec(select(Project).where(Project.slug == slug)).first()
+    return row.id if row is not None else None
+
+
+def _recent_inbox_messages(session: Session, total: int = 20, project_id: str | None = None) -> list[dict[str, Any]]:
     """v1.8 inbox feed for the dashboard chat panel.
 
     Combines both directions (user_to_planner + planner_to_user) into a single
-    chronological list, oldest first. NOT scoped to active mission — the inbox
-    is global. The frontend renders this as a chat transcript and uses
-    direction to decide bubble alignment (You = right, Planner = left).
+    chronological list, oldest first. v1.9: scoped to the current request's
+    project (passed in as `project_id` for callers that already resolved it).
+    The frontend renders this as a chat transcript and uses direction to
+    decide bubble alignment (You = right, Planner = left).
     """
+    pid = project_id if project_id is not None else _resolve_project_id(session)
+    if pid is None:
+        return []
     rows = session.exec(
         select(Message)
-        .where(Message.direction.in_(("user_to_planner", "planner_to_user")))
+        .where(
+            Message.direction.in_(("user_to_planner", "planner_to_user")),
+            Message.project_id == pid,
+        )
         .order_by(desc(Message.created_at))
         .limit(total)
     ).all()
@@ -492,32 +519,30 @@ def _make_events_handler(settings: Settings):
         if dashboard_events._event_loop is None:
             dashboard_events.register_loop(asyncio.get_running_loop())
 
-        sub_id, queue = dashboard_events.subscribe()
+        # v1.9: SSE subscribers are project-scoped. The dashboard URL carries
+        # ?project=<slug>; the ProjectContextMiddleware has already validated
+        # it and set the ContextVar. We pin the slug at subscribe-time so the
+        # subscriber's lifetime is bound to one project.
+        from .project import current_project
+        project_slug = current_project()
+        sub_id, queue = dashboard_events.subscribe(project_slug)
 
         async def event_stream():
             try:
-                # Initial state event — connected clients get the current snapshot
-                # immediately without waiting for the next mutation. Suggest a 3s
-                # reconnect backoff to the browser.
                 initial = _build_state_payload(settings)
                 yield f"retry: 3000\nevent: state\ndata: {json.dumps(initial)}\n\n".encode("utf-8")
 
                 while True:
                     try:
-                        # Wait for either a broadcast sentinel or the keepalive timeout.
                         await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_SECONDS)
-                        # Sentinel arrived — push current state.
                         payload = _build_state_payload(settings)
                         yield f"event: state\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
                     except asyncio.TimeoutError:
-                        # No event in KEEPALIVE_SECONDS — send an SSE comment to
-                        # keep the connection alive through proxy idle timeouts.
                         yield b": keepalive\n\n"
                     except (asyncio.CancelledError, GeneratorExit):
-                        # Client disconnected or server is shutting down.
                         break
             finally:
-                dashboard_events.unsubscribe(sub_id)
+                dashboard_events.unsubscribe(project_slug, sub_id)
 
         return StreamingResponse(
             event_stream(),
@@ -722,6 +747,117 @@ def _make_mark_done_handler(settings: Settings):
     return handler
 
 
+# ---------- v1.9 Projects CRUD ----------
+# Multi-project support: dashboard switcher reads from GET /projects, creates via
+# POST, soft-archives via POST /<slug>/archive. The "default" project is reserved
+# (created by _apply_inline_migrations, blocked at the validator from user input).
+
+
+def _project_dict(p: Project) -> dict[str, Any]:
+    return {
+        "id": p.id,
+        "slug": p.slug,
+        "name": p.name,
+        "description": p.description,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "archived_at": p.archived_at.isoformat() if p.archived_at else None,
+    }
+
+
+def _make_projects_list_handler(settings: Settings):
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        include_archived = request.query_params.get("include_archived", "").lower() in ("1", "true", "yes")
+        with Session(get_engine()) as session:
+            stmt = select(Project)
+            if not include_archived:
+                stmt = stmt.where(Project.archived_at.is_(None))
+            rows = session.exec(stmt.order_by(Project.created_at)).all()
+            return JSONResponse({"projects": [_project_dict(p) for p in rows]})
+    return handler
+
+
+def _make_projects_create_handler(settings: Settings):
+    """POST /api/dashboard/projects — body {slug, name, description?}.
+
+    Validates slug format + reserved-list (the "default" slug is blocked here;
+    the migration seeds it directly). Returns 400 on validation failure, 409
+    on slug collision, 201 on success.
+    """
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        body, err_resp = await _read_json_body(request)
+        if err_resp is not None:
+            return err_resp
+        slug = (body.get("slug") or "").strip().lower()
+        name = (body.get("name") or "").strip()
+        description = body.get("description")
+        if not name or len(name) > 200:
+            return JSONResponse({"error": "name must be a non-empty string under 200 chars"}, status_code=400)
+        slug_err = validate_slug(slug)
+        if slug_err:
+            return JSONResponse({"error": slug_err}, status_code=400)
+        with Session(get_engine()) as session:
+            existing = session.exec(select(Project).where(Project.slug == slug)).first()
+            if existing is not None:
+                if existing.archived_at is None:
+                    # Active row with this slug — genuine collision.
+                    return JSONResponse({"error": f"slug '{slug}' already exists"}, status_code=409)
+                # Revive an archived project on slug match: clear archived_at and
+                # update name/description so the user can effectively "re-create"
+                # under the same URL identifier. The history (missions, messages)
+                # is preserved — which is sometimes the desired behavior. If a
+                # user wants a fresh start, they can pick a different slug.
+                existing.archived_at = None
+                existing.name = name
+                existing.description = description if isinstance(description, str) else None
+                session.add(existing)
+                session.commit()
+                session.refresh(existing)
+                return JSONResponse({"ok": True, "project": _project_dict(existing), "revived": True}, status_code=200)
+            proj = Project(slug=slug, name=name, description=description if isinstance(description, str) else None)
+            session.add(proj)
+            session.commit()
+            session.refresh(proj)
+            result = _project_dict(proj)
+        return JSONResponse({"ok": True, "project": result}, status_code=201)
+    return handler
+
+
+def _make_project_archive_handler(settings: Settings):
+    """POST /api/dashboard/projects/<slug>/archive — soft delete.
+
+    Sets archived_at; the project's data is preserved. The switcher hides
+    archived projects by default. The reserved "default" project cannot be
+    archived (it holds legacy/unscoped traffic).
+    """
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        slug = request.path_params.get("slug", "").strip().lower()
+        if not slug:
+            return JSONResponse({"error": "missing slug"}, status_code=400)
+        if slug == "default":
+            return JSONResponse({"error": "the 'default' project cannot be archived"}, status_code=400)
+        with Session(get_engine()) as session:
+            proj = session.exec(select(Project).where(Project.slug == slug)).first()
+            if proj is None:
+                return JSONResponse({"error": f"unknown project slug '{slug}'"}, status_code=404)
+            if proj.archived_at is None:
+                proj.archived_at = datetime.now(timezone.utc)
+                session.add(proj)
+                session.commit()
+                session.refresh(proj)
+            return JSONResponse({"ok": True, "project": _project_dict(proj)})
+    return handler
+
+
 def register_routes(app, settings: Settings, tool_names: list[str], oauth_provider=None) -> None:
     """Mount dashboard routes onto the given Starlette app.
 
@@ -750,6 +886,10 @@ def register_routes(app, settings: Settings, tool_names: list[str], oauth_provid
     app.router.routes.append(Route("/api/dashboard/mark-done", _make_mark_done_handler(settings), methods=["POST"]))
     # v1.6 SSE push channel
     app.router.routes.append(Route("/api/dashboard/events", _make_events_handler(settings), methods=["GET"]))
+    # v1.9 Projects CRUD
+    app.router.routes.append(Route("/api/dashboard/projects", _make_projects_list_handler(settings), methods=["GET"]))
+    app.router.routes.append(Route("/api/dashboard/projects", _make_projects_create_handler(settings), methods=["POST"]))
+    app.router.routes.append(Route("/api/dashboard/projects/{slug}/archive", _make_project_archive_handler(settings), methods=["POST"]))
     # v1.7 OAuth consent page (only mounted when an OAuth provider is supplied).
     if oauth_provider is not None:
         app.router.routes.append(Route("/oauth/consent", _make_consent_get(settings, oauth_provider), methods=["GET"]))
