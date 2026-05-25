@@ -1,3 +1,5 @@
+import os
+
 import uvicorn
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
@@ -7,12 +9,26 @@ from .auth import BearerAuthMiddleware
 from .config import load_settings
 from .dashboard import register_routes as register_dashboard_routes
 from .db import init_engine
+from .oauth import AgentsHiveOAuthProvider
 from .tools import register_tools
 
 
 def build_app():
     settings = load_settings()
     init_engine(settings)
+
+    # v1.7: the OAuth provider needs to know our PUBLIC base URL so it can build
+    # accurate AS metadata, issuer claim, and canonical resource for audience
+    # validation. Default to localhost for dev; Railway should set
+    # AGENTSHIVE_BASE_URL=https://<service>.up.railway.app at runtime.
+    base_url = os.environ.get("AGENTSHIVE_BASE_URL", f"http://localhost:{settings.port}").rstrip("/")
+    oauth_provider = AgentsHiveOAuthProvider(
+        base_url=base_url,
+        mcp_mount_path="/mcp",
+        # Q2 (KEEP LEGACY KEY FOREVER): hand the provider our shared API key so
+        # /mcp callers using the v1.0-v1.6 bearer auth keep working.
+        legacy_api_key=settings.api_key,
+    )
 
     mcp = FastMCP(
         name="AgentsHive",
@@ -22,6 +38,7 @@ def build_app():
             "Coder's questions. Coders fetch missions, ask the Planner instead of the human, "
             "and submit progress summaries. There is one active mission at a time."
         ),
+        auth=oauth_provider,
     )
     register_tools(mcp, settings)
 
@@ -33,12 +50,11 @@ def build_app():
     app.router.routes.append(Route("/", health))
     app.router.routes.append(Route("/healthz", health))
 
-    # Dashboard routes (v1.4). Registered BEFORE BearerAuthMiddleware so the
-    # PUBLIC_PATHS list can let them through to dashboard._require_dashboard_auth,
-    # which handles cookie-or-bearer auth separately. The dashboard needs the
-    # current MCP tool name list for tools_catalog_hash — capture it now, after
-    # register_tools has run.
-    register_dashboard_routes(app, settings, _capture_tool_names(mcp))
+    # Dashboard routes (v1.4) + v1.7 OAuth consent. Registered BEFORE
+    # BearerAuthMiddleware so the PUBLIC_PATHS list can let them through to
+    # the per-route auth checks (cookie-or-bearer for the dashboard,
+    # API-key-or-cookie-via-form for /oauth/consent).
+    register_dashboard_routes(app, settings, _capture_tool_names(mcp), oauth_provider=oauth_provider)
 
     app.add_middleware(BearerAuthMiddleware, api_key=settings.api_key)
     return app, settings

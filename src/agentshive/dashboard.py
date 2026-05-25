@@ -150,6 +150,7 @@ def _load_template(name: str) -> str:
 
 DASHBOARD_HTML = _load_template("dashboard.html")
 LOGIN_HTML = _load_template("login.html")
+CONSENT_HTML = _load_template("consent.html")
 
 
 
@@ -497,6 +498,175 @@ def _make_events_handler(settings: Settings):
     return events
 
 
+# ---------- v1.7 OAuth consent page ----------
+# The SDK-mounted /authorize redirects the user-agent here. We do NOT mint the
+# authorization code yet — the user has to consent first. Option B from the
+# Planner: if a dashboard session cookie is already valid, reuse it and skip
+# the API-key prompt; otherwise fall back to entering AGENTSHIVE_API_KEY in
+# the form (so first-time consenters can still complete the flow without
+# having visited /dashboard/login first).
+
+
+def _html_escape(value: str) -> str:
+    return (value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _render_consent(
+    *,
+    client_name: str,
+    client_id: str,
+    redirect_uri: str,
+    redirect_uri_provided_explicitly: str,
+    code_challenge: str,
+    state: str,
+    scopes: str,
+    resource: str,
+    show_api_key_field: bool,
+    error: str | None = None,
+) -> str:
+    scope_list = [s for s in (scopes or "").split() if s]
+    scope_tags = "".join(f'<span class="scope">{_html_escape(s)}</span>' for s in scope_list) \
+        or '<span class="scope">mcp</span>'
+    if show_api_key_field:
+        cookie_note = "Enter your AGENTSHIVE_API_KEY to authorize this client."
+        api_key_field = (
+            '<label for="api_key">API Key</label>'
+            '<input id="api_key" type="password" name="api_key" autocomplete="current-password" required>'
+        )
+    else:
+        cookie_note = "You are signed in. Approve to issue this client an access token."
+        api_key_field = ""
+    error_block = f'<div class="error">{_html_escape(error)}</div>' if error else ""
+    return (CONSENT_HTML
+        .replace("{client_name}", _html_escape(client_name))
+        .replace("{client_id}", _html_escape(client_id))
+        .replace("{redirect_uri}", _html_escape(redirect_uri))
+        .replace("{scope_tags}", scope_tags)
+        .replace("{cookie_note}", _html_escape(cookie_note))
+        .replace("{api_key_field}", api_key_field)
+        .replace("{client_id_escaped}", _html_escape(client_id))
+        .replace("{redirect_uri_escaped}", _html_escape(redirect_uri))
+        .replace("{redirect_uri_provided_explicitly}", _html_escape(redirect_uri_provided_explicitly))
+        .replace("{code_challenge_escaped}", _html_escape(code_challenge))
+        .replace("{state_escaped}", _html_escape(state))
+        .replace("{scopes_escaped}", _html_escape(scopes))
+        .replace("{resource_escaped}", _html_escape(resource))
+        .replace("{error_block}", error_block))
+
+
+def _make_consent_get(settings: Settings, provider):
+    async def consent_get(request: Request) -> Response:
+        qs = request.query_params
+        client_id = qs.get("client_id", "")
+        # The client_id MUST be one we registered. If not, refuse — never
+        # show a consent prompt for an unknown client (anti-phishing).
+        if not client_id:
+            return JSONResponse({"error": "missing client_id"}, status_code=400)
+        client = await provider.get_client(client_id)
+        if client is None:
+            return JSONResponse({"error": "unknown client_id"}, status_code=400)
+        # Sanity: the redirect_uri must match one the client registered.
+        redirect_uri = qs.get("redirect_uri", "")
+        registered_uris = [str(u) for u in (client.redirect_uris or [])]
+        if redirect_uri not in registered_uris:
+            return JSONResponse({"error": "redirect_uri not registered for this client"}, status_code=400)
+        # Cookie present? Skip API-key field.
+        has_cookie = _require_dashboard_auth(request, settings)
+        html = _render_consent(
+            client_name=client.client_name or "Unnamed client",
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            redirect_uri_provided_explicitly=qs.get("redirect_uri_provided_explicitly", "1"),
+            code_challenge=qs.get("code_challenge", ""),
+            state=qs.get("state", ""),
+            scopes=qs.get("scopes", "mcp"),
+            resource=qs.get("resource", ""),
+            show_api_key_field=not has_cookie,
+        )
+        return HTMLResponse(html)
+    return consent_get
+
+
+def _append_query(url: str, params: dict) -> str:
+    from urllib.parse import urlencode
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{urlencode({k: v for k, v in params.items() if v is not None})}"
+
+
+def _make_consent_post(settings: Settings, provider):
+    async def consent_post(request: Request) -> Response:
+        form = await request.form()
+        client_id = (form.get("client_id") or "").strip()
+        redirect_uri = (form.get("redirect_uri") or "").strip()
+        state = (form.get("state") or "").strip()
+        decision = (form.get("decision") or "").strip()
+        code_challenge = (form.get("code_challenge") or "").strip()
+        scopes_raw = (form.get("scopes") or "mcp").strip()
+        resource = (form.get("resource") or "").strip() or None
+        redirect_uri_provided_explicitly = (form.get("redirect_uri_provided_explicitly") or "1") == "1"
+
+        if not client_id or not redirect_uri:
+            return JSONResponse({"error": "missing client_id or redirect_uri"}, status_code=400)
+        client = await provider.get_client(client_id)
+        if client is None:
+            return JSONResponse({"error": "unknown client_id"}, status_code=400)
+        registered_uris = [str(u) for u in (client.redirect_uris or [])]
+        if redirect_uri not in registered_uris:
+            return JSONResponse({"error": "redirect_uri not registered"}, status_code=400)
+
+        # User clicked Deny — 302 back to the client with error=access_denied
+        # per RFC 6749 §4.1.2.1. Always include state for CSRF binding.
+        if decision != "approve":
+            return RedirectResponse(
+                _append_query(redirect_uri, {"error": "access_denied", "state": state or None}),
+                status_code=302,
+            )
+
+        # Approve path: re-validate auth. Cookie OR submitted API key must check out.
+        # We deliberately re-run _require_dashboard_auth (which checks cookie) AND
+        # also try the api_key field, so users with a stale cookie can still type the
+        # key, and users with a fresh cookie don't need to type anything.
+        authed = _require_dashboard_auth(request, settings)
+        if not authed:
+            presented = (form.get("api_key") or "").strip()
+            if presented and hmac.compare_digest(
+                presented.encode("utf-8"), settings.api_key.encode("utf-8")
+            ):
+                authed = True
+        if not authed:
+            # Re-render the form with an error message — DO NOT redirect to the
+            # client with error=access_denied, because the user might just have
+            # mistyped. Give them another chance.
+            html = _render_consent(
+                client_name=client.client_name or "Unnamed client",
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                redirect_uri_provided_explicitly="1" if redirect_uri_provided_explicitly else "0",
+                code_challenge=code_challenge,
+                state=state,
+                scopes=scopes_raw,
+                resource=resource or "",
+                show_api_key_field=True,
+                error="Invalid API key.",
+            )
+            return HTMLResponse(html, status_code=200)
+
+        scopes_list = [s for s in scopes_raw.split() if s] or ["mcp"]
+        code = provider.mint_authorization_code(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            redirect_uri_provided_explicitly=redirect_uri_provided_explicitly,
+            code_challenge=code_challenge,
+            scopes=scopes_list,
+            resource=resource,
+        )
+        return RedirectResponse(
+            _append_query(redirect_uri, {"code": code, "state": state or None}),
+            status_code=302,
+        )
+    return consent_post
+
+
 def _make_mark_done_handler(settings: Settings):
     async def handler(request: Request) -> Response:
         if not _require_dashboard_auth(request, settings):
@@ -515,11 +685,14 @@ def _make_mark_done_handler(settings: Settings):
     return handler
 
 
-def register_routes(app, settings: Settings, tool_names: list[str]) -> None:
+def register_routes(app, settings: Settings, tool_names: list[str], oauth_provider=None) -> None:
     """Mount dashboard routes onto the given Starlette app.
 
     tool_names: the registered MCP tool names, captured after register_tools runs in main.py.
                 Used for the tools_catalog_hash field in the state payload.
+    oauth_provider: AgentsHiveOAuthProvider instance — wired in v1.7 to back the
+                /oauth/consent page. When None, the consent routes are not mounted
+                (kept optional so older test harnesses can still build the app).
     """
     global _DASHBOARD_TOOL_NAMES_CACHE
     _DASHBOARD_TOOL_NAMES_CACHE = list(tool_names)
@@ -537,3 +710,7 @@ def register_routes(app, settings: Settings, tool_names: list[str]) -> None:
     app.router.routes.append(Route("/api/dashboard/mark-done", _make_mark_done_handler(settings), methods=["POST"]))
     # v1.6 SSE push channel
     app.router.routes.append(Route("/api/dashboard/events", _make_events_handler(settings), methods=["GET"]))
+    # v1.7 OAuth consent page (only mounted when an OAuth provider is supplied).
+    if oauth_provider is not None:
+        app.router.routes.append(Route("/oauth/consent", _make_consent_get(settings, oauth_provider), methods=["GET"]))
+        app.router.routes.append(Route("/oauth/consent", _make_consent_post(settings, oauth_provider), methods=["POST"]))
