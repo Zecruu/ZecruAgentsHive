@@ -11,8 +11,19 @@ dependencies = [
     "itsdangerous>=2.0",
 ]
 
+[project.optional-dependencies]
+# v1.10: Desktop shell. Install with `pip install -e .[desktop]` to develop
+# the pywebview wrapper locally. PyInstaller is only needed at build time
+# (the installed end-user .exe doesn't carry it) but it's the same group
+# because it's the same workflow for whoever's building installers.
+desktop = [
+    "pywebview>=5",
+    "pyinstaller>=6",
+]
+
 [project.scripts]
 agentshive = "agentshive.main:main"
+agentshive-desktop = "agentshive.desktop:main"
 
 [build-system]
 requires = ["hatchling"]

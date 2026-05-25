@@ -77,6 +77,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # loop below uses startswith for the /api/dashboard/projects/ prefix
         # since exact-match wouldn't cover /<slug>/archive.
         "/api/dashboard/projects",
+        # v1.10 — desktop-mode probe; dashboard handler enforces cookie-or-bearer auth.
+        "/api/dashboard/mode",
         # v1.7 OAuth surface — these endpoints MUST be reachable without a prior
         # bearer token (it's the user-facing path to GET one). Auth, where needed,
         # is enforced inside the SDK handlers (PKCE, client validation) or the

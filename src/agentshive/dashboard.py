@@ -747,6 +747,23 @@ def _make_mark_done_handler(settings: Settings):
     return handler
 
 
+# ---------- v1.10 Mode probe ----------
+# The dashboard JS calls this on load. desktop_mode is True when the server
+# was launched by the desktop shell (AGENTSHIVE_DESKTOP=1 env), False on
+# Railway. Drives conditional rendering of folder picker + Launch buttons.
+
+
+def _make_mode_handler(settings: Settings):
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        import os as _os
+        return JSONResponse({
+            "desktop_mode": _os.environ.get("AGENTSHIVE_DESKTOP", "") == "1",
+        })
+    return handler
+
+
 # ---------- v1.9 Projects CRUD ----------
 # Multi-project support: dashboard switcher reads from GET /projects, creates via
 # POST, soft-archives via POST /<slug>/archive. The "default" project is reserved
@@ -890,6 +907,9 @@ def register_routes(app, settings: Settings, tool_names: list[str], oauth_provid
     app.router.routes.append(Route("/api/dashboard/projects", _make_projects_list_handler(settings), methods=["GET"]))
     app.router.routes.append(Route("/api/dashboard/projects", _make_projects_create_handler(settings), methods=["POST"]))
     app.router.routes.append(Route("/api/dashboard/projects/{slug}/archive", _make_project_archive_handler(settings), methods=["POST"]))
+    # v1.10 Mode probe — dashboard JS calls this on load to decide whether to
+    # render desktop-only UI (folder picker, Launch buttons, install pills).
+    app.router.routes.append(Route("/api/dashboard/mode", _make_mode_handler(settings), methods=["GET"]))
     # v1.7 OAuth consent page (only mounted when an OAuth provider is supplied).
     if oauth_provider is not None:
         app.router.routes.append(Route("/oauth/consent", _make_consent_get(settings, oauth_provider), methods=["GET"]))
