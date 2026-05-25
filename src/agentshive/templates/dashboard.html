@@ -614,9 +614,10 @@ async function sendInboxMessage(e) {
   // Disable composer during send so double-Enter doesn't double-post.
   input.disabled = true;
   try {
-    const r = await postJSON("/api/dashboard/send-to-planner", { body });
-    if (!r.ok) {
-      err.textContent = r.error || "Send failed.";
+    // postJSON returns {status, data}; the server's {ok, error} envelope is on data.
+    const { status, data } = await postJSON("/api/dashboard/send-to-planner", { body });
+    if (!data || !data.ok) {
+      err.textContent = (data && data.error) || `Send failed (HTTP ${status}).`;
       err.style.display = "block";
       return false;
     }
@@ -693,13 +694,14 @@ async function createProject(e) {
   const errBox = $("new-proj-error");
   errBox.style.display = "none";
   try {
-    const r = await postJSON("/api/dashboard/projects", { slug, name, description: desc });
-    if (!r.ok) {
-      errBox.textContent = r.error || "Create failed.";
+    // postJSON returns {status, data} — the server's {ok, error} envelope lives
+    // on data, NOT on the wrapper. Earlier draft mis-read this as r.ok.
+    const { status, data } = await postJSON("/api/dashboard/projects", { slug, name, description: desc });
+    if (!data || !data.ok) {
+      errBox.textContent = (data && data.error) || `Create failed (HTTP ${status}).`;
       errBox.style.display = "block";
       return false;
     }
-    // Success — switch to the new project (full reload).
     window.location.href = urlWithProject(slug);
   } catch (err) {
     errBox.textContent = "Network error — try again.";
