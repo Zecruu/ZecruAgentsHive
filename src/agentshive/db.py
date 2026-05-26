@@ -65,6 +65,9 @@ class Question(SQLModel, table=True):
     answer: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
     answered_at: Optional[datetime] = None
+    # v1.11: optional per-Coder identity. None = legacy single-Coder mode.
+    # Validated via project.validate_coder_id at the Coder-side tool entry point.
+    coder_id: Optional[str] = Field(default=None)
 
 
 class Summary(SQLModel, table=True):
@@ -74,6 +77,8 @@ class Summary(SQLModel, table=True):
     response: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
     responded_at: Optional[datetime] = None
+    # v1.11: see Question.coder_id.
+    coder_id: Optional[str] = Field(default=None)
 
 
 # Free-form bidirectional chat channel ADDITIVE to the structured ask/answer + submit/respond
@@ -105,6 +110,14 @@ class Message(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
     delivered_at: Optional[datetime] = None
     redelivery_count: Optional[int] = Field(default=0)
+    # v1.11: per-Coder identity. coder_id = sender (set on coder_to_planner /
+    # planner_to_coder when the Coder declares an id). target_coder_id = recipient
+    # filter on planner_to_coder messages: None = broadcast to every Coder; a
+    # specific id = only the Coder calling wait_for_planner_message(coder_id=X)
+    # with X matching receives it. Legacy Coders (coder_id=None on their wait
+    # call) only see broadcast messages.
+    coder_id: Optional[str] = Field(default=None)
+    target_coder_id: Optional[str] = Field(default=None)
 
 
 # --- v1.7 OAuth 2.1 storage ---------------------------------------------
@@ -367,6 +380,50 @@ def _apply_inline_migrations(engine: Engine) -> None:
                 "ON mission (project_id, status) WHERE status = 'active'"
             )
         )
+
+    # v1.11: per-Coder identity columns.
+    #
+    # Three additive nullable columns (question.coder_id, summary.coder_id,
+    # message.coder_id) plus message.target_coder_id. All Optional[str], nullable,
+    # no DEFAULT — pre-v1.11 rows surface as NULL which means "legacy single-Coder
+    # mode" through the rest of the protocol.
+    #
+    # Partial index on (mission_id, coder_id) for the eventual "filter pending
+    # items by Coder" query path. Postgres takes the partial WHERE clause
+    # natively; SQLite versions before 3.8.0 (March 2014) silently ignore it, so
+    # we fall back to a non-partial index there — same shape, slightly larger.
+    v111_inspector = inspect(engine)
+    v111_table_specs = [
+        ("question", ["coder_id"]),
+        ("summary", ["coder_id"]),
+        ("message", ["coder_id", "target_coder_id"]),
+    ]
+    with engine.begin() as conn:
+        for table_name, col_names in v111_table_specs:
+            if table_name not in v111_inspector.get_table_names():
+                continue
+            existing = {c["name"] for c in v111_inspector.get_columns(table_name)}
+            for col_name in col_names:
+                if col_name in existing:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} TEXT"))
+
+    with engine.begin() as conn:
+        dialect_name = engine.dialect.name
+        for table_name, _cols in v111_table_specs:
+            if table_name not in v111_inspector.get_table_names():
+                continue
+            index_name = f"ix_{table_name}_mission_coder"
+            if dialect_name == "postgresql":
+                conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON {table_name}(mission_id, coder_id) WHERE coder_id IS NOT NULL"
+                ))
+            else:
+                conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON {table_name}(mission_id, coder_id)"
+                ))
 
 
 def get_engine() -> Engine:

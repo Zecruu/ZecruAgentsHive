@@ -64,3 +64,22 @@ def validate_slug(slug: str) -> str | None:
             "no leading/trailing hyphens (e.g., 'zecru-widget', 'project-2')"
         )
     return None
+
+
+# v1.11: per-Coder identity. coder_id reuses the project slug regex so a single
+# source of truth governs both. None is the legacy/single-Coder case and passes
+# through silently — every Coder-side tool accepts an optional coder_id and only
+# validates when a value is actually supplied.
+def validate_coder_id(value: str | None) -> None:
+    """Validate an optional coder_id. None is legal (legacy single-Coder mode).
+
+    Raises ValueError on a non-None value that does not match SLUG_PATTERN.
+    No reserved-id list — unlike project slugs, "default" is a fine coder_id.
+    """
+    if value is None:
+        return
+    if not isinstance(value, str) or not SLUG_PATTERN.fullmatch(value):
+        raise ValueError(
+            "coder_id must match [a-z0-9-], 1-42 chars, no leading/trailing hyphen "
+            "(e.g., 'coder-server', 'tests', 'a1')"
+        )
