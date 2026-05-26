@@ -12,7 +12,7 @@ from . import __version__ as AGENTSHIVE_VERSION
 from . import dashboard_events
 from .config import Settings
 from .db import Message, Mission, Project, Question, Summary, get_engine
-from .project import current_project
+from .project import current_project, validate_coder_id
 
 
 # Captured at module load. See get_server_info — surfaced as `started_at` so a client
@@ -58,6 +58,8 @@ def _question_dict(q: Question) -> dict[str, Any]:
         "answer": q.answer,
         "created_at": q.created_at.isoformat(),
         "answered_at": q.answered_at.isoformat() if q.answered_at else None,
+        # v1.11: who asked. None = legacy single-Coder mode.
+        "coder_id": q.coder_id,
     }
 
 
@@ -69,6 +71,8 @@ def _summary_dict(s: Summary) -> dict[str, Any]:
         "response": s.response,
         "created_at": s.created_at.isoformat(),
         "responded_at": s.responded_at.isoformat() if s.responded_at else None,
+        # v1.11: who submitted. None = legacy single-Coder mode.
+        "coder_id": s.coder_id,
     }
 
 
@@ -88,6 +92,11 @@ def _message_dict(m: Message) -> dict[str, Any]:
         # delivered_at semantically means "acked_at" since v1.2 — see Message model docstring
         "delivered_at": m.delivered_at.isoformat() if m.delivered_at else None,
         "redelivery_count": max(0, db_count - 1),
+        # v1.11: dual identity. coder_id = sender (set on coder_to_planner rows when
+        # the Coder declared an id). target_coder_id = recipient filter on
+        # planner_to_coder rows (None = broadcast, "A" = only Coder A consumes it).
+        "coder_id": m.coder_id,
+        "target_coder_id": m.target_coder_id,
     }
 
 
@@ -268,10 +277,19 @@ def _do_ack_message(message_id: str) -> dict[str, Any]:
     return result
 
 
-def _do_send_to_coder(body: str) -> dict[str, Any]:
+def _do_send_to_coder(body: str, target_coder_id: Optional[str] = None) -> dict[str, Any]:
+    """Insert a planner_to_coder message. v1.11: optional target_coder_id
+    addresses a specific Coder. None = broadcast (every Coder's
+    wait_for_planner_message sees it). A specific id = only the Coder calling
+    wait_for_planner_message(coder_id=X) with X matching receives it.
+    """
     err = _validate_text(body, "body", MAX_TEXT_LEN)
     if err:
         return err
+    try:
+        validate_coder_id(target_coder_id)
+    except ValueError as e:
+        return {"error": str(e)}
     with Session(get_engine()) as session:
         mission = _active_mission(session)
         if mission is None:
@@ -281,6 +299,7 @@ def _do_send_to_coder(body: str) -> dict[str, Any]:
             project_id=mission.project_id,
             direction="planner_to_coder",
             body=body,
+            target_coder_id=target_coder_id,
         )
         session.add(m)
         session.commit()
@@ -392,22 +411,28 @@ def _do_create_mission(name: str, spec: str) -> dict[str, Any]:
             }
 
 
-def _do_ask_planner(question: str) -> dict[str, Any]:
+def _do_ask_planner(question: str, coder_id: Optional[str] = None) -> dict[str, Any]:
     """Insert a Question against the active mission. Does NOT block — the wait
     loop is MCP-protocol-specific and stays in the @mcp.tool ask_planner wrapper.
     Returns the question dict (with the new question_id) on success.
 
     v1.9: scoped to current project via _active_mission().
+    v1.11: optional coder_id identifies which Coder asked, surfaced to the
+    Hivemind via _question_dict. None = legacy single-Coder mode.
     """
     err = _validate_text(question, "question", MAX_TEXT_LEN)
     if err:
         return err
+    try:
+        validate_coder_id(coder_id)
+    except ValueError as e:
+        return {"error": str(e)}
     with Session(get_engine()) as session:
         _touch_coder(session)
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot ask"}
-        q = Question(mission_id=mission.id, body=question)
+        q = Question(mission_id=mission.id, body=question, coder_id=coder_id)
         session.add(q)
         session.commit()
         session.refresh(q)
@@ -417,17 +442,23 @@ def _do_ask_planner(question: str) -> dict[str, Any]:
     return result
 
 
-def _do_submit_progress(summary: str) -> dict[str, Any]:
-    """Insert a Summary against the active mission. v1.9: scoped to current project."""
+def _do_submit_progress(summary: str, coder_id: Optional[str] = None) -> dict[str, Any]:
+    """Insert a Summary against the active mission. v1.9: scoped to current project.
+    v1.11: optional coder_id identifies which Coder submitted.
+    """
     err = _validate_text(summary, "summary", MAX_TEXT_LEN)
     if err:
         return err
+    try:
+        validate_coder_id(coder_id)
+    except ValueError as e:
+        return {"error": str(e)}
     with Session(get_engine()) as session:
         _touch_coder(session)
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot submit progress"}
-        s = Summary(mission_id=mission.id, body=summary)
+        s = Summary(mission_id=mission.id, body=summary, coder_id=coder_id)
         session.add(s)
         session.commit()
         session.refresh(s)
@@ -706,7 +737,7 @@ def register_tools(mcp, settings: Settings) -> None:
         )
 
     @mcp.tool
-    def send_to_coder(body: str) -> dict[str, Any]:
+    def send_to_coder(body: str, target_coder_id: Optional[str] = None) -> dict[str, Any]:
         """Planner-side: send a free-form message TO the Coder. Fire-and-forget.
 
         Use this for casual "fyi…" / "while you're at it…" / "I noticed X" updates that
@@ -716,8 +747,20 @@ def register_tools(mcp, settings: Settings) -> None:
 
         Inserts a Message addressed to the Coder against the currently-active mission.
         Returns the message_id immediately; does NOT block.
+
+        v1.11: optional target_coder_id addresses a specific Coder by id.
+        - target_coder_id=None (default): broadcast — every Coder that calls
+          wait_for_planner_message receives it, including legacy Coders that
+          don't declare a coder_id.
+        - target_coder_id="A": targeted — only the Coder calling
+          wait_for_planner_message(coder_id="A") receives it. Other identified
+          Coders and legacy Coders (coder_id=None) do NOT see this message.
+
+        Use targeted sends when N Coders are working the same mission and the
+        message is relevant to only one (e.g., "Coder-server, switch to
+        Postgres"). Use the default broadcast for general announcements.
         """
-        return _do_send_to_coder(body)
+        return _do_send_to_coder(body, target_coder_id=target_coder_id)
 
     @mcp.tool
     def wait_for_coder_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
@@ -757,7 +800,7 @@ def register_tools(mcp, settings: Settings) -> None:
         )
 
     @mcp.tool
-    def send_to_planner(body: str) -> dict[str, Any]:
+    def send_to_planner(body: str, coder_id: Optional[str] = None) -> dict[str, Any]:
         """Coder-side: send a free-form message TO the Planner. Fire-and-forget.
 
         Use this for "fyi…" / "I made a small tangential decision" / "here's an
@@ -766,10 +809,18 @@ def register_tools(mcp, settings: Settings) -> None:
 
         Inserts a Message addressed to the Planner against the active mission. Also
         bumps the Coder heartbeat. Returns the message_id immediately; does NOT block.
+
+        v1.11: optional coder_id self-identifies the Coder. Surfaced to the
+        Hivemind on _message_dict so they can attribute the note. None = legacy
+        single-Coder mode (no attribution).
         """
         err = _validate_text(body, "body", MAX_TEXT_LEN)
         if err:
             return err
+        try:
+            validate_coder_id(coder_id)
+        except ValueError as e:
+            return {"error": str(e)}
         with Session(get_engine()) as session:
             _touch_coder(session)
             mission = _active_mission(session)
@@ -780,6 +831,7 @@ def register_tools(mcp, settings: Settings) -> None:
                 project_id=mission.project_id,
                 direction="coder_to_planner",
                 body=body,
+                coder_id=coder_id,
             )
             session.add(m)
             session.commit()
@@ -790,7 +842,10 @@ def register_tools(mcp, settings: Settings) -> None:
         return result
 
     @mcp.tool
-    def wait_for_planner_message(timeout_seconds: Optional[float] = None) -> dict[str, Any]:
+    def wait_for_planner_message(
+        timeout_seconds: Optional[float] = None,
+        coder_id: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Coder-side: block until an unacked Planner→Coder message exists for the active mission.
 
         AT-LEAST-ONCE SEMANTICS (v1.2): returns the OLDEST unacked message but does NOT
@@ -802,10 +857,25 @@ def register_tools(mcp, settings: Settings) -> None:
 
         On timeout: {status: "pending", message: ...}. Call again to keep waiting.
 
+        v1.11 — targeting filter for multi-Coder coordination. Pass `coder_id` to
+        self-identify. The four delivery paths:
+          - sender target=None + coder_id=None or any value  → DELIVERED (broadcast)
+          - sender target="A" + coder_id="A"                  → DELIVERED (targeted match)
+          - sender target="A" + coder_id="B"                  → NOT DELIVERED (other Coder's)
+          - sender target="A" + coder_id=None (legacy)        → NOT DELIVERED (legacy
+            Coders never claim a target identity, so they only see broadcasts)
+
         Args:
             timeout_seconds: optional override for the server-side block. Falls back to
                 TOOL_BLOCK_TIMEOUT_SECONDS.
+            coder_id: optional self-identifier. Validated against the same slug regex
+                as project slugs. None preserves pre-v1.11 behavior (broadcast-only).
         """
+        try:
+            validate_coder_id(coder_id)
+        except ValueError as e:
+            return {"error": str(e)}
+
         with Session(get_engine()) as session:
             _touch_coder(session)
         def _bump(m, session):
@@ -813,16 +883,29 @@ def register_tools(mcp, settings: Settings) -> None:
             session.add(m)
             session.commit()
             session.refresh(m)
-        return _wait_for_active(
-            lambda session, mission: session.exec(
+
+        def _query(session, mission):
+            from sqlalchemy import or_
+            stmt = (
                 select(Message)
                 .where(
                     Message.mission_id == mission.id,
                     Message.direction == "planner_to_coder",
                     Message.delivered_at.is_(None),
                 )
-                .order_by(Message.created_at)
-            ).first(),
+            )
+            if coder_id is None:
+                # Legacy / broadcast-only mode: only target_coder_id IS NULL rows.
+                stmt = stmt.where(Message.target_coder_id.is_(None))
+            else:
+                # Identified Coder: broadcasts + messages targeted at me.
+                stmt = stmt.where(
+                    or_(Message.target_coder_id.is_(None), Message.target_coder_id == coder_id)
+                )
+            return session.exec(stmt.order_by(Message.created_at)).first()
+
+        return _wait_for_active(
+            _query,
             _message_dict,
             "no messages yet — call wait_for_planner_message again to keep waiting",
             timeout_seconds if timeout_seconds is not None else block_timeout,
@@ -1081,7 +1164,7 @@ def register_tools(mcp, settings: Settings) -> None:
         )
 
     @mcp.tool
-    def ask_planner(question: str) -> dict[str, Any]:
+    def ask_planner(question: str, coder_id: Optional[str] = None) -> dict[str, Any]:
         """Ask the Planner a question and wait for the answer.
 
         Use this whenever you would otherwise stop and ask the human. This is the entire
@@ -1093,9 +1176,13 @@ def register_tools(mcp, settings: Settings) -> None:
         is hit before an answer arrives, you get a {status: "pending", question_id: ...}
         response — call wait_for_answer(question_id) repeatedly until you get a real
         answer. Do NOT treat 'pending' as failure.
+
+        v1.11: optional coder_id self-identifies the Coder so the Hivemind can
+        attribute the question when multiple Coders work the same mission. None =
+        legacy single-Coder mode.
         """
         # Insert via the module-level _do_ function so the dashboard SSE push fires.
-        inserted = _do_ask_planner(question)
+        inserted = _do_ask_planner(question, coder_id=coder_id)
         if "error" in inserted:
             return inserted
         return _wait_for_question(inserted["question_id"])
@@ -1126,7 +1213,7 @@ def register_tools(mcp, settings: Settings) -> None:
         )
 
     @mcp.tool
-    def submit_progress(summary: str) -> dict[str, Any]:
+    def submit_progress(summary: str, coder_id: Optional[str] = None) -> dict[str, Any]:
         """Push a natural-language progress summary to the Planner and wait for their response.
 
         Call this at meaningful checkpoints (after each feature / milestone). Write in plain
@@ -1136,9 +1223,13 @@ def register_tools(mcp, settings: Settings) -> None:
         Behavior: blocks until the Planner responds. If the MCP transport times out first,
         you get status="pending" + summary_id — call wait_for_summary_response(summary_id)
         to keep waiting.
+
+        v1.11: optional coder_id self-identifies the Coder. The Hivemind sees the
+        coder_id on every summary so they can attribute the work in a multi-Coder
+        run. None = legacy single-Coder mode.
         """
         # Insert via the module-level _do_ function so the dashboard SSE push fires.
-        inserted = _do_submit_progress(summary)
+        inserted = _do_submit_progress(summary, coder_id=coder_id)
         if "error" in inserted:
             return inserted
         return _wait_for_summary(inserted["summary_id"])

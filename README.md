@@ -143,6 +143,42 @@ The dashboard header has a **Project** dropdown that lists every non-archived pr
 
 OAuth tokens are project-orthogonal: an OAuth client issued during a consent flow for project A works for project B too. Project scope is a request-level concern (read from the URL), not an authentication concern.
 
+## Multi-Coder coordination (v1.11+)
+
+Inside one project you can run a single Hivemind (Planner) alongside several Coder agents — e.g., one Coder per subsystem (`coder-server`, `coder-client`, `coder-tests`). All Coders share the active mission; per-Coder identity keeps their questions, summaries, and chat attributed and addressable.
+
+**Coders self-identify.** Every Coder-side tool accepts an optional `coder_id`:
+
+```python
+ask_planner(question="0-indexed?", coder_id="coder-server")
+submit_progress(summary="phase 1 done", coder_id="coder-server")
+send_to_planner(body="fyi I'm starting tests", coder_id="coder-tests")
+```
+
+`coder_id` is validated against the same kebab-case regex as project slugs (`[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?`). It surfaces on every question / summary / message in `list_pending_*`, `wait_for_next_*`, and the dashboard JSON, so the Hivemind always knows who asked.
+
+**Hivemind addresses one Coder or broadcasts.** `send_to_coder` takes an optional `target_coder_id`:
+
+```python
+send_to_coder(body="use Postgres, not SQLite")                    # broadcast — every Coder sees it
+send_to_coder(body="rebase your branch", target_coder_id="coder-server")  # only coder-server sees it
+```
+
+**Coders filter their inbox by identity.** `wait_for_planner_message` takes an optional `coder_id`:
+
+| Sender's `target_coder_id` | Coder's `wait_for_planner_message(coder_id=…)` | Delivered? |
+| --- | --- | --- |
+| `None` (broadcast) | any value (or `None`) | yes |
+| `"a"` | `"a"` | yes |
+| `"a"` | `"b"` | no — belongs to another Coder |
+| `"a"` | `None` (legacy Coder) | no — legacy Coders only see broadcasts |
+
+The last row is the safety property: a legacy single-Coder setup that never declares `coder_id` stays in broadcast-only mode and never silently intercepts a targeted message meant for someone else.
+
+**Backwards compatibility.** `coder_id` is optional everywhere. Omit it and you get pre-v1.11 behavior (no attribution, no targeting). Existing single-Coder workflows need zero changes.
+
+**Dashboard pills.** Each question, summary, and message renders a small `Coder: <id>` pill in a deterministic color (so the same Coder always reads as the same color across sessions). Targeted Planner→Coder messages also show a `→ <target>` pill; broadcasts show `→ broadcast`.
+
 ## Dashboard (v1.4+)
 
 A read-only web view of the unified Planner / Coder state, served by the same Starlette app at:

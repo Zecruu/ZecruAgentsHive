@@ -30,11 +30,23 @@ Only ONE mission active at a time. Creating a new one supersedes the previous (i
    - Genuinely need user-only info (credentials, personal preferences)? → ask the user directly.
 3. At milestones: `submit_progress(summary, status)` where status is `in_progress`, `blocked`, or `done`. Then `wait_for_summary_response(summary_id, timeout=240)`.
 
-## Multi-Coder
+## Multi-Coder (v1.11+)
 
-You can run multiple Coder threads on the same mission (one on server, one on dashboard, one on tests). All see the same active mission. The Hivemind sees questions in arrival order — questions don't carry per-Coder identity in v1.x, so be explicit about which part of the work you're asking about.
+You can run multiple Coder threads on the same mission (one on server, one on dashboard, one on tests). All see the same active mission. Since v1.11, every Coder-side tool accepts an optional `coder_id` so the Hivemind sees who asked what:
 
-If you find another Coder already touched files you'd touch, ping the Hivemind via `send_to_planner(message)` to clarify scope.
+```python
+ask_planner(question="…", coder_id="coder-server")
+submit_progress(summary="…", coder_id="coder-server")
+send_to_planner(body="…", coder_id="coder-server")
+```
+
+`coder_id` follows the project-slug regex (`[a-z0-9-]`, 1-42 chars, no leading/trailing hyphen). Pick something stable for your thread's scope (`coder-server`, `coder-tests`, `coder-dashboard`) and pass it on every call.
+
+The Hivemind addresses you back via `send_to_coder(body, target_coder_id=…)`. To receive only the messages meant for you, pass your same `coder_id` to `wait_for_planner_message(coder_id="coder-server")` — you'll see broadcasts plus messages targeted at your id; targeted messages for other Coders won't surface in your queue.
+
+If you DON'T pass a `coder_id`, you're in legacy/broadcast-only mode: the Hivemind has no attribution and you only see broadcasts (never targeted messages — that's the v1.11 safety property).
+
+If you find another Coder already touched files you'd touch, ping the Hivemind via `send_to_planner(message, coder_id="…")` to clarify scope.
 
 ## Project context
 
