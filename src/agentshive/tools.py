@@ -707,13 +707,19 @@ def register_tools(mcp, settings: Settings) -> None:
         Coder is polling for a mission to appear (no mission exists yet, so
         they can't ask_planner) and wants to show up in the Connected Coders
         panel as "alive and waiting".
+
+        Without coder_id: NO heartbeat side effect, preserving pre-v1.13
+        Planner-side behavior (v1.1 F3.b: list/get tools don't bump
+        coder_last_seen). Only adding coder_id opts into the per-Coder
+        heartbeat trail.
         """
         try:
             validate_coder_id(coder_id)
         except ValueError as e:
             return {"error": str(e)}
         with Session(get_engine()) as session:
-            _touch_coder(session, coder_id=coder_id)
+            if coder_id is not None:
+                _touch_coder(session, coder_id=coder_id)
             mission = _active_mission(session)
             return _mission_dict(mission) if mission else {"mission": None}
 
