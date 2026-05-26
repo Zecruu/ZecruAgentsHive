@@ -2,6 +2,28 @@
 
 An MCP bridge so AI coders (Claude Code, Codex CLI) can ask AI planners (Claude or Codex desktop/mobile) instead of stopping to ask the human.
 
+## Quick start — `agentshive init` (Zed / Claude Code / Codex CLI multi-agent)
+
+Run from your project root to drop in `AGENTS.md` (cross-tool agent rules) plus `.zed/settings.json` (Zed MCP wiring):
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/init_project.py | python - <project-slug>
+```
+
+```powershell
+# Windows PowerShell
+iwr -useb https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/init_project.py | python - <project-slug>
+```
+
+You'll be prompted for the AgentsHive server URL (defaults to the Railway-hosted one) and your API key (or set `AGENTSHIVE_API_KEY` env to skip the prompt).
+
+After init, in Zed's agent panel:
+- One thread: *"You are the Hivemind for project `<slug>`. Read AGENTS.md."*
+- Other threads: *"You are a Coder for project `<slug>`. Read AGENTS.md."*
+
+The Hivemind orchestrates, Coders implement and ask the Hivemind (not you) when stuck. Pair this with the [`agentshive` skill](https://app.noticomax.com) for full protocol context inside Claude Code CLI.
+
 ## How it works
 
 1. **You + the Planner** lock the spec inside Claude.ai or ChatGPT/Codex (desktop or mobile). The Planner has AgentsHive connected as a connector.
