@@ -7,13 +7,13 @@ An MCP bridge so AI coders (Claude Code, Codex CLI) can ask AI planners (Claude 
 Run from your project root to drop in `AGENTS.md` (cross-tool agent rules) plus `.zed/settings.json` (Zed MCP wiring):
 
 ```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/init_project.py | python - <project-slug>
+# macOS / Linux — replace my-project with your slug, or omit to use the current dir name
+curl -fsSL https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/init_project.py | python - my-project
 ```
 
 ```powershell
-# Windows PowerShell
-iwr -useb https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/init_project.py | python - <project-slug>
+# Windows PowerShell — DO NOT use angle brackets, PowerShell reserves '<' as an operator
+iwr -useb https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/init_project.py | python - my-project
 ```
 
 You'll be prompted for the AgentsHive server URL (defaults to the Railway-hosted one) and your API key (or set `AGENTSHIVE_API_KEY` env to skip the prompt).
