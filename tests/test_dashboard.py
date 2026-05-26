@@ -15,7 +15,7 @@ import httpx
 from fastmcp import Client
 
 KEY = os.environ.get("AGENTSHIVE_API_KEY", "test-key")
-BASE = os.environ.get("AGENTSHIVE_BASE", "http://localhost:8001")
+BASE = os.environ.get("AGENTSHIVE_BASE", "http://localhost:8000")
 MCP_URL = f"{BASE}/mcp"
 
 
@@ -24,7 +24,7 @@ def _c(r):
 
 
 def test_login_bad_key_returns_200_with_error():
-    print("--- T1: POST /dashboard/login bad key → 200 + error, no cookie ---")
+    print("--- T1: POST /dashboard/login bad key -> 200 + error, no cookie ---")
     r = httpx.post(f"{BASE}/dashboard/login", data={"api_key": "wrong"}, follow_redirects=False)
     assert r.status_code == 200, f"expected 200, got {r.status_code}"
     assert "Invalid API key" in r.text, "error message missing"
@@ -33,7 +33,7 @@ def test_login_bad_key_returns_200_with_error():
 
 
 def test_login_good_key_redirects_with_cookie():
-    print("--- T2: POST /dashboard/login good key → 302 + cookie ---")
+    print("--- T2: POST /dashboard/login good key -> 302 + cookie ---")
     r = httpx.post(f"{BASE}/dashboard/login", data={"api_key": KEY}, follow_redirects=False)
     assert r.status_code == 302, f"expected 302, got {r.status_code}"
     assert r.headers.get("location") == "/dashboard"
@@ -45,7 +45,7 @@ def test_login_good_key_redirects_with_cookie():
 
 
 def test_dashboard_no_cookie_redirects():
-    print("--- T3: GET /dashboard no cookie → 302 /dashboard/login ---")
+    print("--- T3: GET /dashboard no cookie -> 302 /dashboard/login ---")
     r = httpx.get(f"{BASE}/dashboard", follow_redirects=False)
     assert r.status_code == 302, f"expected 302, got {r.status_code}"
     assert r.headers.get("location") == "/dashboard/login"
@@ -53,7 +53,7 @@ def test_dashboard_no_cookie_redirects():
 
 
 def test_dashboard_valid_cookie_returns_html():
-    print("--- T4: GET /dashboard valid cookie → 200 HTML ---")
+    print("--- T4: GET /dashboard valid cookie -> 200 HTML ---")
     cookie = test_login_good_key_redirects_with_cookie.__wrapped__() if hasattr(test_login_good_key_redirects_with_cookie, "__wrapped__") else None
     if not cookie:
         login = httpx.post(f"{BASE}/dashboard/login", data={"api_key": KEY}, follow_redirects=False)
@@ -65,7 +65,7 @@ def test_dashboard_valid_cookie_returns_html():
 
 
 def test_dashboard_tampered_cookie_redirects():
-    print("--- T5: GET /dashboard tampered cookie → 302 ---")
+    print("--- T5: GET /dashboard tampered cookie -> 302 ---")
     r = httpx.get(
         f"{BASE}/dashboard",
         cookies={"agentshive_dash_session": "tampered.garbage.value"},
@@ -77,14 +77,14 @@ def test_dashboard_tampered_cookie_redirects():
 
 
 def test_state_no_auth_401():
-    print("--- T6: GET /api/dashboard/state no auth → 401 ---")
+    print("--- T6: GET /api/dashboard/state no auth -> 401 ---")
     r = httpx.get(f"{BASE}/api/dashboard/state")
     assert r.status_code == 401, f"expected 401, got {r.status_code}"
     print("  [OK]")
 
 
 def test_state_bearer_200_shape():
-    print("--- T7: GET /api/dashboard/state bearer → 200 with all keys ---")
+    print("--- T7: GET /api/dashboard/state bearer -> 200 with all keys ---")
     r = httpx.get(f"{BASE}/api/dashboard/state", headers={"Authorization": f"Bearer {KEY}"})
     assert r.status_code == 200, f"expected 200, got {r.status_code}"
     body = r.json()
@@ -99,7 +99,7 @@ def test_state_bearer_200_shape():
 
 
 def test_state_cookie_200_same_shape():
-    print("--- T8: GET /api/dashboard/state cookie → 200 same shape ---")
+    print("--- T8: GET /api/dashboard/state cookie -> 200 same shape ---")
     login = httpx.post(f"{BASE}/dashboard/login", data={"api_key": KEY}, follow_redirects=False)
     cookie = login.cookies.get("agentshive_dash_session")
     r = httpx.get(f"{BASE}/api/dashboard/state", cookies={"agentshive_dash_session": cookie})
@@ -110,7 +110,7 @@ def test_state_cookie_200_same_shape():
 
 
 def test_logout_clears_cookie():
-    print("--- T9: POST /dashboard/logout → 302 + cookie cleared ---")
+    print("--- T9: POST /dashboard/logout -> 302 + cookie cleared ---")
     login = httpx.post(f"{BASE}/dashboard/login", data={"api_key": KEY}, follow_redirects=False)
     cookie = login.cookies.get("agentshive_dash_session")
     r = httpx.post(f"{BASE}/dashboard/logout",
@@ -125,14 +125,14 @@ def test_logout_clears_cookie():
 
 
 def test_logout_works_without_valid_cookie():
-    print("--- T10: POST /dashboard/logout no cookie → 302 (public) ---")
+    print("--- T10: POST /dashboard/logout no cookie -> 302 (public) ---")
     r = httpx.post(f"{BASE}/dashboard/logout", follow_redirects=False)
     assert r.status_code == 302, f"logout should work without a cookie, got {r.status_code}"
     print("  [OK]")
 
 
 async def test_integration_state_populated_after_writes():
-    print("--- T11: integration — writes populate the state payload ---")
+    print("--- T11: integration -- writes populate the state payload ---")
     async with Client(MCP_URL, auth=KEY) as cli:
         await cli.call_tool("create_mission", {"name": "dash-int", "spec": "integration test"})
         await cli.call_tool("send_to_coder", {"body": "fyi for the coder"})

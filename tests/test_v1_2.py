@@ -14,7 +14,7 @@ from fastmcp import Client
 from sqlalchemy import create_engine, inspect, text
 
 KEY = os.environ.get("AGENTSHIVE_API_KEY", "test-key")
-URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8001/mcp")
+URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8000/mcp")
 DB_PATH = os.environ.get("AGENTSHIVE_DB", "sqlite:///./agentshive.db")
 
 
@@ -49,10 +49,10 @@ async def test_redeliver_on_crash():
             r2 = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 3}))
             r3 = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 3}))
             assert r1["message_id"] == r2["message_id"] == r3["message_id"] == mid
-            # 0-indexed surface: first delivery → 0, then 1 (one predecessor), then 2 (two)
+            # 0-indexed surface: first delivery -> 0, then 1 (one predecessor), then 2 (two)
             assert (r1["redelivery_count"], r2["redelivery_count"], r3["redelivery_count"]) == (0, 1, 2), \
                 f"expected 0,1,2 got {(r1['redelivery_count'], r2['redelivery_count'], r3['redelivery_count'])}"
-            print(f"  [OK] same msg returned 3 times, redelivery_count 0→1→2 (predecessor count)")
+            print(f"  [OK] same msg returned 3 times, redelivery_count 0->1->2 (predecessor count)")
             # Now ack
             await coder.call_tool("ack_message", {"message_id": mid})
             r4 = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 2}))
@@ -126,12 +126,12 @@ async def test_sequential_create_mission_supersedes():
 def test_concurrent_create_mission_skipped_on_sqlite():
     print("--- F2.d: true concurrent race test ---")
     if DB_PATH.startswith("sqlite"):
-        print("  [SKIP] SQLite serializes writes — partial unique index already proven via direct INSERT bypass")
+        print("  [SKIP] SQLite serializes writes -- partial unique index already proven via direct INSERT bypass")
     else:
         # Postgres path: spawn N threads issuing create_mission, verify all succeed (via retry-and-supersede)
         # and that get_active_mission still returns exactly one. Not exercised here in CI but the
         # mechanism is the IntegrityError retry-once in tools.py:create_mission.
-        print("  [TODO] Postgres concurrent test — currently SQLite-only suite")
+        print("  [TODO] Postgres concurrent test -- currently SQLite-only suite")
 
 
 # ---------- FEATURE 3: input validation ----------

@@ -73,7 +73,7 @@ async def planner_role(started: asyncio.Event, mission_id_holder: dict):
                     _ok("got pending summary", sid)
                     r = await client.call_tool("respond_to_summary", {
                         "summary_id": sid,
-                        "response": "Looks good — ship it.",
+                        "response": "Looks good -- ship it.",
                     })
                     _ok("respond_to_summary", _content(r).get("responded_at"))
                     break

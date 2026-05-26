@@ -61,11 +61,11 @@ async def _open_mission(project_slug: str, name: str = "v1.11 test") -> str:
 
 
 async def test_coder_id_on_question():
-    print("--- T1: ask_planner(coder_id=A) → Hivemind sees coder_id on the question ---")
+    print("--- T1: ask_planner(coder_id=A) -> Hivemind sees coder_id on the question ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
     async with Client(f"{MCP}?project={p}", auth=KEY) as c:
-        # ask_planner blocks for the answer — give it a tiny timeout so it returns
+        # ask_planner blocks for the answer -- give it a tiny timeout so it returns
         # status=pending and we can read the question row from list_pending_questions.
         r = await c.call_tool("ask_planner", {"question": "from A?", "coder_id": "coder-a"})
         # We just need the question to have been INSERTED. Pending or answered both fine.
@@ -90,7 +90,7 @@ async def test_distinct_coder_ids_on_questions():
 
 
 async def test_no_coder_id_legacy_persists_null():
-    print("--- T3: legacy Coder (no coder_id) → row.coder_id stays null ---")
+    print("--- T3: legacy Coder (no coder_id) -> row.coder_id stays null ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
     async with Client(f"{MCP}?project={p}", auth=KEY) as c:
@@ -102,14 +102,14 @@ async def test_no_coder_id_legacy_persists_null():
 
 
 async def test_submit_progress_persists_coder_id():
-    print("--- T4: submit_progress(coder_id=A) → coder_id on summary row ---")
+    print("--- T4: submit_progress(coder_id=A) -> coder_id on summary row ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
 
     async def _coder_submit(sl):
         async with Client(f"{MCP}?project={sl}", auth=KEY) as c:
             # submit_progress blocks until Planner responds; we don't want to wait.
-            # Use a very short timeout via timeout_seconds — but submit_progress
+            # Use a very short timeout via timeout_seconds -- but submit_progress
             # doesn't expose one. Instead, call the underlying tool then poll the
             # pending-summaries list (the row is inserted before the wait loop).
             await c.call_tool("submit_progress", {"summary": "phase-1", "coder_id": "phase-coder"})
@@ -129,7 +129,7 @@ async def test_submit_progress_persists_coder_id():
 
 
 async def test_invalid_coder_id_rejected():
-    print("--- T5: invalid coder_id (uppercase, special chars, too long) → error ---")
+    print("--- T5: invalid coder_id (uppercase, special chars, too long) -> error ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
     async with Client(f"{MCP}?project={p}", auth=KEY) as c:
@@ -144,7 +144,7 @@ async def test_invalid_coder_id_rejected():
 
 async def _post_planner_message(project_slug: str, body: str, target_coder_id: str | None) -> str:
     """Planner-side send_to_coder, called via the same MCP URL the Coder uses
-    (the tool itself doesn't differentiate by role — it's by convention)."""
+    (the tool itself doesn't differentiate by role -- it's by convention)."""
     payload = {"body": body}
     if target_coder_id is not None:
         payload["target_coder_id"] = target_coder_id
@@ -154,7 +154,7 @@ async def _post_planner_message(project_slug: str, body: str, target_coder_id: s
 
 
 async def test_broadcast_delivered_to_legacy_coder():
-    print("--- T6: target=None + coder_id=None (legacy Coder) → DELIVERED ---")
+    print("--- T6: target=None + coder_id=None (legacy Coder) -> DELIVERED ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
     await _post_planner_message(p, "everyone-hear-this", target_coder_id=None)
@@ -167,7 +167,7 @@ async def test_broadcast_delivered_to_legacy_coder():
 
 
 async def test_broadcast_delivered_to_identified_coder():
-    print("--- T7: target=None + coder_id=A → DELIVERED ---")
+    print("--- T7: target=None + coder_id=A -> DELIVERED ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
     await _post_planner_message(p, "broadcast-to-all", target_coder_id=None)
@@ -180,7 +180,7 @@ async def test_broadcast_delivered_to_identified_coder():
 
 
 async def test_targeted_delivered_to_matching_coder():
-    print("--- T8: target=A + coder_id=A → DELIVERED ---")
+    print("--- T8: target=A + coder_id=A -> DELIVERED ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
     await _post_planner_message(p, "for-a-only", target_coder_id="a")
@@ -194,7 +194,7 @@ async def test_targeted_delivered_to_matching_coder():
 
 
 async def test_targeted_not_delivered_to_other_coder():
-    print("--- T9: target=A + coder_id=B → NOT DELIVERED ---")
+    print("--- T9: target=A + coder_id=B -> NOT DELIVERED ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
     await _post_planner_message(p, "for-a-only", target_coder_id="a")
@@ -206,7 +206,7 @@ async def test_targeted_not_delivered_to_other_coder():
 
 
 async def test_targeted_not_delivered_to_legacy_coder():
-    print("--- T10: target=A + coder_id=None (legacy) → NOT DELIVERED (safety) ---")
+    print("--- T10: target=A + coder_id=None (legacy) -> NOT DELIVERED (safety) ---")
     p = _slug(); _new_project(p)
     await _open_mission(p)
     await _post_planner_message(p, "for-a-only", target_coder_id="a")
@@ -225,7 +225,7 @@ def test_migration_columns_exist():
     # process imports agentshive directly, we can use the engine that init_engine
     # populates. But the running server has its own engine. We use a side channel:
     # the dashboard JSON includes the columns implicitly (via the dict serializers)
-    # — so an indirect proof is that /api/dashboard/state contains coder_id fields.
+    # -- so an indirect proof is that /api/dashboard/state contains coder_id fields.
     # Direct schema inspection: connect to the same sqlite/postgres file the
     # server uses. For the test harness we assume the default sqlite path.
     from agentshive.config import load_settings

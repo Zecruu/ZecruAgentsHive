@@ -73,7 +73,7 @@ def test_default_slug_reserved():
 def test_invalid_slug_rejected():
     print("--- T3: invalid slug formats are 400'd ---")
     # Note: the handler auto-lowercases the slug before validating, so 'FooBar'
-    # becomes 'foobar' and passes — that's a deliberate UX choice. The bad list
+    # becomes 'foobar' and passes -- that's a deliberate UX choice. The bad list
     # only contains slugs that fail even after lowercasing.
     for bad in ("-foo", "foo-", "foo.bar", "a" * 50, "", "foo_bar"):
         r = _post_project(bad, "Bad")
@@ -82,7 +82,7 @@ def test_invalid_slug_rejected():
 
 
 def test_duplicate_slug_conflict():
-    print("--- T4: duplicate slug → 409 ---")
+    print("--- T4: duplicate slug -> 409 ---")
     s = _slug()
     r = _post_project(s, "First")
     assert r.status_code == 201
@@ -164,7 +164,7 @@ async def test_wait_for_user_message_scoped():
     assert _post_project(b, "WB").status_code == 201
     UNIQUE = f"wait-marker-{_slug()}"
 
-    # Schedule a post to B while A is waiting — A should NOT see it (would time out)
+    # Schedule a post to B while A is waiting -- A should NOT see it (would time out)
     async def writer_to_b():
         await asyncio.sleep(0.3)
         httpx.post(f"{BASE}/api/dashboard/send-to-planner?project={b}",
@@ -172,7 +172,7 @@ async def test_wait_for_user_message_scoped():
 
     async with Client(f"{MCP}?project={a}", auth=KEY) as ca:
         asyncio.create_task(writer_to_b())
-        # Short timeout — if A picks up B's message, this assertion fails
+        # Short timeout -- if A picks up B's message, this assertion fails
         r = await ca.call_tool("wait_for_user_message", {"timeout_seconds": 3})
         d = _unwrap(r)
         assert d.get("status") == "pending", f"A picked up B's msg (leak!): {d}"
@@ -230,23 +230,23 @@ def test_create_revives_archived_slug():
     # Archive
     r = httpx.post(f"{BASE}/api/dashboard/projects/{s}/archive", headers=ORIGIN, timeout=5)
     assert r.status_code == 200
-    # Re-create with the same slug — should revive, not 409
+    # Re-create with the same slug -- should revive, not 409
     r = _post_project(s, "Revived", "now with description")
     assert r.status_code == 200, r.text[:200]
     body = r.json()
     assert body.get("ok") is True and body.get("revived") is True, body
     assert body["project"]["archived_at"] is None
     assert body["project"]["name"] == "Revived"
-    print(f"  [OK] {s} archived → re-created → revived in place")
+    print(f"  [OK] {s} archived -> re-created -> revived in place")
 
 
 async def test_oauth_endpoints_unaffected_by_project():
     print("--- T13: OAuth metadata is project-orthogonal ---")
-    # AS metadata is reachable with or without ?project= — same response
+    # AS metadata is reachable with or without ?project= -- same response
     r1 = httpx.get(f"{BASE}/.well-known/oauth-authorization-server", timeout=5)
     r2 = httpx.get(f"{BASE}/.well-known/oauth-authorization-server?project=anything", timeout=5)
     assert r1.status_code == 200 and r2.status_code == 200
-    assert r1.json() == r2.json(), "OAuth metadata varies by project — should be orthogonal"
+    assert r1.json() == r2.json(), "OAuth metadata varies by project -- should be orthogonal"
     print("  [OK] OAuth surface unchanged")
 
 

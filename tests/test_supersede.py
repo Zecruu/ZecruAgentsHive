@@ -12,7 +12,7 @@ Covers three scenarios:
 2. Supersede unblocks a Coder waiting on ask_planner: if the Planner calls create_mission
    while the Coder is blocked, wait_for_answer must return {status: "superseded", ...}
    instead of looping forever.
-3. mark_mission_done unblocks a Coder waiting on submit_progress: same idea — the Coder
+3. mark_mission_done unblocks a Coder waiting on submit_progress: same idea -- the Coder
    gets {status: "done", ...} and can stop.
 """
 
@@ -23,7 +23,7 @@ import sys
 from fastmcp import Client
 
 KEY = os.environ.get("AGENTSHIVE_API_KEY", "test-key")
-URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8001/mcp")
+URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8000/mcp")
 
 
 def _content(r):
@@ -75,7 +75,7 @@ async def test_supersede_unblocks_coder():
         r = await cli.call_tool("create_mission", {"name": "mission-A", "spec": "A"})
         mid_a = _content(r)["mission_id"]
 
-        q = _content(await cli.call_tool("ask_planner", {"question": "will block — no one will answer"}))
+        q = _content(await cli.call_tool("ask_planner", {"question": "will block -- no one will answer"}))
         assert q.get("status") == "pending", f"expected pending, got {q}"
         qid = q["question_id"]
 

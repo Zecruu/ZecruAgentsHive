@@ -16,7 +16,7 @@ import sys
 from fastmcp import Client
 
 KEY = os.environ.get("AGENTSHIVE_API_KEY", "test-key")
-URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8001/mcp")
+URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8000/mcp")
 
 
 def _c(r):
@@ -143,10 +143,10 @@ async def test_message_drain_in_order():
             for _ in range(3):
                 r = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 3}))
                 seen.append(r["body"])
-                # ack between each wait — without this, v1.2 would return m1 every time
+                # ack between each wait -- without this, v1.2 would return m1 every time
                 await coder.call_tool("ack_message", {"message_id": r["message_id"]})
             assert seen == ["m1", "m2", "m3"], f"expected ordered drain, got {seen}"
-            # Now the queue is empty — next call should timeout
+            # Now the queue is empty -- next call should timeout
             r = _c(await coder.call_tool("wait_for_planner_message", {"timeout_seconds": 2}))
             assert r.get("status") == "pending", f"queue should be drained, got {r}"
         print("  [OK] drained 3 messages with ack between; subsequent wait timed out")
@@ -196,7 +196,7 @@ async def test_heartbeat_NOT_bumped_by_planner_calls():
         r = _c(await cli.call_tool("is_mission_done", {}))
         baseline = r["mission"]["coder_last_seen"]
 
-        # Planner-side calls — none should bump
+        # Planner-side calls -- none should bump
         await asyncio.sleep(1.05)
         await cli.call_tool("list_pending_questions", {})
         await cli.call_tool("list_pending_summaries", {})

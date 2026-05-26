@@ -1079,7 +1079,69 @@ def register_tools(mcp, settings: Settings) -> None:
             "server_version": AGENTSHIVE_VERSION,
             "tools_catalog_hash": _compute_tools_catalog_hash(names),
             "started_at": SERVER_STARTED_AT.isoformat(),
+            # v1.12: project_slug surfaced so agents can sanity-check their MCP wiring
+            # before calling create_mission. The morning 2026-05-26 incident -- two
+            # Hiveminds colliding on the same project because nobody verified scope --
+            # is what motivated this. Cheap inline addition; no extra round trip needed.
+            "project_slug": current_project(),
         }
+
+    @mcp.tool
+    def get_project_info() -> dict[str, Any]:
+        """Return metadata about the current request's project context.
+
+        v1.12: closes the project-scoping footgun that ate 3 hours of debugging on
+        2026-05-26 (a Hivemind session was MCP-wired to the wrong ?project= slug
+        and silently superseded another project's active mission).
+
+        Every Hivemind/Coder session's FIRST action should be get_project_info()
+        + verify the returned slug matches what the user asked you to drive. If it
+        mismatches: STOP, send_to_user, do not call create_mission.
+
+        Returns:
+          slug: the project this MCP connection is scoped to (from ?project= URL param)
+          name: human-readable display name
+          description: optional free-form text from project creation
+          created_at: ISO timestamp of project creation
+          archived_at: ISO timestamp if archived, else None
+          mission_count: total missions ever created on this project (any status)
+          active_mission_id: the currently-active mission's id, or None if no mission is active
+        """
+        slug = current_project()
+        with Session(get_engine()) as session:
+            proj = session.exec(select(Project).where(Project.slug == slug)).first()
+            if proj is None:
+                # Should not happen — ProjectContextMiddleware returns 400 before any
+                # tool sees an unknown slug. Defensive return for direct-invocation
+                # tests / future code paths.
+                return {
+                    "slug": slug,
+                    "name": None,
+                    "description": None,
+                    "created_at": None,
+                    "archived_at": None,
+                    "mission_count": 0,
+                    "active_mission_id": None,
+                    "error": f"project '{slug}' not found in database",
+                }
+            mission_count = len(session.exec(
+                select(Mission.id).where(Mission.project_id == proj.id)
+            ).all())
+            active = session.exec(
+                select(Mission).where(
+                    Mission.project_id == proj.id,
+                    Mission.status == "active",
+                )
+            ).first()
+            return {
+                "slug": proj.slug,
+                "name": proj.name,
+                "description": proj.description,
+                "created_at": proj.created_at.isoformat(),
+                "archived_at": proj.archived_at.isoformat() if proj.archived_at else None,
+                "mission_count": mission_count,
+                "active_mission_id": active.id if active else None,
+            }
 
     @mcp.tool
     async def refresh_tool_catalog(ctx: Context) -> dict[str, Any]:

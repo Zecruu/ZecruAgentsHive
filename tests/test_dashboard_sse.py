@@ -1,8 +1,8 @@
 """v1.6 SSE push channel tests.
 
 Covers /api/dashboard/events:
-  T1 no auth → 401
-  T2 bearer → 200 + Content-Type: text/event-stream
+  T1 no auth -> 401
+  T2 bearer -> 200 + Content-Type: text/event-stream
   T3 initial event arrives within ~1s, carries the state envelope
   T4 push event arrives within ~3s after another caller mutates state
   T5 (slow, gated by SLOW_TESTS=1) keepalive comment arrives within ~17s
@@ -24,13 +24,13 @@ import httpx
 from fastmcp import Client
 
 KEY = os.environ.get("AGENTSHIVE_API_KEY", "test-key")
-BASE = os.environ.get("AGENTSHIVE_BASE", "http://localhost:8001")
+BASE = os.environ.get("AGENTSHIVE_BASE", "http://localhost:8000")
 MCP_URL = f"{BASE}/mcp"
 BEARER = {"Authorization": f"Bearer {KEY}"}
 
 
 async def _event_iter(resp, kind: str = "state"):
-    """Persistent async generator over the SSE stream — yields parsed `event: <kind>`
+    """Persistent async generator over the SSE stream -- yields parsed `event: <kind>`
     payloads. Keep a single iterator across multiple reads in a test (httpx's
     aiter_bytes() raises StreamConsumed if iterated more than once on the same response).
     """
@@ -53,14 +53,14 @@ async def _next_event(ait, timeout: float = 5.0) -> dict:
 
 
 def test_no_auth_returns_401():
-    print("--- T1: GET /api/dashboard/events no auth → 401 ---")
+    print("--- T1: GET /api/dashboard/events no auth -> 401 ---")
     r = httpx.get(f"{BASE}/api/dashboard/events", timeout=5)
     assert r.status_code == 401, f"expected 401, got {r.status_code}"
     print("  [OK]")
 
 
 async def test_bearer_returns_event_stream():
-    print("--- T2: bearer → 200 + Content-Type: text/event-stream ---")
+    print("--- T2: bearer -> 200 + Content-Type: text/event-stream ---")
     async with httpx.AsyncClient(timeout=5) as cli:
         async with cli.stream("GET", f"{BASE}/api/dashboard/events", headers=BEARER) as resp:
             assert resp.status_code == 200, f"got {resp.status_code}"
@@ -104,14 +104,14 @@ async def test_push_on_write():
 
 async def test_keepalive_in_idle_window():
     if not os.environ.get("SLOW_TESTS"):
-        print("--- T5: keepalive comment in idle window — SKIPPED (set SLOW_TESTS=1 to run) ---")
+        print("--- T5: keepalive comment in idle window -- SKIPPED (set SLOW_TESTS=1 to run) ---")
         return
     print("--- T5: keepalive (`: keepalive`) comment arrives within ~17s of idle ---")
     async with httpx.AsyncClient(timeout=25) as cli:
         async with cli.stream("GET", f"{BASE}/api/dashboard/events", headers=BEARER) as resp:
             # Drain the initial event
             await _read_one_event(resp, "state", timeout=2.0)
-            # Now wait for any traffic — looking for a `: keepalive` line specifically.
+            # Now wait for any traffic -- looking for a `: keepalive` line specifically.
             buf = b""
             deadline = asyncio.get_event_loop().time() + 18
             seen_keepalive = False

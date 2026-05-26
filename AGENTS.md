@@ -1,6 +1,16 @@
+<!-- AGENTSHIVE_PROJECT_SLUG: agentshive -->
 # AgentsHive coordination — `agentshive`
 
 This is the AgentsHive repo itself. We dogfood the protocol: when multiple agents work on AgentsHive in parallel, they coordinate via AgentsHive's own MCP bridge.
+
+## Step 0 — Verify project scope (v1.12+, do this FIRST)
+
+Before ANY mutating tool call, every agent (Hivemind or Coder) must call `get_project_info()` and confirm the returned `slug` matches the value in the sentinel comment at the top of this file (`<!-- AGENTSHIVE_PROJECT_SLUG: agentshive -->`).
+
+If they match — proceed.
+If they mismatch — STOP. Call `send_to_user` describing the actual vs expected slug. Do NOT call `create_mission`, `answer_question`, `mark_mission_done`, `submit_progress`, or any other mutator. The MCP wiring is wrong and a mutating call would silently corrupt another project's state.
+
+**Why this exists:** on 2026-05-26 a Hivemind Claude Code session was MCP-wired to `?project=poker-online` by accident (an earlier `claude mcp add` in this dir used the wrong slug). The Hivemind called `create_mission` for v1.11, which landed on `poker-online` and superseded that project's active "Velthara Dominion 2D" game-build mission. Two Hiveminds collided, the Coder got crossed signals, ~3 hours of restart/reconnect work. The root cause was no protocol-level "what project am I on" check. v1.12 added `get_project_info()` and this Step 0 specifically to prevent recurrence. **Never skip Step 0.**
 
 ## Roles
 
