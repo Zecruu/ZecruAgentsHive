@@ -106,6 +106,15 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
                   border-top: 1px solid #232732; padding-top: 10px; }
 #inbox-composer textarea { min-height: 38px; max-height: 140px; }
 #inbox-composer button { align-self: flex-end; }
+/* v1.11 per-Coder identity pill. Background hue is deterministic per coder_id
+   (computed in coderHue) so the same Coder reads as the same color across
+   reloads and across panels. Saturation/lightness fixed at 65%/30% — sits
+   distinctly against the panel background without clashing with the badge row. */
+.coder-pill { display: inline-block; padding: 1px 7px; border-radius: 8px;
+              font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+              color: #e6e9f0; white-space: nowrap; }
+.coder-pill.target { opacity: 0.85; font-style: italic; }
+.coder-pill.broadcast { background: #2a3540; color: #9aa6bc; font-weight: 500; }
 </style>
 </head>
 <body>
@@ -268,15 +277,42 @@ function actionButtons(buttons) {
   return `<div class="actions">${buttons.join("")}</div>`;
 }
 
+// v1.11 per-Coder identity. Hash → 0-359 hue so a given coder_id always paints
+// the same color across panels/reloads. Cheap djb2-ish over UTF-16 code units;
+// collisions are visually acceptable below ~40 distinct ids per project.
+function coderHue(id) {
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) {
+    h = ((h << 5) + h + id.charCodeAt(i)) >>> 0;
+  }
+  return h % 360;
+}
+function coderPill(id) {
+  if (!id) return "";
+  const hue = coderHue(id);
+  return `<span class="coder-pill" style="background:hsl(${hue}, 65%, 30%);" title="Coder ${escapeHtml(id)}">Coder: ${escapeHtml(id)}</span>`;
+}
+function targetPill(target) {
+  // Only rendered on planner_to_coder messages where direction matters. Broadcast
+  // gets a neutral pill so the Hivemind can tell at a glance who they addressed.
+  if (target === null || target === undefined) {
+    return `<span class="coder-pill broadcast">→ broadcast</span>`;
+  }
+  const hue = coderHue(target);
+  return `<span class="coder-pill target" style="background:hsl(${hue}, 65%, 30%);" title="targeted at Coder ${escapeHtml(target)}">→ ${escapeHtml(target)}</span>`;
+}
+
 function renderQuestions(qs) {
   if (!qs.length) return `<div class="empty">No pending questions.</div>`;
   return qs.map(q => {
     const id = q.question_id;
     const formSlot = `<div id="form-answer-${id}"></div>`;
-    return renderItem(q.body, [
+    const metas = [
       `<span>${ago(q.created_at)}</span>`,
       `<small class="dim">id ${id.slice(0,8)}</small>`,
-    ], actionButtons([
+    ];
+    if (q.coder_id) metas.push(coderPill(q.coder_id));
+    return renderItem(q.body, metas, actionButtons([
       `<button onclick="openAnswerForm('${id}')">Answer</button>`
     ]) + formSlot);
   }).join("");
@@ -287,10 +323,12 @@ function renderSummaries(ss) {
   return ss.map(s => {
     const id = s.summary_id;
     const formSlot = `<div id="form-respond-${id}"></div>`;
-    return renderItem(s.body, [
+    const metas = [
       `<span>${ago(s.created_at)}</span>`,
       `<small class="dim">id ${id.slice(0,8)}</small>`,
-    ], actionButtons([
+    ];
+    if (s.coder_id) metas.push(coderPill(s.coder_id));
+    return renderItem(s.body, metas, actionButtons([
       `<button onclick="openRespondForm('${id}')">Respond</button>`,
       `<button class="ship" onclick="doShipIt('${id}')">Ship it ✓</button>`,
     ]) + formSlot);
@@ -310,10 +348,15 @@ function renderMessages(ms) {
     const ackBtn = m.delivered_at
       ? ""
       : `<button onclick="doAck('${id}', this)">Ack</button>`;
-    return renderItem(m.body, [
+    const metas = [
       `<span>${ago(m.created_at)}</span>`,
       ackBadge, redeliv, ackBtn,
-    ]);
+    ];
+    // v1.11: coder_id on coder→planner messages identifies the sender; the
+    // target pill on planner→coder messages shows who the Hivemind addressed.
+    if (m.coder_id) metas.push(coderPill(m.coder_id));
+    if (m.direction === "planner_to_coder") metas.push(targetPill(m.target_coder_id));
+    return renderItem(m.body, metas);
   }).join("");
 }
 
