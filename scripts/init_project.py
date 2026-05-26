@@ -138,6 +138,25 @@ def _write_agents_md(target: Path, slug: str, server: str, force: bool) -> str:
     return f"wrote {target}"
 
 
+def _ensure_gitignored(gitignore_path: Path, entry: str) -> str:
+    """Append `entry` to .gitignore if not already present. Creates the file
+    if missing. We do this because .zed/settings.json contains a plaintext
+    bearer token -- accidentally committing it to a public repo would leak
+    the AgentsHive API key.
+    """
+    if gitignore_path.exists():
+        existing = gitignore_path.read_text(encoding="utf-8")
+        # Treat any line that already matches (post-strip) as already gitignored.
+        for line in existing.splitlines():
+            if line.strip() == entry:
+                return f"skip ({entry} already in {gitignore_path})"
+        sep = "" if existing.endswith("\n") else "\n"
+        gitignore_path.write_text(existing + sep + entry + "\n", encoding="utf-8")
+        return f"appended '{entry}' to {gitignore_path}"
+    gitignore_path.write_text(entry + "\n", encoding="utf-8")
+    return f"wrote {gitignore_path} with '{entry}'"
+
+
 def _write_zed_settings(target: Path, slug: str, server: str, api_key: str) -> str:
     """Merge AgentsHive MCP config into .zed/settings.json (creates if missing).
 
@@ -208,6 +227,9 @@ def main() -> int:
     print(_write_agents_md(cwd / "AGENTS.md", slug, server, args.force))
     if not args.no_zed:
         print(_write_zed_settings(cwd / ".zed" / "settings.json", slug, server, api_key))
+        # The Zed settings file embeds a plaintext bearer token. Auto-gitignore
+        # to keep it out of any repo this dir becomes.
+        print(_ensure_gitignored(cwd / ".gitignore", ".zed/settings.json"))
     print()
     print("=== Done. Next steps ===")
     print(f"1. Open this directory in Zed (or Claude Code, or Codex CLI).")
