@@ -14,7 +14,7 @@ from fastmcp import Client
 from sqlalchemy import create_engine, inspect, text
 
 KEY = os.environ.get("AGENTSHIVE_API_KEY", "test-key")
-URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8001/mcp")
+URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8000/mcp")
 DB_PATH = os.environ.get("AGENTSHIVE_DB", "sqlite:///./agentshive.db")
 
 

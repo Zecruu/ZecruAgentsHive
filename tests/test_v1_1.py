@@ -16,7 +16,7 @@ import sys
 from fastmcp import Client
 
 KEY = os.environ.get("AGENTSHIVE_API_KEY", "test-key")
-URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8001/mcp")
+URL = os.environ.get("AGENTSHIVE_URL", "http://localhost:8000/mcp")
 
 
 def _c(r):

@@ -15,7 +15,7 @@ import httpx
 from fastmcp import Client
 
 KEY = os.environ.get("AGENTSHIVE_API_KEY", "test-key")
-BASE = os.environ.get("AGENTSHIVE_BASE", "http://localhost:8001")
+BASE = os.environ.get("AGENTSHIVE_BASE", "http://localhost:8000")
 MCP_URL = f"{BASE}/mcp"
 
 
