@@ -15,3 +15,6 @@ build/
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
+
+# Zed MCP config holds plaintext bearer tokens — must not be committed
+.zed/settings.json
