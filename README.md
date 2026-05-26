@@ -179,6 +179,27 @@ The last row is the safety property: a legacy single-Coder setup that never decl
 
 **Dashboard pills.** Each question, summary, and message renders a small `Coder: <id>` pill in a deterministic color (so the same Coder always reads as the same color across sessions). Targeted Planner→Coder messages also show a `→ <target>` pill; broadcasts show `→ broadcast`.
 
+### Connected Coders panel + crash resume (v1.13+)
+
+The dashboard now has a **Connected Coders** card directly under the active mission summary. For every `coder_id` active on the current mission within the last 5 minutes, it shows:
+
+- the v1.11 color-stable pill (same hue as the Coder's Q/S/M rows)
+- relative-time of last activity
+- a `q N · s N · m N` row of question / summary / message counts on this mission
+
+A Coder counts as "active" by either source: an explicit heartbeat write (any Coder-side tool call that passed `coder_id` bumps a `CoderHeartbeat(project_id, coder_id)` row, throttled to ≤6 writes/min) **or** the `MAX(created_at)` across their questions/summaries/messages on the mission. Heartbeat-only Coders surface even before they've produced any protocol output — useful for the "I'm in Step 1 research, haven't asked yet" case. Legacy Coders (no `coder_id`) aggregate into a single `<unidentified>` row.
+
+**Crash resume.** `wait_for_planner_message(since=…)` takes either an ISO 8601 timestamp or a message_id (32-char hex). Only messages created strictly after that point are eligible. Malformed / future / unknown values silently fall back to "no filter" so the Coder never has to special-case errors:
+
+```python
+# Pick up where you left off after a process restart
+wait_for_planner_message(coder_id="coder-server", since=last_seen_msg_id)
+# Or by wall-clock: only messages from after a known checkpoint
+wait_for_planner_message(coder_id="coder-server", since="2026-05-26T13:00:00+00:00")
+```
+
+The at-least-once delivery, ack contract, and `coder_id` routing matrix all still apply on top of `since` — it's a pure filter, not a replacement.
+
 ## Dashboard (v1.4+)
 
 A read-only web view of the unified Planner / Coder state, served by the same Starlette app at:
