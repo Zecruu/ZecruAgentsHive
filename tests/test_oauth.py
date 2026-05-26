@@ -130,11 +130,11 @@ def test_consent_get_unknown_client_rejected():
         "redirect_uri_provided_explicitly": "1",
     }, timeout=5)
     assert r.status_code == 400, r.status_code
-    print("  [OK] unknown client → 400")
+    print("  [OK] unknown client -> 400")
 
 
 def test_consent_deny_redirects_with_error():
-    print("--- T7: POST /oauth/consent deny → 302 with error=access_denied ---")
+    print("--- T7: POST /oauth/consent deny -> 302 with error=access_denied ---")
     with httpx.Client(timeout=5) as c:
         cid = _register_client(c)
         r = c.post(f"{BASE}/oauth/consent", data={
@@ -240,7 +240,7 @@ def test_revoke_invalidates_access_token():
             "token": tok["access_token"], "client_id": cid, "client_secret": "",
         })
         assert rev.status_code == 200, rev.status_code
-        # Probe again — must be 401 now
+        # Probe again -- must be 401 now
         probe2 = c.post(f"{BASE}/mcp", headers={
             "Authorization": f"Bearer {tok['access_token']}",
             "Content-Type": "application/json",
@@ -254,7 +254,7 @@ def test_revoke_invalidates_access_token():
 
 
 def test_legacy_bearer_key_still_works():
-    print("--- T12: Q2 — legacy AGENTSHIVE_API_KEY bearer still authenticates /mcp ---")
+    print("--- T12: Q2 -- legacy AGENTSHIVE_API_KEY bearer still authenticates /mcp ---")
     r = httpx.post(f"{BASE}/mcp", headers={
         "Authorization": f"Bearer {KEY}",
         "Content-Type": "application/json",
@@ -278,7 +278,7 @@ def test_wrong_bearer_key_rejected():
         "clientInfo": {"name": "probe", "version": "1"},
     }}, timeout=5)
     assert r.status_code == 401, r.status_code
-    print("  [OK] unknown bearer → 401")
+    print("  [OK] unknown bearer -> 401")
 
 
 def main():

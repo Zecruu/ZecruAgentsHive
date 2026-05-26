@@ -36,7 +36,7 @@ def _c(r):
 
 
 async def _setup_mission_with_pending_work():
-    """Create a mission and seed it with one question, one summary, one P→C message.
+    """Create a mission and seed it with one question, one summary, one P->C message.
 
     Returns dict with the IDs the dashboard tests need.
     """
@@ -61,7 +61,7 @@ async def _setup_mission_with_pending_work():
     asyncio.create_task(coder_ask())
     asyncio.create_task(coder_submit())
 
-    # Poll until both inserts have landed — async background clients have to
+    # Poll until both inserts have landed -- async background clients have to
     # negotiate MCP sessions before they can send the inner call, and 1s isn't
     # always enough on a cold loop. Cap at ~6s.
     body = None
@@ -77,7 +77,7 @@ async def _setup_mission_with_pending_work():
     return seeds
 
 
-# ---------- Common pattern: bad auth → 401, CSRF mismatch → 403 ----------
+# ---------- Common pattern: bad auth -> 401, CSRF mismatch -> 403 ----------
 
 def test_all_writes_reject_no_auth():
     print("--- T1: every POST endpoint returns 401 with no auth ---")
@@ -100,17 +100,17 @@ def test_csrf_mismatched_origin_403():
     r = httpx.post(f"{BASE}/api/dashboard/send", json={"body": "hi"}, headers=headers)
     assert r.status_code == 403, f"expected 403, got {r.status_code}"
     assert "cross-origin" in r.text.lower()
-    print(f"  [OK] mismatched Origin → 403")
+    print(f"  [OK] mismatched Origin -> 403")
 
 
 def test_csrf_matching_origin_allowed():
     print("--- T3: CSRF allows matching Origin ---")
     headers = dict(BEARER, Origin=BASE)
     r = httpx.post(f"{BASE}/api/dashboard/send", json={"body": "csrf ok"}, headers=headers)
-    # Either 200 ok:true (active mission) or 200 ok:false ("no active mission") —
+    # Either 200 ok:true (active mission) or 200 ok:false ("no active mission") --
     # both prove CSRF accepted the request; we don't care which body shape.
     assert r.status_code == 200, f"expected 200, got {r.status_code}"
-    print(f"  [OK] matching Origin → 200")
+    print(f"  [OK] matching Origin -> 200")
 
 
 def test_csrf_no_origin_no_referer_allowed():
@@ -118,13 +118,13 @@ def test_csrf_no_origin_no_referer_allowed():
     # httpx by default doesn't add Origin to POSTs; this mimics curl/cli with bearer.
     r = httpx.post(f"{BASE}/api/dashboard/send", json={"body": "no headers"}, headers=BEARER)
     assert r.status_code == 200, f"expected 200, got {r.status_code}"
-    print(f"  [OK] no Origin / no Referer → 200 (non-browser caller)")
+    print(f"  [OK] no Origin / no Referer -> 200 (non-browser caller)")
 
 
 # ---------- /api/dashboard/answer ----------
 
 async def test_answer_happy_path():
-    print("--- T5: /answer valid request → 200 ok=true ---")
+    print("--- T5: /answer valid request -> 200 ok=true ---")
     seeds = await _setup_mission_with_pending_work()
     r = httpx.post(f"{BASE}/api/dashboard/answer",
                    json={"question_id": seeds["question_id"], "answer": "use X"},
@@ -137,21 +137,21 @@ async def test_answer_happy_path():
 
 
 def test_answer_malformed_body_400():
-    print("--- T6: /answer malformed JSON → 400 ---")
+    print("--- T6: /answer malformed JSON -> 400 ---")
     r = httpx.post(f"{BASE}/api/dashboard/answer", content="not json", headers=BEARER)
     assert r.status_code == 400, f"got {r.status_code}: {r.text[:80]}"
     print(f"  [OK]")
 
 
 def test_answer_missing_field_400():
-    print("--- T7: /answer missing question_id → 400 ---")
+    print("--- T7: /answer missing question_id -> 400 ---")
     r = httpx.post(f"{BASE}/api/dashboard/answer", json={"answer": "x"}, headers=BEARER)
     assert r.status_code == 400, f"got {r.status_code}: {r.text[:80]}"
     print(f"  [OK]")
 
 
 def test_answer_length_cap_400():
-    print("--- T8: /answer oversized answer → 400 ---")
+    print("--- T8: /answer oversized answer -> 400 ---")
     r = httpx.post(f"{BASE}/api/dashboard/answer",
                    json={"question_id": "fake", "answer": "x" * (16 * 1024 + 1)},
                    headers=BEARER)
@@ -161,7 +161,7 @@ def test_answer_length_cap_400():
 
 
 async def test_answer_competing_actor_already_answered():
-    print("--- T9: /answer on already-answered question → 200 ok=false (not 500) ---")
+    print("--- T9: /answer on already-answered question -> 200 ok=false (not 500) ---")
     seeds = await _setup_mission_with_pending_work()
     # First answer succeeds
     r1 = httpx.post(f"{BASE}/api/dashboard/answer",
@@ -182,7 +182,7 @@ async def test_answer_competing_actor_already_answered():
 # ---------- /api/dashboard/respond + /ack + /send + /mark-done (lighter coverage) ----------
 
 async def test_respond_happy_path():
-    print("--- T10: /respond valid → 200 ok=true ---")
+    print("--- T10: /respond valid -> 200 ok=true ---")
     seeds = await _setup_mission_with_pending_work()
     r = httpx.post(f"{BASE}/api/dashboard/respond",
                    json={"summary_id": seeds["summary_id"], "response": "keep going"},
@@ -193,7 +193,7 @@ async def test_respond_happy_path():
 
 
 async def test_ack_happy_path():
-    print("--- T11: /ack valid → 200 ok=true, message stamped ---")
+    print("--- T11: /ack valid -> 200 ok=true, message stamped ---")
     seeds = await _setup_mission_with_pending_work()
     r = httpx.post(f"{BASE}/api/dashboard/ack",
                    json={"message_id": seeds["message_id"]},
@@ -214,7 +214,7 @@ def test_send_happy_path_requires_mission():
 
 
 async def test_mark_done_happy_path():
-    print("--- T13: /mark-done with active mission → 200 ok=true, mission status=done ---")
+    print("--- T13: /mark-done with active mission -> 200 ok=true, mission status=done ---")
     await _setup_mission_with_pending_work()  # ensures active mission
     r = httpx.post(f"{BASE}/api/dashboard/mark-done", headers=BEARER)
     assert r.status_code == 200, f"got {r.status_code}"
@@ -225,7 +225,7 @@ async def test_mark_done_happy_path():
 
 
 def test_mark_done_no_mission_ok_false():
-    print("--- T14: /mark-done with no active mission → 200 ok=false ---")
+    print("--- T14: /mark-done with no active mission -> 200 ok=false ---")
     # Earlier integration tests (T15, T16) may have created new active missions
     # since T13. Drain by calling /mark-done in a small loop until we get the
     # no-active-mission response. Cap at 5 iterations so a real bug doesn't loop.
@@ -243,7 +243,7 @@ def test_mark_done_no_mission_ok_false():
 # ---------- Integrations ----------
 
 async def test_integration_coder_unblocks_via_dashboard_answer():
-    print("--- T15: integration — Coder blocked on ask_planner unblocks via /answer ---")
+    print("--- T15: integration -- Coder blocked on ask_planner unblocks via /answer ---")
     async with Client(MCP_URL, auth=KEY) as cli:
         await cli.call_tool("create_mission", {"name": "int-unblock", "spec": "int"})
 
@@ -274,7 +274,7 @@ async def test_integration_coder_unblocks_via_dashboard_answer():
 
 
 async def test_integration_ack_hides_from_wait():
-    print("--- T16: integration — /ack hides message from subsequent wait_for_*_message ---")
+    print("--- T16: integration -- /ack hides message from subsequent wait_for_*_message ---")
     async with Client(MCP_URL, auth=KEY) as cli:
         await cli.call_tool("create_mission", {"name": "int-ack", "spec": "int"})
         await cli.call_tool("send_to_coder", {"body": "ack-test message"})

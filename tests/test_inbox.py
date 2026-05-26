@@ -2,7 +2,7 @@
 
 Covers the back-channel between the dashboard user and the Planner:
   - POST /api/dashboard/send-to-planner (auth, CSRF, no-active-mission OK)
-  - GET  /api/dashboard/state — new `inbox` field present and shaped right
+  - GET  /api/dashboard/state -- new `inbox` field present and shaped right
   - MCP tools wait_for_user_message + ack_message + send_to_user + list_inbox_history
   - At-least-once redelivery: re-waiting before ack returns the same row
   - Integration: dashboard POSTs message, Planner wait_for_user_message returns
@@ -48,21 +48,21 @@ def _unwrap(r) -> dict | list:
 
 
 def test_send_to_planner_requires_auth():
-    print("--- T1: POST /api/dashboard/send-to-planner with no auth → 401 ---")
+    print("--- T1: POST /api/dashboard/send-to-planner with no auth -> 401 ---")
     r = httpx.post(f"{BASE}/api/dashboard/send-to-planner", json={"body": "x"}, timeout=5)
     assert r.status_code == 401, r.status_code
     print("  [OK]")
 
 
 def test_send_to_planner_rejects_cross_origin():
-    print("--- T2: POST send-to-planner with foreign Origin → 403 ---")
+    print("--- T2: POST send-to-planner with foreign Origin -> 403 ---")
     r = _post_send_to_planner("x", headers={**BEARER, "Origin": "http://evil.example"})
     assert r.status_code == 403, r.status_code
     print("  [OK]")
 
 
 def test_send_to_planner_succeeds_without_active_mission():
-    print("--- T3: POST send-to-planner with NO active mission → 200, mission_id=None ---")
+    print("--- T3: POST send-to-planner with NO active mission -> 200, mission_id=None ---")
     # Note: previous tests may have left an active mission. We rely on the global
     # nature of the inbox: it works regardless. We just assert it returns 200 and
     # the stored message is a user_to_planner row.
@@ -94,14 +94,14 @@ def test_state_payload_carries_inbox_key():
 
 
 def test_send_to_planner_validates_empty_body():
-    print("--- T5: empty body → 400 validation error ---")
+    print("--- T5: empty body -> 400 validation error ---")
     r = _post_send_to_planner("   ")
     assert r.status_code == 400, r.status_code
     print("  [OK]")
 
 
 async def test_integration_user_post_planner_wait_then_reply():
-    print("--- T6: integration — dashboard POSTs, wait_for_user_message returns it, ack, reply via send_to_user ---")
+    print("--- T6: integration -- dashboard POSTs, wait_for_user_message returns it, ack, reply via send_to_user ---")
     # Drain any stale unacked user_to_planner first (other tests left rows)
     async with Client(MCP_URL, auth=KEY) as planner:
         for _ in range(20):
@@ -111,7 +111,7 @@ async def test_integration_user_post_planner_wait_then_reply():
                 break
             await planner.call_tool("ack_message", {"message_id": data["message_id"]})
         else:
-            raise AssertionError("could not drain inbox in 20 iters — server saturated?")
+            raise AssertionError("could not drain inbox in 20 iters -- server saturated?")
 
         # Schedule the dashboard POST after a small delay so the wait actually blocks.
         UNIQUE = "v1.8-integration-marker-please-reply"
@@ -152,7 +152,7 @@ async def test_integration_user_post_planner_wait_then_reply():
     inbox = r.json().get("inbox", [])
     assert any(m["body"] == REPLY and m["direction"] == "planner_to_user" for m in inbox), \
         f"reply not in inbox: {[m.get('body') for m in inbox]}"
-    print(f"  [OK] full round-trip user→planner→user works")
+    print(f"  [OK] full round-trip user->planner->user works")
 
 
 async def test_list_inbox_history_returns_recent_messages():
@@ -173,12 +173,12 @@ async def test_list_inbox_history_returns_recent_messages():
 async def test_send_to_user_works_without_active_mission():
     print("--- T8: send_to_user works with NO active mission (global inbox) ---")
     async with Client(MCP_URL, auth=KEY) as planner:
-        # Don't bother creating/clearing a mission — the tool must work either way.
+        # Don't bother creating/clearing a mission -- the tool must work either way.
         r = await planner.call_tool("send_to_user", {"body": "v1.8-T8-no-mission-test"})
         msg = _unwrap(r)
         assert isinstance(msg, dict), msg
         assert msg["direction"] == "planner_to_user", msg
-        # Either mission_id is set (one was active) or None — both acceptable for this assertion
+        # Either mission_id is set (one was active) or None -- both acceptable for this assertion
         assert "mission_id" in msg
         print(f"  [OK] mid={msg['message_id'][:10]} mission_id={msg.get('mission_id')}")
 

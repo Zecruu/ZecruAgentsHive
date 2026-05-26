@@ -1,11 +1,11 @@
-"""v1.12 — get_project_info() MCP tool + project_slug in get_server_info.
+"""v1.12 -- get_project_info() MCP tool + project_slug in get_server_info.
 
 Covers:
-  T1 — get_project_info on a fresh project returns slug + name + zero counts
-  T2 — get_project_info on the default project returns slug="default"
-  T3 — get_project_info reports mission_count + active_mission_id correctly
-  T4 — get_server_info now includes project_slug field
-  T5 — get_project_info on a different project's URL returns that project's data (scope check)
+  T1 -- get_project_info on a fresh project returns slug + name + zero counts
+  T2 -- get_project_info on the default project returns slug="default"
+  T3 -- get_project_info reports mission_count + active_mission_id correctly
+  T4 -- get_server_info now includes project_slug field
+  T5 -- get_project_info on a different project's URL returns that project's data (scope check)
 
 Run against a fresh local server:
     AGENTSHIVE_API_KEY=test-key PORT=8000 AGENTSHIVE_BASE_URL=http://localhost:8000 \
