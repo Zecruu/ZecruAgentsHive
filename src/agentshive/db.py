@@ -120,6 +120,27 @@ class Message(SQLModel, table=True):
     target_coder_id: Optional[str] = Field(default=None)
 
 
+# v1.13: per-Coder heartbeat for multi-Coder workflows. Lets the Connected
+# Coders dashboard panel show a Coder as "alive" even when they haven't yet
+# inserted a Question/Summary/Message — important for the realistic case where
+# a Coder is mid-Step-1-research with no protocol output yet but is otherwise
+# healthy. Updated by _touch_coder when the caller passes coder_id, throttled
+# to at most one write per HEARTBEAT_MIN_INTERVAL_SECONDS per (project_id,
+# coder_id) pair so a chatty Coder doesn't generate ~N writes/sec.
+#
+# Composite PK (project_id, coder_id) — a coder_id is unique within a project
+# but two projects can each have a "coder-server" without colliding.
+#
+# TODO (v1.14+): no GC yet. Rows accumulate forever (~100B each — even at 1000
+# distinct coders that's 100KB). A future cleanup pass would be UX-driven
+# ("clear the panel"), not perf-driven. Add age-based delete when the panel
+# UX starts feeling cluttered.
+class CoderHeartbeat(SQLModel, table=True):
+    project_id: str = Field(foreign_key="project.id", primary_key=True)
+    coder_id: str = Field(primary_key=True)
+    last_seen: datetime = Field(default_factory=_utcnow)
+
+
 # --- v1.7 OAuth 2.1 storage ---------------------------------------------
 #
 # Four tables back the AgentsHiveOAuthProvider. Access tokens and refresh
@@ -424,6 +445,33 @@ def _apply_inline_migrations(engine: Engine) -> None:
                     f"CREATE INDEX IF NOT EXISTS {index_name} "
                     f"ON {table_name}(mission_id, coder_id)"
                 ))
+
+    # v1.13: CoderHeartbeat table + supporting index.
+    #
+    # SQLModel.metadata.create_all already creates the table when the engine is
+    # fresh — this block is belt-and-suspenders for already-running v1.11/v1.12
+    # databases that pre-date the CoderHeartbeat declaration. CREATE TABLE IF
+    # NOT EXISTS is safe on both SQLite and Postgres.
+    #
+    # The (project_id, last_seen) index serves the Connected Coders panel
+    # query: "WHERE project_id = ? AND last_seen > now - ttl". Cheap; one row
+    # per coder_id per project so the index stays tiny.
+    v113_inspector = inspect(engine)
+    if "coderheartbeat" not in v113_inspector.get_table_names():
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS coderheartbeat ("
+                "project_id TEXT NOT NULL REFERENCES project(id), "
+                "coder_id TEXT NOT NULL, "
+                "last_seen TIMESTAMP NOT NULL, "
+                "PRIMARY KEY (project_id, coder_id)"
+                ")"
+            ))
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_coderheartbeat_project_lastseen "
+            "ON coderheartbeat(project_id, last_seen)"
+        ))
 
 
 def get_engine() -> Engine:
