@@ -17,8 +17,8 @@ import hmac
 import importlib.resources
 import json
 import time
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlmodel import Session, desc, select
@@ -29,7 +29,7 @@ from starlette.routing import Route
 from . import dashboard_events
 
 from .config import Settings
-from .db import Message, Mission, Project, Question, Summary, get_engine
+from .db import CoderHeartbeat, Message, Mission, Project, Question, Summary, get_engine
 from .project import current_project, validate_slug
 from .tools import (
     AGENTSHIVE_VERSION,
@@ -54,6 +54,17 @@ from .tools import (
 COOKIE_NAME = "agentshive_dash_session"
 COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60  # 12 hours
 SPEC_PREVIEW_CHARS = 300
+
+# v1.13: Connected Coders panel TTL. A Coder is shown in the panel if their
+# last_seen (CoderHeartbeat OR latest Q/S/M created_at on the active mission)
+# is within this many seconds of now. 5 minutes balances "still working" vs
+# "process crashed and left a stale entry". The same constant drives the
+# JS-side staleness CSS (rows >= ttl/2 get a 'stale' class for a visual nudge).
+CONNECTED_CODER_TTL_SECONDS = 300
+# Sentinel coder_id for legacy callers (no coder_id passed) that still
+# produce Q/S/M rows. Surfaces on the panel so the user knows SOMEONE is
+# active even when attribution is missing.
+UNIDENTIFIED_CODER_LABEL = "<unidentified>"
 
 
 def _serializer(settings: Settings) -> URLSafeTimedSerializer:
@@ -291,6 +302,14 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
         # current request's project (passed in to avoid re-resolving the slug).
         inbox = _recent_inbox_messages(session, project_id=project_id)
 
+        # v1.13: Connected Coders panel. Empty list when no active mission
+        # (per Planner — empty list, not None, so the frontend "no rows to
+        # render" path handles both states uniformly).
+        if active is not None:
+            connected = _compute_connected_coders(session, active, now)
+        else:
+            connected = []
+
         return {
             "active_mission": active_dict,
             "recent_missions": recent,
@@ -300,7 +319,124 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
             "inbox": inbox,
             "server_info": server_info,
             "coder_heartbeat": heartbeat,
+            "connected_coders": connected,
+            "connected_coder_ttl_seconds": CONNECTED_CODER_TTL_SECONDS,
         }
+
+
+def _compute_connected_coders(
+    session: Session, active_mission: Mission, now: datetime,
+) -> list[dict[str, Any]]:
+    """v1.13: who is alive on this mission RIGHT NOW.
+
+    UNION two sources to surface both passive Coders (heartbeating but no
+    protocol output yet) and legacy Coders (Q/S/M rows but no heartbeat):
+
+      Source A — CoderHeartbeat rows for the active mission's project where
+        last_seen > now - CONNECTED_CODER_TTL_SECONDS.
+      Source B — derived MAX(created_at) per coder_id across Question,
+        Summary, Message for the active mission. coder_id=NULL rows
+        aggregate into UNIDENTIFIED_CODER_LABEL so the user sees that
+        SOMEONE is producing output even when attribution is missing.
+
+    Final per-coder_id row: max(last_seen across sources), plus integer
+    counts of how many questions / summaries / messages this Coder has
+    produced ON THIS MISSION (mission-scoped, not project-scoped — the
+    panel is "who is doing this mission" not "who has ever touched this
+    project"). Sorted by last_seen DESC so the freshest activity surfaces
+    at the top.
+    """
+    ttl = CONNECTED_CODER_TTL_SECONDS
+    cutoff = now - timedelta(seconds=ttl)
+    project_id = active_mission.project_id
+
+    # Source A: heartbeats. Returns (coder_id, last_seen). All heartbeats
+    # were written with timezone-aware datetimes but SQLite reads them
+    # back naive — coerce on read so the comparisons stay sane.
+    hb_rows = session.exec(
+        select(CoderHeartbeat).where(
+            CoderHeartbeat.project_id == project_id,
+            CoderHeartbeat.last_seen > cutoff.replace(tzinfo=None) if engine_dialect_is_sqlite()
+            else CoderHeartbeat.last_seen > cutoff,
+        )
+    ).all()
+
+    by_coder: dict[str, dict[str, Any]] = {}
+    for hb in hb_rows:
+        last = _to_aware(hb.last_seen)
+        by_coder[hb.coder_id] = {
+            "coder_id": hb.coder_id,
+            "last_seen": last,
+            "q_count": 0,
+            "s_count": 0,
+            "m_count": 0,
+        }
+
+    # Source B: derived activity on the active mission. The brief allows
+    # iterating once and bucketing per coder_id in Python — keeps the
+    # query simple and the result tiny (handful of rows per mission).
+    def _bucket(coder_id_value: Optional[str], created_at: datetime, kind: str) -> None:
+        key = coder_id_value or UNIDENTIFIED_CODER_LABEL
+        slot = by_coder.get(key)
+        ts = _to_aware(created_at)
+        if slot is None:
+            slot = {
+                "coder_id": key,
+                "last_seen": ts,
+                "q_count": 0,
+                "s_count": 0,
+                "m_count": 0,
+            }
+            by_coder[key] = slot
+        if ts > slot["last_seen"]:
+            slot["last_seen"] = ts
+        slot[kind] += 1
+
+    for q in session.exec(select(Question).where(Question.mission_id == active_mission.id)).all():
+        _bucket(q.coder_id, q.created_at, "q_count")
+    for s in session.exec(select(Summary).where(Summary.mission_id == active_mission.id)).all():
+        _bucket(s.coder_id, s.created_at, "s_count")
+    for m in session.exec(select(Message).where(
+        Message.mission_id == active_mission.id,
+        Message.direction == "coder_to_planner",
+    )).all():
+        _bucket(m.coder_id, m.created_at, "m_count")
+
+    # Filter to last 5 min after the union — derived rows may be older
+    # than the TTL (a Coder who asked a question 10 minutes ago and went
+    # silent shouldn't count as "connected").
+    filtered = [
+        row for row in by_coder.values()
+        if row["last_seen"] > cutoff
+    ]
+    # Sort by last_seen DESC and emit ISO + freshness like the existing
+    # `coder_heartbeat` field for shape consistency.
+    filtered.sort(key=lambda r: r["last_seen"], reverse=True)
+    return [
+        {
+            "coder_id": r["coder_id"],
+            "last_seen": r["last_seen"].isoformat(),
+            "freshness_seconds": max(0, int((now - r["last_seen"]).total_seconds())),
+            "q_count": r["q_count"],
+            "s_count": r["s_count"],
+            "m_count": r["m_count"],
+        }
+        for r in filtered
+    ]
+
+
+def _to_aware(d: datetime) -> datetime:
+    """Coerce a naive datetime (SQLite read) to aware UTC. No-op on aware datetimes."""
+    return d if d.tzinfo is not None else d.replace(tzinfo=timezone.utc)
+
+
+def engine_dialect_is_sqlite() -> bool:
+    """Return True if the bound engine is SQLite. Used to pick aware vs naive
+    datetime arguments in WHERE clauses — SQLAlchemy's SQLite driver doesn't
+    let you compare TIMESTAMP columns against aware datetimes in some versions.
+    Postgres handles both transparently.
+    """
+    return get_engine().dialect.name == "sqlite"
 
 
 def _recent_messages(session: Session, mission_id: str, direction: str, total: int = 10) -> list[dict[str, Any]]:
