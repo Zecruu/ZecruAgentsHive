@@ -24,6 +24,35 @@ After init, in Zed's agent panel:
 
 The Hivemind orchestrates, Coders implement and ask the Hivemind (not you) when stuck. Pair this with the [`agentshive` skill](https://app.noticomax.com) for full protocol context inside Claude Code CLI.
 
+## Testing (v1.17+)
+
+Start a server, then run all suites sequentially with `tests/runner.py`:
+
+```bash
+# Start once, leave running
+AGENTSHIVE_API_KEY=test-key PORT=8000 \
+    DATABASE_URL=sqlite:///./agentshive_test_runner.db \
+    AGENTSHIVE_BASE_URL=http://localhost:8000 \
+    TOOL_BLOCK_TIMEOUT_SECONDS=2 \
+    python -m agentshive.main &
+
+# Run all suites sequentially (mandatory — see Why below)
+AGENTSHIVE_API_KEY=test-key AGENTSHIVE_BASE=http://localhost:8000 \
+    python tests/runner.py
+```
+
+Single suite:
+```bash
+python tests/runner.py test_v1_16_scope_guard
+```
+
+Skip flaky/slow ones:
+```bash
+python tests/runner.py --skip test_dashboard_sse test_oauth
+```
+
+**Why sequential and not parallel:** several legacy suites (test_v1_1, test_v1_2, test_v1_3, test_supersede, test_inbox, test_dashboard*) assume sole ownership of the default project's active-mission state. Running them concurrently against the same server causes state contamination — questions/missions created by suite A leak into suite B's wait assertions. v1.18+ may refactor each legacy suite to use its own scoped project (Option A from the v1.14 spec) so parallel runs become safe. Until then, `tests/runner.py` is the canonical way to run the full suite.
+
 ## Cross-device setup (v1.15+) — Windows + Mac + Linux + mobile
 
 AgentsHive is server-hosted on Railway, so the same dashboard, missions, and message queue are visible from any device with internet + an AgentsHive client. You can run a Hivemind Claude Desktop on Mac, Coder threads on Windows + Linux, and check progress from your phone in claude.ai/code — all on one mission.
