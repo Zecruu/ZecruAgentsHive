@@ -217,6 +217,55 @@ def _validate_text(value: str, field_name: str, max_len: int) -> Optional[dict]:
 ALLOWED_OS_HINTS = frozenset({"windows", "macos", "linux"})
 
 
+def validate_project_scope(claimed_slug: Optional[str]) -> Optional[dict[str, Any]]:
+    """v1.16: enforce that the caller's claimed project_slug matches the actual
+    project this MCP request is routed to.
+
+    The bug this prevents:
+    - An agent has multiple AgentsHive MCP connectors loaded (e.g., a workspace-
+      local one for project A AND a claude.ai cloud connector for project B).
+    - The agent reads project A's mission spec, then calls submit_progress via
+      the cloud connector — which routes to project B and silently corrupts
+      B's mission state. v1.12's Step 0 (call get_project_info first) is
+      advisory; this guard is enforced.
+
+    Usage from a tool wrapper:
+
+        err = validate_project_scope(project_slug)
+        if err:
+            return err   # caller propagates the error dict to the agent
+        ... mutate ...
+
+    Returns None when:
+    - claimed_slug is None (caller didn't opt in; legacy behavior preserved)
+    - claimed_slug equals the request's actual project (the happy path)
+
+    Returns an error dict otherwise. The error message names BOTH the
+    claimed slug AND the actual one so the agent can self-diagnose. Caller
+    is expected to surface this to the requesting agent (do not raise — that
+    bypasses the FastMCP error envelope on some clients).
+    """
+    if claimed_slug is None:
+        return None
+    actual = current_project()
+    if claimed_slug == actual:
+        return None
+    return {
+        "error": (
+            f"project scope mismatch: caller claimed project_slug={claimed_slug!r} "
+            f"but this MCP request is routed to project_slug={actual!r}. "
+            "Refusing to mutate. This usually means the caller has multiple "
+            "AgentsHive MCP connectors loaded and picked the wrong one for the "
+            "spec they're executing. Call get_project_info() to verify which "
+            "project the current connection is on, then either: (a) switch to "
+            "the correct connector, or (b) update your project_slug arg to "
+            "match the actual route."
+        ),
+        "claimed_project_slug": claimed_slug,
+        "actual_project_slug": actual,
+    }
+
+
 def validate_os_hint(value: Optional[str]) -> None:
     """Validate an optional os_hint. None is legal (legacy / cloud Coder).
 
@@ -499,14 +548,26 @@ def _do_send_to_planner_from_user(body: str) -> dict[str, Any]:
     return result
 
 
-def _do_create_mission(name: str, spec: str) -> dict[str, Any]:
+def _do_create_mission(
+    name: str,
+    spec: str,
+    project_slug: Optional[str] = None,
+) -> dict[str, Any]:
     """Insert a new mission, superseding any prior active one IN THE SAME PROJECT.
 
     v1.9: scoped to the current request's project. Two projects can each have
     their own active mission simultaneously — they don't supersede each other.
     Atomic via the one_active_mission_per_project partial unique index +
     IntegrityError retry-once.
+
+    v1.16: optional project_slug guards against cross-connector misrouting.
+    The morning of 2026-05-26 a Hivemind silently superseded another
+    project's active mission because it created on the wrong project URL.
+    Passing project_slug=<expected> makes that class of bug hard-fail.
     """
+    scope_err = validate_project_scope(project_slug)
+    if scope_err:
+        return scope_err
     err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
     if err:
         return err
@@ -545,6 +606,7 @@ def _do_ask_planner(
     question: str,
     coder_id: Optional[str] = None,
     os_hint: Optional[str] = None,
+    project_slug: Optional[str] = None,
 ) -> dict[str, Any]:
     """Insert a Question against the active mission. Does NOT block — the wait
     loop is MCP-protocol-specific and stays in the @mcp.tool ask_planner wrapper.
@@ -555,7 +617,15 @@ def _do_ask_planner(
     Hivemind via _question_dict. None = legacy single-Coder mode.
     v1.15: optional os_hint persists on the CoderHeartbeat row so the
     Connected Coders dashboard panel renders an OS icon next to this Coder.
+    v1.16: optional project_slug. When supplied, server validates it matches
+    the URL's actual project slug; mismatch returns a scope-error and the
+    write is REJECTED. Closes the cross-connector misrouting bug where an
+    agent picks the wrong MCP connector and silently corrupts another
+    project's state.
     """
+    scope_err = validate_project_scope(project_slug)
+    if scope_err:
+        return scope_err
     err = _validate_text(question, "question", MAX_TEXT_LEN)
     if err:
         return err
@@ -583,11 +653,16 @@ def _do_submit_progress(
     summary: str,
     coder_id: Optional[str] = None,
     os_hint: Optional[str] = None,
+    project_slug: Optional[str] = None,
 ) -> dict[str, Any]:
     """Insert a Summary against the active mission. v1.9: scoped to current project.
     v1.11: optional coder_id identifies which Coder submitted.
     v1.15: optional os_hint persists on CoderHeartbeat for dashboard OS icon.
+    v1.16: optional project_slug guards against cross-connector misrouting.
     """
+    scope_err = validate_project_scope(project_slug)
+    if scope_err:
+        return scope_err
     err = _validate_text(summary, "summary", MAX_TEXT_LEN)
     if err:
         return err
@@ -735,7 +810,11 @@ def register_tools(mcp, settings: Settings) -> None:
     # ---------- Planner-side tools ----------
 
     @mcp.tool
-    def create_mission(name: str, spec: str) -> dict[str, Any]:
+    def create_mission(
+        name: str,
+        spec: str,
+        project_slug: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Start a new AgentsHive mission. The Coder will fetch this spec and begin building.
 
         Any previously-active mission is marked 'superseded' — there is only one active
@@ -746,8 +825,14 @@ def register_tools(mcp, settings: Settings) -> None:
                 Must be non-empty, max {MAX_NAME_LEN} characters.
             spec: the full natural-language specification the Coder should implement.
                 Must be non-empty, max {MAX_SPEC_LEN // 1024} KB.
+            project_slug: (v1.16+) optional safety check — the project slug you THINK
+                this connection is routed to. Server validates against the actual ?project=
+                URL slug; mismatch returns a hard error and the create is REFUSED. Strongly
+                recommended when you have multiple AgentsHive MCP connectors loaded — call
+                get_project_info() first to discover the slug, then pass it here to prove
+                you're mutating the project you intend.
         """
-        return _do_create_mission(name, spec)
+        return _do_create_mission(name, spec, project_slug=project_slug)
 
     @mcp.tool
     def get_active_mission(coder_id: Optional[str] = None) -> dict[str, Any]:
@@ -897,7 +982,11 @@ def register_tools(mcp, settings: Settings) -> None:
         )
 
     @mcp.tool
-    def send_to_coder(body: str, target_coder_id: Optional[str] = None) -> dict[str, Any]:
+    def send_to_coder(
+        body: str,
+        target_coder_id: Optional[str] = None,
+        project_slug: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Planner-side: send a free-form message TO the Coder. Fire-and-forget.
 
         Use this for casual "fyi…" / "while you're at it…" / "I noticed X" updates that
@@ -920,6 +1009,9 @@ def register_tools(mcp, settings: Settings) -> None:
         message is relevant to only one (e.g., "Coder-server, switch to
         Postgres"). Use the default broadcast for general announcements.
         """
+        scope_err = validate_project_scope(project_slug)
+        if scope_err:
+            return scope_err
         return _do_send_to_coder(body, target_coder_id=target_coder_id)
 
     @mcp.tool
@@ -964,6 +1056,7 @@ def register_tools(mcp, settings: Settings) -> None:
         body: str,
         coder_id: Optional[str] = None,
         os_hint: Optional[str] = None,
+        project_slug: Optional[str] = None,
     ) -> dict[str, Any]:
         """Coder-side: send a free-form message TO the Planner. Fire-and-forget.
 
@@ -980,6 +1073,9 @@ def register_tools(mcp, settings: Settings) -> None:
         v1.15: optional os_hint ("windows" | "macos" | "linux") persists on the
         CoderHeartbeat row for the dashboard's Connected Coders OS icon.
         """
+        scope_err = validate_project_scope(project_slug)
+        if scope_err:
+            return scope_err
         err = _validate_text(body, "body", MAX_TEXT_LEN)
         if err:
             return err
@@ -1374,8 +1470,15 @@ def register_tools(mcp, settings: Settings) -> None:
         }
 
     @mcp.tool
-    def mark_mission_done() -> dict[str, Any]:
-        """Mark the active mission as done. The Coder will see this on its next is_mission_done() check and stop."""
+    def mark_mission_done(project_slug: Optional[str] = None) -> dict[str, Any]:
+        """Mark the active mission as done. The Coder will see this on its next is_mission_done() check and stop.
+
+        v1.16: optional project_slug guards against cross-connector misrouting.
+        If passed and mismatches the URL's actual project slug, the mark is REFUSED.
+        """
+        scope_err = validate_project_scope(project_slug)
+        if scope_err:
+            return scope_err
         return _do_mark_mission_done()
 
     # ---------- Coder-side tools ----------
@@ -1421,6 +1524,7 @@ def register_tools(mcp, settings: Settings) -> None:
         question: str,
         coder_id: Optional[str] = None,
         os_hint: Optional[str] = None,
+        project_slug: Optional[str] = None,
     ) -> dict[str, Any]:
         """Ask the Planner a question and wait for the answer.
 
@@ -1442,7 +1546,9 @@ def register_tools(mcp, settings: Settings) -> None:
         OS icon for this Coder. Useful when running Coders across devices.
         """
         # Insert via the module-level _do_ function so the dashboard SSE push fires.
-        inserted = _do_ask_planner(question, coder_id=coder_id, os_hint=os_hint)
+        inserted = _do_ask_planner(
+            question, coder_id=coder_id, os_hint=os_hint, project_slug=project_slug,
+        )
         if "error" in inserted:
             return inserted
         return _wait_for_question(inserted["question_id"])
@@ -1483,6 +1589,7 @@ def register_tools(mcp, settings: Settings) -> None:
         summary: str,
         coder_id: Optional[str] = None,
         os_hint: Optional[str] = None,
+        project_slug: Optional[str] = None,
     ) -> dict[str, Any]:
         """Push a natural-language progress summary to the Planner and wait for their response.
 
@@ -1501,7 +1608,9 @@ def register_tools(mcp, settings: Settings) -> None:
         CoderHeartbeat row for the dashboard's Connected Coders OS icon.
         """
         # Insert via the module-level _do_ function so the dashboard SSE push fires.
-        inserted = _do_submit_progress(summary, coder_id=coder_id, os_hint=os_hint)
+        inserted = _do_submit_progress(
+            summary, coder_id=coder_id, os_hint=os_hint, project_slug=project_slug,
+        )
         if "error" in inserted:
             return inserted
         return _wait_for_summary(inserted["summary_id"])
