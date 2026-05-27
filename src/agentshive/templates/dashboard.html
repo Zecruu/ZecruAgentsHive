@@ -127,6 +127,9 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
 #connected-coders .coder-row .count { padding: 1px 6px; background: #1a1c22;
                                       border-radius: 4px; }
 #connected-coders .coder-row .count strong { color: #d6d9e0; }
+/* v1.15: OS icon (🪟/🍎/🐧) next to coder pill */
+#connected-coders .os-icon { display: inline-block; margin-right: 4px;
+  font-size: 13px; line-height: 1; }
 </style>
 </head>
 <body>
@@ -376,13 +379,23 @@ function renderConnectedCoders(coders, ttl, hasActive) {
     return;
   }
   const halfTtl = Math.max(60, Math.floor((ttl || 300) / 2));
+  // v1.15: OS icon per Coder. Strict allow-list matches the server-side
+  // ALLOWED_OS_HINTS set; anything else (or null) renders no icon.
+  // Emoji codepoints chosen for ubiquity (all pre-2020, render in every
+  // modern browser).
+  const osIcon = (h) => {
+    if (h === "windows") return `<span class="os-icon" title="Windows">🪟</span>`;
+    if (h === "macos") return `<span class="os-icon" title="macOS">🍎</span>`;
+    if (h === "linux") return `<span class="os-icon" title="Linux">🐧</span>`;
+    return "";
+  };
   root.innerHTML = coders.map(c => {
     const staleCls = c.freshness_seconds >= halfTtl ? " stale" : "";
     const pill = c.coder_id === "<unidentified>"
       ? `<span class="coder-pill broadcast">&lt;unidentified&gt;</span>`
       : coderPill(c.coder_id);
     return `<div class="coder-row${staleCls}">
-      ${pill}
+      ${osIcon(c.os_hint)}${pill}
       <span class="relative">${ago(c.last_seen)}</span>
       <div class="counts">
         <span class="count" title="questions asked">q <strong>${c.q_count}</strong></span>

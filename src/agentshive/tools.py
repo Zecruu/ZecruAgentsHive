@@ -212,7 +212,32 @@ def _validate_text(value: str, field_name: str, max_len: int) -> Optional[dict]:
     return None
 
 
-def _touch_coder(session: Session, coder_id: Optional[str] = None) -> None:
+# v1.15: device hint allow-list. Used by validate_os_hint and surfaced via
+# the Connected Coders dashboard panel as an OS icon.
+ALLOWED_OS_HINTS = frozenset({"windows", "macos", "linux"})
+
+
+def validate_os_hint(value: Optional[str]) -> None:
+    """Validate an optional os_hint. None is legal (legacy / cloud Coder).
+
+    Raises ValueError on a non-None value outside ALLOWED_OS_HINTS so a typo
+    ("Windows", "darwin", "osx") fails loudly at the API boundary instead of
+    silently rendering as an unknown OS in the dashboard.
+    """
+    if value is None:
+        return
+    if value not in ALLOWED_OS_HINTS:
+        raise ValueError(
+            f"os_hint must be one of {sorted(ALLOWED_OS_HINTS)} or None "
+            f"(got {value!r})"
+        )
+
+
+def _touch_coder(
+    session: Session,
+    coder_id: Optional[str] = None,
+    os_hint: Optional[str] = None,
+) -> None:
     """Update the heartbeat trail for the Coder making this tool call.
 
     Called once per Coder-side tool invocation so the Planner can see whether the
@@ -230,10 +255,18 @@ def _touch_coder(session: Session, coder_id: Optional[str] = None) -> None:
       generate one write per tool call. Surfaces to the Connected Coders
       dashboard panel even when the Coder has no Q/S/M yet.
 
+    v1.15: os_hint, if supplied, is validated + persisted on the heartbeat
+    row alongside coder_id. Only meaningful when coder_id is also passed (a
+    bare os_hint with no coder_id has nothing to attach to). Updates the
+    stored os_hint on every non-throttled write so a Coder moving between
+    devices (rare) eventually reflects in the panel.
+
     No-op for the legacy trail if no mission is active. The per-Coder trail
     runs regardless of mission state — a Coder doing Step 1 research before
     create_mission lands still shows up if they're passing coder_id.
     """
+    validate_os_hint(os_hint)
+
     mission = _active_mission(session)
     if mission is not None:
         mission.coder_last_seen = _utcnow()
@@ -261,9 +294,13 @@ def _touch_coder(session: Session, coder_id: Optional[str] = None) -> None:
         if (now - last).total_seconds() < HEARTBEAT_MIN_INTERVAL_SECONDS:
             return
         existing.last_seen = now
+        if os_hint is not None:
+            existing.os_hint = os_hint
         session.add(existing)
     else:
-        session.add(CoderHeartbeat(project_id=pid, coder_id=coder_id, last_seen=now))
+        session.add(CoderHeartbeat(
+            project_id=pid, coder_id=coder_id, last_seen=now, os_hint=os_hint,
+        ))
     session.commit()
 
 
@@ -504,7 +541,11 @@ def _do_create_mission(name: str, spec: str) -> dict[str, Any]:
             }
 
 
-def _do_ask_planner(question: str, coder_id: Optional[str] = None) -> dict[str, Any]:
+def _do_ask_planner(
+    question: str,
+    coder_id: Optional[str] = None,
+    os_hint: Optional[str] = None,
+) -> dict[str, Any]:
     """Insert a Question against the active mission. Does NOT block — the wait
     loop is MCP-protocol-specific and stays in the @mcp.tool ask_planner wrapper.
     Returns the question dict (with the new question_id) on success.
@@ -512,16 +553,19 @@ def _do_ask_planner(question: str, coder_id: Optional[str] = None) -> dict[str, 
     v1.9: scoped to current project via _active_mission().
     v1.11: optional coder_id identifies which Coder asked, surfaced to the
     Hivemind via _question_dict. None = legacy single-Coder mode.
+    v1.15: optional os_hint persists on the CoderHeartbeat row so the
+    Connected Coders dashboard panel renders an OS icon next to this Coder.
     """
     err = _validate_text(question, "question", MAX_TEXT_LEN)
     if err:
         return err
     try:
         validate_coder_id(coder_id)
+        validate_os_hint(os_hint)
     except ValueError as e:
         return {"error": str(e)}
     with Session(get_engine()) as session:
-        _touch_coder(session, coder_id=coder_id)
+        _touch_coder(session, coder_id=coder_id, os_hint=os_hint)
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot ask"}
@@ -535,19 +579,25 @@ def _do_ask_planner(question: str, coder_id: Optional[str] = None) -> dict[str, 
     return result
 
 
-def _do_submit_progress(summary: str, coder_id: Optional[str] = None) -> dict[str, Any]:
+def _do_submit_progress(
+    summary: str,
+    coder_id: Optional[str] = None,
+    os_hint: Optional[str] = None,
+) -> dict[str, Any]:
     """Insert a Summary against the active mission. v1.9: scoped to current project.
     v1.11: optional coder_id identifies which Coder submitted.
+    v1.15: optional os_hint persists on CoderHeartbeat for dashboard OS icon.
     """
     err = _validate_text(summary, "summary", MAX_TEXT_LEN)
     if err:
         return err
     try:
         validate_coder_id(coder_id)
+        validate_os_hint(os_hint)
     except ValueError as e:
         return {"error": str(e)}
     with Session(get_engine()) as session:
-        _touch_coder(session, coder_id=coder_id)
+        _touch_coder(session, coder_id=coder_id, os_hint=os_hint)
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot submit progress"}
@@ -910,7 +960,11 @@ def register_tools(mcp, settings: Settings) -> None:
         )
 
     @mcp.tool
-    def send_to_planner(body: str, coder_id: Optional[str] = None) -> dict[str, Any]:
+    def send_to_planner(
+        body: str,
+        coder_id: Optional[str] = None,
+        os_hint: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Coder-side: send a free-form message TO the Planner. Fire-and-forget.
 
         Use this for "fyi…" / "I made a small tangential decision" / "here's an
@@ -923,16 +977,19 @@ def register_tools(mcp, settings: Settings) -> None:
         v1.11: optional coder_id self-identifies the Coder. Surfaced to the
         Hivemind on _message_dict so they can attribute the note. None = legacy
         single-Coder mode (no attribution).
+        v1.15: optional os_hint ("windows" | "macos" | "linux") persists on the
+        CoderHeartbeat row for the dashboard's Connected Coders OS icon.
         """
         err = _validate_text(body, "body", MAX_TEXT_LEN)
         if err:
             return err
         try:
             validate_coder_id(coder_id)
+            validate_os_hint(os_hint)
         except ValueError as e:
             return {"error": str(e)}
         with Session(get_engine()) as session:
-            _touch_coder(session, coder_id=coder_id)
+            _touch_coder(session, coder_id=coder_id, os_hint=os_hint)
             mission = _active_mission(session)
             if mission is None:
                 return {"error": "no active mission — cannot send"}
@@ -1360,7 +1417,11 @@ def register_tools(mcp, settings: Settings) -> None:
         )
 
     @mcp.tool
-    def ask_planner(question: str, coder_id: Optional[str] = None) -> dict[str, Any]:
+    def ask_planner(
+        question: str,
+        coder_id: Optional[str] = None,
+        os_hint: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Ask the Planner a question and wait for the answer.
 
         Use this whenever you would otherwise stop and ask the human. This is the entire
@@ -1376,9 +1437,12 @@ def register_tools(mcp, settings: Settings) -> None:
         v1.11: optional coder_id self-identifies the Coder so the Hivemind can
         attribute the question when multiple Coders work the same mission. None =
         legacy single-Coder mode.
+        v1.15: optional os_hint ("windows" | "macos" | "linux") persists on the
+        CoderHeartbeat row so the dashboard's Connected Coders panel renders an
+        OS icon for this Coder. Useful when running Coders across devices.
         """
         # Insert via the module-level _do_ function so the dashboard SSE push fires.
-        inserted = _do_ask_planner(question, coder_id=coder_id)
+        inserted = _do_ask_planner(question, coder_id=coder_id, os_hint=os_hint)
         if "error" in inserted:
             return inserted
         return _wait_for_question(inserted["question_id"])
@@ -1415,7 +1479,11 @@ def register_tools(mcp, settings: Settings) -> None:
         )
 
     @mcp.tool
-    def submit_progress(summary: str, coder_id: Optional[str] = None) -> dict[str, Any]:
+    def submit_progress(
+        summary: str,
+        coder_id: Optional[str] = None,
+        os_hint: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Push a natural-language progress summary to the Planner and wait for their response.
 
         Call this at meaningful checkpoints (after each feature / milestone). Write in plain
@@ -1429,9 +1497,11 @@ def register_tools(mcp, settings: Settings) -> None:
         v1.11: optional coder_id self-identifies the Coder. The Hivemind sees the
         coder_id on every summary so they can attribute the work in a multi-Coder
         run. None = legacy single-Coder mode.
+        v1.15: optional os_hint ("windows" | "macos" | "linux") persists on the
+        CoderHeartbeat row for the dashboard's Connected Coders OS icon.
         """
         # Insert via the module-level _do_ function so the dashboard SSE push fires.
-        inserted = _do_submit_progress(summary, coder_id=coder_id)
+        inserted = _do_submit_progress(summary, coder_id=coder_id, os_hint=os_hint)
         if "error" in inserted:
             return inserted
         return _wait_for_summary(inserted["summary_id"])

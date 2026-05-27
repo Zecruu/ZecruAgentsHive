@@ -370,6 +370,10 @@ def _compute_connected_coders(
             "q_count": 0,
             "s_count": 0,
             "m_count": 0,
+            # v1.15: device hint surfaces as OS icon in the dashboard. None
+            # means "unknown" (legacy Coder, cloud Coder via OAuth, etc.) and
+            # the frontend just doesn't render an icon for them.
+            "os_hint": hb.os_hint,
         }
 
     # Source B: derived activity on the active mission. The brief allows
@@ -386,6 +390,7 @@ def _compute_connected_coders(
                 "q_count": 0,
                 "s_count": 0,
                 "m_count": 0,
+                "os_hint": None,  # source B has no os_hint info
             }
             by_coder[key] = slot
         if ts > slot["last_seen"]:
@@ -420,6 +425,7 @@ def _compute_connected_coders(
             "q_count": r["q_count"],
             "s_count": r["s_count"],
             "m_count": r["m_count"],
+            "os_hint": r.get("os_hint"),
         }
         for r in filtered
     ]
