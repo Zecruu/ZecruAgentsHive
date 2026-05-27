@@ -217,25 +217,35 @@ Then read AGENTS.md at the repo root and the agentshive skill at ~/.claude/skill
 
 You orchestrate; you do not write code. Wait for the user to describe the work, clarify scope with them, then call create_mission with a comprehensive brief. After that, long-poll wait_for_next_question / wait_for_next_summary for Coder activity."""
 
-CODER_PROMPT = """You are a Coder for project {slug} (coder_id={coder_id}). Your first action MUST be: call mcp__agentshive__get_project_info() and confirm the slug it returns equals {slug}. If it does not, STOP and call send_to_user describing the mismatch (do not call submit_progress or any mutator).
+CODER_PROMPT = """You are a Coder for project {slug} (coder_id={coder_id}, os_hint={os_hint}). Your first action MUST be: call mcp__agentshive__get_project_info() and confirm the slug it returns equals {slug}. If it does not, STOP and call send_to_user describing the mismatch (do not call submit_progress or any mutator).
 
 Then read AGENTS.md at the repo root and the agentshive skill at ~/.claude/skills/agentshive/SKILL.md.
 
-Call get_active_mission to fetch the brief. If a brief exists, do the Step 1 research from its spec, then ask_planner(coder_id="{coder_id}") with your findings. Use ask_planner for any clarification -- do NOT ask the human user. Submit progress at every milestone via submit_progress(coder_id="{coder_id}", ...)."""
+Call get_active_mission to fetch the brief. If a brief exists, do the Step 1 research from its spec, then ask_planner(coder_id="{coder_id}", os_hint="{os_hint}") with your findings. Use ask_planner for any clarification -- do NOT ask the human user. Submit progress at every milestone via submit_progress(coder_id="{coder_id}", os_hint="{os_hint}", ...). The os_hint surfaces in the dashboard's Connected Coders panel as a device icon so the Hivemind can see which machine you're on."""
+
+
+def _detect_os_hint() -> str:
+    """v1.15: map sys.platform to the allow-listed os_hint values."""
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform == "win32":
+        return "windows"
+    return "linux"
 
 
 def _print_role_prompt(role: str, slug: str, coder_id: str | None = None) -> None:
     """Print a ready-to-paste boot prompt for one or both roles."""
     cid = coder_id or "coder-main"
+    os_hint = _detect_os_hint()
     if role == "hivemind":
         print(HIVEMIND_PROMPT.format(slug=slug))
     elif role == "coder":
-        print(CODER_PROMPT.format(slug=slug, coder_id=cid))
+        print(CODER_PROMPT.format(slug=slug, coder_id=cid, os_hint=os_hint))
     elif role == "both":
         print("--- COPY HIVEMIND PROMPT ABOVE / CODER PROMPT BELOW ---\n")
         print(HIVEMIND_PROMPT.format(slug=slug))
         print("\n--- CODER PROMPT ---\n")
-        print(CODER_PROMPT.format(slug=slug, coder_id=cid))
+        print(CODER_PROMPT.format(slug=slug, coder_id=cid, os_hint=os_hint))
 
 
 def _write_zed_settings(target: Path, slug: str, server: str, api_key: str) -> str:
@@ -348,6 +358,20 @@ def main() -> int:
     print(f"3. New agent thread -> 'You are a Coder for project {slug}. Read AGENTS.md.'")
     print(f"4. The agents coordinate via AgentsHive MCP automatically.")
     print()
+    # v1.15: platform-aware setup hints. The .zed/settings.json we just wrote
+    # is workspace-local and works identically on all platforms; this is for
+    # users who want to edit Zed's global config or troubleshoot.
+    if sys.platform == "darwin":
+        zed_global = "~/Library/Application Support/Zed/settings.json"
+        os_label = "macOS"
+    elif sys.platform == "win32":
+        zed_global = "%APPDATA%\\Zed\\settings.json"
+        os_label = "Windows"
+    else:
+        zed_global = "~/.config/zed/settings.json"
+        os_label = "Linux"
+    print(f"Detected: {os_label}")
+    print(f"Zed global settings (if you need to inspect): {zed_global}")
     print(f"Dashboard: {server.rstrip('/')}/dashboard")
     return 0
 
