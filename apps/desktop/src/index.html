@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>AgentsHive</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">⬡</span>
+      <span class="brand-name">AgentsHive</span>
+      <span class="brand-version" id="version-tag">v2.0-alpha</span>
+    </div>
+    <div class="topbar-right">
+      <span id="server-status" class="status-pill">connecting…</span>
+      <button id="open-settings" class="ghost-btn" title="Settings">⚙</button>
+    </div>
+  </header>
+
+  <main id="app"></main>
+
+  <template id="tpl-settings">
+    <section class="card">
+      <h2>Connect to AgentsHive</h2>
+      <p class="muted">Point this app at your AgentsHive server. The API key never leaves this machine — it's stored in your app data folder.</p>
+      <label>
+        <span>Server URL</span>
+        <input id="cfg-base-url" type="url" placeholder="https://agentshive-production.up.railway.app" />
+      </label>
+      <label>
+        <span>API key</span>
+        <input id="cfg-api-key" type="password" placeholder="paste AGENTSHIVE_API_KEY" />
+        <small id="cfg-api-status" class="muted"></small>
+      </label>
+      <label>
+        <span>Default OS hint</span>
+        <select id="cfg-os-hint">
+          <option value="">(detect)</option>
+          <option value="windows">windows 🪟</option>
+          <option value="macos">macos 🍎</option>
+          <option value="linux">linux 🐧</option>
+        </select>
+      </label>
+      <div class="row">
+        <button id="cfg-save" class="primary-btn">Save</button>
+        <button id="cfg-cancel" class="ghost-btn" hidden>Cancel</button>
+      </div>
+    </section>
+  </template>
+
+  <template id="tpl-project-picker">
+    <section class="card">
+      <div class="row between">
+        <h2>Select a project</h2>
+        <button id="refresh-projects" class="ghost-btn">↻ Refresh</button>
+      </div>
+      <p class="muted">Projects are scoped on the AgentsHive server. Every agent you launch will be wired to the project you pick here.</p>
+      <ul id="project-list" class="project-list"></ul>
+      <details class="create-project">
+        <summary>+ Create a new project</summary>
+        <div class="row">
+          <input id="new-project-slug" type="text" placeholder="slug (e.g. my-app)" maxlength="64" />
+          <input id="new-project-name" type="text" placeholder="display name" maxlength="120" />
+          <button id="create-project" class="primary-btn">Create</button>
+        </div>
+        <small class="muted">Slug: lowercase, numbers, hyphens. Used in MCP URLs and env vars.</small>
+      </details>
+    </section>
+  </template>
+
+  <template id="tpl-project-view">
+    <section class="card project-card">
+      <div class="row between">
+        <div>
+          <h2 id="pv-name">…</h2>
+          <code class="muted" id="pv-slug"></code>
+        </div>
+        <div class="row">
+          <button id="pv-dashboard" class="ghost-btn">Open dashboard ↗</button>
+          <button id="pv-switch" class="ghost-btn">← Switch project</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>Launch an agent</h3>
+      <p class="muted">Spawns a new terminal window pre-wired with this project's env vars. Run <code>claude</code> or <code>codex</code> when the window opens.</p>
+      <div class="grid-form">
+        <label>
+          <span>Role</span>
+          <select id="launch-role">
+            <option value="hivemind">Hivemind (Planner)</option>
+            <option value="coder">Coder</option>
+          </select>
+        </label>
+        <label>
+          <span>CLI</span>
+          <select id="launch-cli">
+            <option value="claude">Claude Code</option>
+            <option value="codex">Codex CLI</option>
+          </select>
+        </label>
+        <label>
+          <span>Coder ID</span>
+          <input id="launch-coder-id" type="text" placeholder="auto" maxlength="64" />
+        </label>
+        <label>
+          <span>OS hint</span>
+          <select id="launch-os-hint">
+            <option value="">(use default)</option>
+            <option value="windows">windows 🪟</option>
+            <option value="macos">macos 🍎</option>
+            <option value="linux">linux 🐧</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <button id="launch-go" class="primary-btn">⟶ Launch agent</button>
+        <span id="launch-status" class="muted"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>Coming in v2.0-beta</h3>
+      <ul class="muted compact">
+        <li>Embedded terminals via xterm.js + node-pty (no external window)</li>
+        <li>Hivemind dynamic role assignment (coder / designer / marketer)</li>
+        <li>Inline dashboard view (no browser bounce)</li>
+        <li>Per-project AGENTS.md auto-generation</li>
+      </ul>
+    </section>
+  </template>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
