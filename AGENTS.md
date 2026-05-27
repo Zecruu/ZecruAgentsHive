@@ -56,6 +56,10 @@ The Hivemind addresses you back via `send_to_coder(body, target_coder_id=…)`. 
 
 If you DON'T pass a `coder_id`, you're in legacy/broadcast-only mode: the Hivemind has no attribution and you only see broadcasts (never targeted messages — that's the v1.11 safety property).
 
+v1.13+ adds two more knobs:
+- **Heartbeat.** Any tool call that passes `coder_id` (including read-only ones like `get_active_mission`, `fetch_mission`, `is_mission_done`) bumps a per-Coder heartbeat. You appear in the dashboard's "Connected Coders" panel within 5 minutes of your most recent touch even if you haven't asked or submitted anything yet.
+- **Crash resume.** `wait_for_planner_message(since=…)` accepts an ISO 8601 timestamp or a 32-char message_id; only messages created strictly after that point are eligible. Use this when reconnecting after a process restart so you don't re-read the whole backlog one ack at a time.
+
 If you find another Coder already touched files you'd touch, ping the Hivemind via `send_to_planner(message, coder_id="…")` to clarify scope.
 
 ## Project context

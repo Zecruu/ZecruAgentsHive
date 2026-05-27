@@ -1,6 +1,7 @@
 import hashlib
+import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastmcp import Context
@@ -11,8 +12,20 @@ from sqlmodel import Session, select
 from . import __version__ as AGENTSHIVE_VERSION
 from . import dashboard_events
 from .config import Settings
-from .db import Message, Mission, Project, Question, Summary, get_engine
+from .db import CoderHeartbeat, Message, Mission, Project, Question, Summary, get_engine
 from .project import current_project, validate_coder_id
+
+
+# v1.13: heartbeat throttle. _touch_coder writes a CoderHeartbeat row at most
+# once per HEARTBEAT_MIN_INTERVAL_SECONDS per (project_id, coder_id) pair so a
+# chatty Coder doesn't generate one write per tool call. Module-level constant
+# so tests can monkeypatch it to 0 for "heartbeat updates on every call" cases.
+HEARTBEAT_MIN_INTERVAL_SECONDS = 10
+
+# v1.13: message_id form vs ISO timestamp form for the wait_for_planner_message
+# `since` parameter. uuid4().hex is always 32 lowercase hex; anything else gets
+# parsed as ISO 8601.
+_MESSAGE_ID_REGEX = re.compile(r"^[a-f0-9]{32}$")
 
 
 # Captured at module load. See get_server_info — surfaced as `started_at` so a client
@@ -36,6 +49,48 @@ def _compute_tools_catalog_hash(tool_names: list[str]) -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _resolve_since(since: Optional[str]) -> Optional[datetime]:
+    """v1.13: parse the wait_for_planner_message `since` parameter.
+
+    Accepts either an ISO 8601 timestamp string OR a message_id (32-char lowercase
+    hex, matching uuid4().hex). Returns the corresponding `created_at` boundary as
+    an aware UTC datetime, or None if the input should be ignored.
+
+    Silent passthrough (return None) cases per the brief:
+      - since is None or empty
+      - since is malformed (neither parseable as ISO 8601 nor as message_id)
+      - since is a message_id that doesn't exist in the DB
+      - since is in the future
+      - (since older than the earliest row is acceptable — the filter still
+        applies; it just doesn't exclude anything, which is the same outcome
+        as not passing since at all)
+
+    Naive datetimes are coerced to UTC. The returned value is always aware.
+    """
+    if not since:
+        return None
+    candidate: Optional[datetime] = None
+    if _MESSAGE_ID_REGEX.match(since):
+        # message_id form — look up the row to get its created_at.
+        with Session(get_engine()) as session:
+            row = session.get(Message, since)
+            if row is None:
+                return None  # unknown id — silent passthrough
+            candidate = row.created_at
+    else:
+        try:
+            candidate = datetime.fromisoformat(since)
+        except (ValueError, TypeError):
+            return None
+    if candidate is None:
+        return None
+    if candidate.tzinfo is None:
+        candidate = candidate.replace(tzinfo=timezone.utc)
+    if candidate > _utcnow():
+        return None  # future timestamp — silent passthrough
+    return candidate
 
 
 def _mission_dict(m: Mission) -> dict[str, Any]:
@@ -157,21 +212,59 @@ def _validate_text(value: str, field_name: str, max_len: int) -> Optional[dict]:
     return None
 
 
-def _touch_coder(session: Session) -> None:
-    """Update the active mission's coder_last_seen to now.
+def _touch_coder(session: Session, coder_id: Optional[str] = None) -> None:
+    """Update the heartbeat trail for the Coder making this tool call.
 
     Called once per Coder-side tool invocation so the Planner can see whether the
     Coder process is alive without an explicit ping protocol. Called at the START
     of a tool, not inside per-iteration polling loops — one touch per call is the
     intended granularity ("the Coder placed this tool call N seconds ago").
 
-    No-op if no mission is active.
+    Two heartbeat trails since v1.13:
+    - Legacy: Mission.coder_last_seen is always bumped on every Coder call (no
+      coder_id needed). This is what the existing dashboard `coder_heartbeat`
+      surface reads. Backwards compatible with pre-v1.13 single-Coder setups.
+    - Per-Coder: if coder_id is supplied, upsert CoderHeartbeat(project_id,
+      coder_id) → last_seen=now. Throttled — skip the write if the row was
+      bumped within HEARTBEAT_MIN_INTERVAL_SECONDS so a chatty Coder doesn't
+      generate one write per tool call. Surfaces to the Connected Coders
+      dashboard panel even when the Coder has no Q/S/M yet.
+
+    No-op for the legacy trail if no mission is active. The per-Coder trail
+    runs regardless of mission state — a Coder doing Step 1 research before
+    create_mission lands still shows up if they're passing coder_id.
     """
     mission = _active_mission(session)
     if mission is not None:
         mission.coder_last_seen = _utcnow()
         session.add(mission)
         session.commit()
+
+    if coder_id is None:
+        return
+
+    # v1.13: per-Coder heartbeat. Resolve project_id from the current request's
+    # ContextVar (NOT from the mission, since a Coder may be active before any
+    # mission exists).
+    pid = _project_id(session)
+    if pid is None:
+        return  # request landed on a project that doesn't exist — nothing to do
+
+    now = _utcnow()
+    existing = session.get(CoderHeartbeat, (pid, coder_id))
+    if existing is not None:
+        # Throttle: skip the write if we bumped within the interval. Coerce
+        # naive datetimes (SQLite) to aware before comparing against `now`.
+        last = existing.last_seen
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if (now - last).total_seconds() < HEARTBEAT_MIN_INTERVAL_SECONDS:
+            return
+        existing.last_seen = now
+        session.add(existing)
+    else:
+        session.add(CoderHeartbeat(project_id=pid, coder_id=coder_id, last_seen=now))
+    session.commit()
 
 
 # ---------- Module-level write operations (v1.5) ----------
@@ -428,7 +521,7 @@ def _do_ask_planner(question: str, coder_id: Optional[str] = None) -> dict[str, 
     except ValueError as e:
         return {"error": str(e)}
     with Session(get_engine()) as session:
-        _touch_coder(session)
+        _touch_coder(session, coder_id=coder_id)
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot ask"}
@@ -454,7 +547,7 @@ def _do_submit_progress(summary: str, coder_id: Optional[str] = None) -> dict[st
     except ValueError as e:
         return {"error": str(e)}
     with Session(get_engine()) as session:
-        _touch_coder(session)
+        _touch_coder(session, coder_id=coder_id)
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot submit progress"}
@@ -607,9 +700,26 @@ def register_tools(mcp, settings: Settings) -> None:
         return _do_create_mission(name, spec)
 
     @mcp.tool
-    def get_active_mission() -> dict[str, Any]:
-        """Return the currently active mission (spec + status), or None if none is active."""
+    def get_active_mission(coder_id: Optional[str] = None) -> dict[str, Any]:
+        """Return the currently active mission (spec + status), or None if none is active.
+
+        v1.13: optional coder_id bumps the per-Coder heartbeat — useful when a
+        Coder is polling for a mission to appear (no mission exists yet, so
+        they can't ask_planner) and wants to show up in the Connected Coders
+        panel as "alive and waiting".
+
+        Without coder_id: NO heartbeat side effect, preserving pre-v1.13
+        Planner-side behavior (v1.1 F3.b: list/get tools don't bump
+        coder_last_seen). Only adding coder_id opts into the per-Coder
+        heartbeat trail.
+        """
+        try:
+            validate_coder_id(coder_id)
+        except ValueError as e:
+            return {"error": str(e)}
         with Session(get_engine()) as session:
+            if coder_id is not None:
+                _touch_coder(session, coder_id=coder_id)
             mission = _active_mission(session)
             return _mission_dict(mission) if mission else {"mission": None}
 
@@ -822,7 +932,7 @@ def register_tools(mcp, settings: Settings) -> None:
         except ValueError as e:
             return {"error": str(e)}
         with Session(get_engine()) as session:
-            _touch_coder(session)
+            _touch_coder(session, coder_id=coder_id)
             mission = _active_mission(session)
             if mission is None:
                 return {"error": "no active mission — cannot send"}
@@ -845,6 +955,7 @@ def register_tools(mcp, settings: Settings) -> None:
     def wait_for_planner_message(
         timeout_seconds: Optional[float] = None,
         coder_id: Optional[str] = None,
+        since: Optional[str] = None,
     ) -> dict[str, Any]:
         """Coder-side: block until an unacked Planner→Coder message exists for the active mission.
 
@@ -865,19 +976,32 @@ def register_tools(mcp, settings: Settings) -> None:
           - sender target="A" + coder_id=None (legacy)        → NOT DELIVERED (legacy
             Coders never claim a target identity, so they only see broadcasts)
 
+        v1.13 — `since` parameter for crash-resume. Pass either an ISO 8601 timestamp
+        or a message_id (32-char lowercase hex) and only messages created strictly
+        after that point are eligible. Both at-least-once semantics and the coder_id
+        routing matrix still apply on top. Malformed / future / non-existent `since`
+        is silently ignored (returns as if since wasn't passed).
+
         Args:
             timeout_seconds: optional override for the server-side block. Falls back to
                 TOOL_BLOCK_TIMEOUT_SECONDS.
             coder_id: optional self-identifier. Validated against the same slug regex
                 as project slugs. None preserves pre-v1.11 behavior (broadcast-only).
+            since: optional resume marker — ISO 8601 timestamp OR a message_id (32-hex).
+                Server auto-detects format. None preserves pre-v1.13 behavior (no filter).
         """
         try:
             validate_coder_id(coder_id)
         except ValueError as e:
             return {"error": str(e)}
 
+        # Resolve since once, before entering the poll loop. None = no filter.
+        # Bad input (malformed, unknown message_id, future timestamp, older than
+        # earliest row) silently falls back to "no filter" per the brief.
+        since_at = _resolve_since(since)
+
         with Session(get_engine()) as session:
-            _touch_coder(session)
+            _touch_coder(session, coder_id=coder_id)
         def _bump(m, session):
             m.redelivery_count = (m.redelivery_count or 0) + 1
             session.add(m)
@@ -902,6 +1026,8 @@ def register_tools(mcp, settings: Settings) -> None:
                 stmt = stmt.where(
                     or_(Message.target_coder_id.is_(None), Message.target_coder_id == coder_id)
                 )
+            if since_at is not None:
+                stmt = stmt.where(Message.created_at > since_at)
             return session.exec(stmt.order_by(Message.created_at)).first()
 
         return _wait_for_active(
@@ -1198,14 +1324,22 @@ def register_tools(mcp, settings: Settings) -> None:
     # ---------- Coder-side tools ----------
 
     @mcp.tool
-    def fetch_mission() -> dict[str, Any]:
+    def fetch_mission(coder_id: Optional[str] = None) -> dict[str, Any]:
         """Fetch the currently-active mission spec from AgentsHive. Call this first when starting work.
 
         Returns the mission's name, spec, status, and mission_id. If there is no active mission,
         the Planner has not created one yet — wait or stop.
+
+        v1.13: optional coder_id bumps the per-Coder heartbeat so this Coder shows
+        up in the Connected Coders dashboard panel even before they've asked a
+        question or submitted a summary.
         """
+        try:
+            validate_coder_id(coder_id)
+        except ValueError as e:
+            return {"error": str(e)}
         with Session(get_engine()) as session:
-            _touch_coder(session)
+            _touch_coder(session, coder_id=coder_id)
             mission = _active_mission(session)
             if mission is None:
                 return {"mission": None, "message": "No active mission. The Planner has not started one yet."}
@@ -1250,14 +1384,20 @@ def register_tools(mcp, settings: Settings) -> None:
         return _wait_for_question(inserted["question_id"])
 
     @mcp.tool
-    def wait_for_answer(question_id: str) -> dict[str, Any]:
+    def wait_for_answer(question_id: str, coder_id: Optional[str] = None) -> dict[str, Any]:
         """Continue waiting for the Planner to answer a previously-asked question.
 
         Use this when ask_planner returned status="pending" (the MCP transport timed out
         before the Planner answered). Keep calling until you get status="answered".
+
+        v1.13: optional coder_id bumps the per-Coder heartbeat.
         """
+        try:
+            validate_coder_id(coder_id)
+        except ValueError as e:
+            return {"error": str(e)}
         with Session(get_engine()) as session:
-            _touch_coder(session)
+            _touch_coder(session, coder_id=coder_id)
         return _wait_for_question(question_id)
 
     def _wait_for_summary(summary_id: str) -> dict[str, Any]:
@@ -1297,14 +1437,21 @@ def register_tools(mcp, settings: Settings) -> None:
         return _wait_for_summary(inserted["summary_id"])
 
     @mcp.tool
-    def wait_for_summary_response(summary_id: str) -> dict[str, Any]:
-        """Continue waiting for the Planner to respond to a previously-submitted summary."""
+    def wait_for_summary_response(summary_id: str, coder_id: Optional[str] = None) -> dict[str, Any]:
+        """Continue waiting for the Planner to respond to a previously-submitted summary.
+
+        v1.13: optional coder_id bumps the per-Coder heartbeat.
+        """
+        try:
+            validate_coder_id(coder_id)
+        except ValueError as e:
+            return {"error": str(e)}
         with Session(get_engine()) as session:
-            _touch_coder(session)
+            _touch_coder(session, coder_id=coder_id)
         return _wait_for_summary(summary_id)
 
     @mcp.tool
-    def is_mission_done(mission_id: Optional[str] = None) -> dict[str, Any]:
+    def is_mission_done(mission_id: Optional[str] = None, coder_id: Optional[str] = None) -> dict[str, Any]:
         """Check the status of a mission.
 
         Without an argument: backward-compatible behavior — reports on the latest applicable
@@ -1321,9 +1468,17 @@ def register_tools(mcp, settings: Settings) -> None:
         - status carries the literal mission.status so the Coder can branch correctly
           (e.g., distinguish "Planner started a new mission, fetch_mission and restart"
           from "Planner shipped this one, stop")
+
+        v1.13: optional coder_id bumps the per-Coder heartbeat. Useful for a
+        Coder polling is_mission_done in a loop after mission completion — they
+        stay visible in the Connected Coders panel until they stop polling.
         """
+        try:
+            validate_coder_id(coder_id)
+        except ValueError as e:
+            return {"error": str(e)}
         with Session(get_engine()) as session:
-            _touch_coder(session)
+            _touch_coder(session, coder_id=coder_id)
             if mission_id is not None:
                 m = session.get(Mission, mission_id)
                 if m is None:

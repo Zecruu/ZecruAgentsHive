@@ -115,6 +115,18 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
               color: #e6e9f0; white-space: nowrap; }
 .coder-pill.target { opacity: 0.85; font-style: italic; }
 .coder-pill.broadcast { background: #2a3540; color: #9aa6bc; font-weight: 500; }
+/* v1.13 Connected Coders panel — vertical list of who's alive on the mission */
+#connected-coders .coder-row { display: flex; align-items: center; gap: 10px;
+                               padding: 8px 0; border-top: 1px solid #232732;
+                               font-size: 12px; }
+#connected-coders .coder-row:first-child { border-top: none; }
+#connected-coders .coder-row.stale { opacity: 0.55; }
+#connected-coders .coder-row .relative { color: #9aa0ab; min-width: 90px; }
+#connected-coders .coder-row .counts { margin-left: auto; display: flex; gap: 6px;
+                                       color: #6a7080; font-variant-numeric: tabular-nums; }
+#connected-coders .coder-row .count { padding: 1px 6px; background: #1a1c22;
+                                      border-radius: 4px; }
+#connected-coders .coder-row .count strong { color: #d6d9e0; }
 </style>
 </head>
 <body>
@@ -165,6 +177,17 @@ textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px 1
     <div class="row" style="margin-top:8px;">
       <small class="dim" id="server-info">server: …</small>
     </div>
+  </div>
+
+  <!-- v1.13: Connected Coders panel. Shows which Coders are alive on the
+       current mission (heartbeat OR recent Q/S/M within the TTL). Rendered
+       below the active mission so it sits in the user's first scroll. -->
+  <div class="card" id="connected-coders-card">
+    <h2 class="panel-title">
+      <span>Connected Coders</span>
+      <small class="dim" id="connected-coders-meta">…</small>
+    </h2>
+    <div id="connected-coders"><div class="empty">Loading…</div></div>
   </div>
 
   <div class="panel-grid">
@@ -333,6 +356,42 @@ function renderSummaries(ss) {
       `<button class="ship" onclick="doShipIt('${id}')">Ship it ✓</button>`,
     ]) + formSlot);
   }).join("");
+}
+
+// v1.13 Connected Coders panel renderer. Renders each Coder as one row with
+// the v1.11 color-stable pill, relative-time, and Q/S/M counts. Two empty
+// states: no active mission (state.active_mission === null) → "No active
+// mission"; active mission but no Coder activity → "Waiting for Coders…".
+function renderConnectedCoders(coders, ttl, hasActive) {
+  const root = $("connected-coders");
+  const meta = $("connected-coders-meta");
+  if (!hasActive) {
+    root.innerHTML = `<div class="empty">No active mission</div>`;
+    meta.textContent = "";
+    return;
+  }
+  if (!coders || coders.length === 0) {
+    root.innerHTML = `<div class="empty">Waiting for Coders…</div>`;
+    meta.textContent = `last ${Math.round((ttl||300)/60)}m · 0 coders`;
+    return;
+  }
+  const halfTtl = Math.max(60, Math.floor((ttl || 300) / 2));
+  root.innerHTML = coders.map(c => {
+    const staleCls = c.freshness_seconds >= halfTtl ? " stale" : "";
+    const pill = c.coder_id === "<unidentified>"
+      ? `<span class="coder-pill broadcast">&lt;unidentified&gt;</span>`
+      : coderPill(c.coder_id);
+    return `<div class="coder-row${staleCls}">
+      ${pill}
+      <span class="relative">${ago(c.last_seen)}</span>
+      <div class="counts">
+        <span class="count" title="questions asked">q <strong>${c.q_count}</strong></span>
+        <span class="count" title="summaries submitted">s <strong>${c.s_count}</strong></span>
+        <span class="count" title="messages sent">m <strong>${c.m_count}</strong></span>
+      </div>
+    </div>`;
+  }).join("");
+  meta.textContent = `last ${Math.round((ttl||300)/60)}m · ${coders.length} coder${coders.length===1?"":"s"}`;
 }
 
 function renderMessages(ms) {
@@ -552,6 +611,11 @@ function renderState(s) {
     $("btn-mark-done").style.display = "none";
   }
   renderHeartbeat(s.coder_heartbeat);
+  renderConnectedCoders(
+    s.connected_coders || [],
+    s.connected_coder_ttl_seconds || 300,
+    s.active_mission !== null && s.active_mission !== undefined,
+  );
 
   $("server-info").textContent =
     `server v${s.server_info.server_version} · catalog ${s.server_info.tools_catalog_hash} · up since ${ago(s.server_info.started_at)}`;
