@@ -1,0 +1,14 @@
+{
+  "name": "agentshive-desktop",
+  "version": "2.0.0-alpha.0",
+  "private": true,
+  "description": "AgentsHive — multi-agent control center. Pick a project, pick a role, launch Claude/Codex CLIs pre-wired to AgentsHive MCP.",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --inspect"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
