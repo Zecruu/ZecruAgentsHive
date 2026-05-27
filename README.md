@@ -7,13 +7,13 @@ An MCP bridge so AI coders (Claude Code, Codex CLI) can ask AI planners (Claude 
 Run from your project root to drop in `AGENTS.md` (cross-tool agent rules) plus `.zed/settings.json` (Zed MCP wiring):
 
 ```bash
-# macOS / Linux — replace my-project with your slug, or omit to use the current dir name
-curl -fsSL https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/init_project.py | python - my-project
+# macOS / Linux — recommended (uses a wrapper script that survives shell-piping quirks)
+curl -fsSL https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/install.sh | bash -s -- my-project
 ```
 
 ```powershell
-# Windows PowerShell — DO NOT use angle brackets, PowerShell reserves '<' as an operator
-iwr -useb https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/init_project.py | python - my-project
+# Windows PowerShell — recommended (uses install.ps1 wrapper)
+iex "& { $(iwr -useb https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/install.ps1) } my-project"
 ```
 
 You'll be prompted for the AgentsHive server URL (defaults to the Railway-hosted one) and your API key (or set `AGENTSHIVE_API_KEY` env to skip the prompt).
@@ -23,6 +23,52 @@ After init, in Zed's agent panel:
 - Other threads: *"You are a Coder for project `<slug>`. Read AGENTS.md."*
 
 The Hivemind orchestrates, Coders implement and ask the Hivemind (not you) when stuck. Pair this with the [`agentshive` skill](https://app.noticomax.com) for full protocol context inside Claude Code CLI.
+
+## Cross-device setup (v1.15+) — Windows + Mac + Linux + mobile
+
+AgentsHive is server-hosted on Railway, so the same dashboard, missions, and message queue are visible from any device with internet + an AgentsHive client. You can run a Hivemind Claude Desktop on Mac, Coder threads on Windows + Linux, and check progress from your phone in claude.ai/code — all on one mission.
+
+### Setting up a fresh machine
+
+Run the install one-liner from any project dir on the new device — same project slug as your other machines, same `AGENTSHIVE_API_KEY`:
+
+| Platform | One-liner |
+| --- | --- |
+| macOS / Linux | `curl -fsSL https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/install.sh \| bash -s -- my-project` |
+| Windows | `iex "& { $(iwr -useb https://raw.githubusercontent.com/Zecruu/ZecruAgentsHive/main/scripts/install.ps1) } my-project"` |
+
+The init script writes platform-aware Zed config, registers the project on the server (idempotent — running it on the second machine just no-ops), and prints `--role coder` boot prompts pre-filled with the local `os_hint` ("windows" / "macos" / "linux").
+
+### Per-machine Coder identity
+
+When you spawn a Coder thread on each device, pass an `os_hint` matching the local platform on every Coder-side tool call:
+
+```python
+ask_planner(question="…", coder_id="dell-xps-coder", os_hint="windows")
+submit_progress(summary="…", coder_id="dell-xps-coder", os_hint="windows")
+ask_planner(question="…", coder_id="macbook-pro-coder", os_hint="macos")
+```
+
+The dashboard's "Connected Coders" panel (v1.13+) now renders an OS icon next to each Coder:
+
+| Icon | Platform |
+| --- | --- |
+| 🪟 | Windows |
+| 🍎 | macOS |
+| 🐧 | Linux |
+| (none) | unknown / cloud Coder via OAuth (claude.ai web) |
+
+You can see at a glance which machine each Coder is on, sort by last-seen, watch live activity across devices.
+
+### Mobile / web Planner
+
+If you want to drive a mission from your phone, add the AgentsHive custom connector to claude.ai (Settings → Connectors → Add custom connector → `https://agentshive-production.up.railway.app/mcp?project=<slug>`). The v1.7+ OAuth flow handles auth without a bearer field; you sign in once and the Planner can create missions, answer questions, and review summaries from any browser.
+
+### Caveats
+
+- **Same project slug everywhere.** If your Windows machine uses `?project=foo` and your Mac uses `?project=bar`, they're invisible to each other — different namespaces. Run `agentshive init` with the SAME slug on each device, or set the slug in your dashboard before spawning Coders.
+- **The bearer key is shared.** All your devices use the same `AGENTSHIVE_API_KEY`. Rotate it (`railway variables --service agentshive --set ...`) if any machine is compromised, then re-run init on the survivors.
+- **No automatic device discovery yet.** Setting up a fresh machine is still a deliberate `install.sh` / `install.ps1` step. v1.16+ may add a `agentshive pair` flow that picks up your account-bound config from claude.ai.
 
 ## How it works
 

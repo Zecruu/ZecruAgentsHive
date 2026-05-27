@@ -139,6 +139,12 @@ class CoderHeartbeat(SQLModel, table=True):
     project_id: str = Field(foreign_key="project.id", primary_key=True)
     coder_id: str = Field(primary_key=True)
     last_seen: datetime = Field(default_factory=_utcnow)
+    # v1.15: device hint ("windows" | "macos" | "linux"). Surfaces on the
+    # Connected Coders dashboard panel as an OS icon so the user can tell at
+    # a glance which device each Coder is running on (useful when running
+    # Coders across Windows + Mac in one mission). Validated server-side
+    # against a strict allow-list; None means "unknown / cloud Coder".
+    os_hint: Optional[str] = Field(default=None)
 
 
 # --- v1.7 OAuth 2.1 storage ---------------------------------------------
@@ -472,6 +478,16 @@ def _apply_inline_migrations(engine: Engine) -> None:
             "CREATE INDEX IF NOT EXISTS ix_coderheartbeat_project_lastseen "
             "ON coderheartbeat(project_id, last_seen)"
         ))
+
+    # v1.15: os_hint column on coderheartbeat. Idempotent ALTER TABLE - inspect
+    # current columns and only ALTER if missing. Same pattern as v1.11's coder_id
+    # column additions. Nullable so legacy rows (pre-v1.15) stay valid.
+    v115_inspector = inspect(engine)
+    if "coderheartbeat" in v115_inspector.get_table_names():
+        existing_cols = {c["name"] for c in v115_inspector.get_columns("coderheartbeat")}
+        if "os_hint" not in existing_cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE coderheartbeat ADD COLUMN os_hint TEXT"))
 
 
 def get_engine() -> Engine:
