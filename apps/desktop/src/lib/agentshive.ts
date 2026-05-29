@@ -445,6 +445,14 @@ export function basename(p: string): string {
   return parts[parts.length - 1] || p;
 }
 
+/** The shell command for a command tool call (claude Bash / codex shell), else null. */
+export function toolCommand(call: ToolCallData): string | null {
+  const name = (call.name || '').split('__').pop() || call.name || '';
+  if (name !== 'Bash' && name !== 'shell') return null;
+  const cmd = (call.input as Record<string, unknown> | null)?.command;
+  return typeof cmd === 'string' && cmd ? cmd : null;
+}
+
 export function unwrapProjects(raw: { projects: Project[] } | Project[]): Project[] {
   if (Array.isArray(raw)) return raw;
   if (raw && Array.isArray(raw.projects)) return raw.projects;
