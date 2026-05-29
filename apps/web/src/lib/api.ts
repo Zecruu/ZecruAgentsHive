@@ -46,12 +46,59 @@ export interface WebMessage {
   created_at: string;
 }
 
+// v2.x Cloud Sync (opt-in) shapes — the durable synced transcript history.
+export interface Entitlements {
+  sub: string;
+  email: string | null;
+  plan: string;
+  cloud_sync: boolean;
+}
+export interface SyncToolCall {
+  id?: string;
+  name: string;
+  input?: unknown;
+  result?: unknown;
+  isError?: boolean;
+  completed?: boolean;
+}
+export interface SyncTokens {
+  input: number;
+  output: number;
+}
+export interface SyncMessage {
+  uuid: string;
+  idx: number;
+  role: 'user' | 'assistant' | 'system';
+  text: string;
+  tool_calls?: SyncToolCall[] | null;
+  tokens?: SyncTokens | null;
+  created_at?: string;
+  updated_at?: string;
+}
+export interface SyncConversation {
+  agent_id: string;
+  project_slug: string;
+  label: string | null;
+  role: string | null;
+  cli: string | null;
+  updated_at: string;
+  messages: SyncMessage[];
+}
+
 export const api = {
   agents: (): Promise<{ agents: WebAgent[] }> => webFetch('/web/agents'),
   conversation: (project: string, agentKey: string): Promise<{ messages: WebMessage[] }> =>
     webFetch(`/web/conversation?project=${encodeURIComponent(project)}&agent_key=${encodeURIComponent(agentKey)}`),
   send: (project: string, agentKey: string, body: string): Promise<WebMessage> =>
     webFetch('/web/message', { method: 'POST', body: JSON.stringify({ project, agent_key: agentKey, body }) }),
+  // Purge a consumed agent_to_web relay message (ephemeral relay — durable
+  // history lives in the synced transcript store, below).
+  relayAck: (messageId: string): Promise<{ ok?: boolean; error?: string }> =>
+    webFetch('/web/relay-ack', { method: 'POST', body: JSON.stringify({ message_id: messageId }) }),
+  // Cloud Sync: entitlements + the tenant's full synced transcript history.
+  me: (): Promise<Entitlements> => webFetch('/web/me'),
+  syncHistory: (): Promise<{ conversations?: SyncConversation[]; cursor?: string | null; gated?: boolean }> =>
+    webFetch('/web/sync/pull?project='),
 };
 
 export async function signIn(email: string, password: string): Promise<{ error: string | null }> {
