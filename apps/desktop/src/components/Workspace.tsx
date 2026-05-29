@@ -20,10 +20,6 @@ import { ProjectSidebar } from './ProjectSidebar';
 import { ProjectView } from './ProjectView';
 import { MissionsPanel } from './MissionsPanel';
 
-// Stable empty roster so the sidebar gets a referentially-stable array when no
-// project is active (avoids a new [] each render).
-const EMPTY_AGENTS: AgentRuntime[] = [];
-
 export function Workspace() {
   const [loaded, setLoaded] = useState(false);
   const [serverProjects, setServerProjects] = useState<Project[]>([]);
@@ -87,6 +83,13 @@ export function Workspace() {
   const onActiveRender = useCallback(() => forceRender(), []);
   const activeRt = activeSlug ? rtRegistry.current.get(activeSlug) ?? null : null;
 
+  // Live agents for EVERY open project (slug → roster), read from the registry.
+  // The sidebar uses this to show live status/activity for ALL projects, not just
+  // the active one (a backgrounded project's running agent shows "thinking · Ns"
+  // instead of looking dormant). Built fresh each render; cheap (a few entries).
+  const liveAgentsBySlug: Record<string, AgentRuntime[]> = {};
+  for (const [slug, rt] of rtRegistry.current) liveAgentsBySlug[slug] = rt.agents;
+
   // --- initial load: workspace state + server project list ---
   useEffect(() => {
     (async () => {
@@ -116,6 +119,28 @@ export function Workspace() {
   useEffect(() => {
     if (loaded) ah().workspace.set({ lastActive: activeSlug }).catch(() => {});
   }, [loaded, activeSlug]);
+
+  // Bounded live-status refresh for BACKGROUND projects. The active host bumps
+  // Workspace on every render (live chat), but a backgrounded in-flight project
+  // would otherwise look frozen in the sidebar. Poll the registry once a second
+  // and re-render while SOME open project has an in-flight turn — so the
+  // per-project elapsed timers + status advance at ~1Hz. Idle = no re-render, and
+  // it's a single bounded driver (not per-event), so multiple streaming projects
+  // never cause a re-render storm. (The memoized hosts don't re-render on a bump.)
+  // One trailing render on the in-flight→idle edge flushes the final "ready"
+  // status of a backgrounded project that just settled.
+  const tickerWasBusy = useRef(false);
+  useEffect(() => {
+    const id = setInterval(() => {
+      let busy = false;
+      for (const rt of rtRegistry.current.values()) {
+        if (rt.agents.some((a) => a.inFlight)) { busy = true; break; }
+      }
+      if (busy || tickerWasBusy.current) forceRender();
+      tickerWasBusy.current = busy;
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
 
   // --- handlers ---
   const expand = (slug: string) => setCollapsed((c) => ({ ...c, [slug]: false }));
@@ -230,7 +255,7 @@ export function Workspace() {
         activeSlug={activeSlug}
         activeCurrentId={activeRt?.currentId ?? null}
         collapsed={collapsed}
-        activeAgents={activeRt?.agents ?? EMPTY_AGENTS}
+        liveAgentsBySlug={liveAgentsBySlug}
         activeFolder={activeRt?.folder ?? null}
         serverProjects={serverProjects}
         refreshKey={refreshKey}

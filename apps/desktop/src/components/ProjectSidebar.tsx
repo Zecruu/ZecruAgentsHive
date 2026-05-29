@@ -53,8 +53,12 @@ interface RowAgent {
   cli: Cli;
   model: string | null;
   status: AgentStatus;
-  // Live activity for the ACTIVE project's agents (undefined for dormant ones).
+  // Live activity, present for ANY project with a mounted runtime (not just the
+  // active one). Undefined only for projects falling back to on-disk (dormant).
   activity?: AgentActivity;
+  // True when this row is backed by a live runtime (status dot reflects real
+  // state); false for the on-disk dormant fallback.
+  live: boolean;
 }
 
 interface Props {
@@ -62,7 +66,7 @@ interface Props {
   activeSlug: string | null;
   activeCurrentId: string | null; // which agent row is open in the chat pane
   collapsed: Record<string, boolean>;
-  activeAgents: AgentRuntime[]; // live agents for the active project
+  liveAgentsBySlug: Record<string, AgentRuntime[]>; // live agents per OPEN project
   activeFolder: string | null;
   serverProjects: Project[]; // all server projects (for the add panel)
   refreshKey: number; // bump to force inactive-agent reloads
@@ -86,7 +90,7 @@ export function ProjectSidebar(props: Props) {
     projects,
     activeSlug,
     collapsed,
-    activeAgents,
+    liveAgentsBySlug,
     activeFolder,
     serverProjects,
     refreshKey,
@@ -121,9 +125,14 @@ export function ProjectSidebar(props: Props) {
   }, [projects.map((p) => p.slug).join(','), activeSlug, refreshKey]);
 
   const rowsFor = (slug: string): RowAgent[] => {
-    if (slug === activeSlug) {
+    // Prefer the live runtime roster for ANY open project (every open project has
+    // a mounted ProjectRuntimeHost now), so a backgrounded project's running
+    // agent shows live "thinking · Ns" just like the active one. Fall back to the
+    // on-disk dormant list only during the brief pre-mount window.
+    const live = liveAgentsBySlug[slug];
+    if (live) {
       const now = Date.now();
-      return activeAgents.map((a) => ({
+      return live.map((a) => ({
         id: a.id,
         label: a.label,
         role: a.role,
@@ -131,6 +140,7 @@ export function ProjectSidebar(props: Props) {
         model: a.model,
         status: a.status,
         activity: agentActivity(a, now),
+        live: true,
       }));
     }
     return (inactiveAgents[slug] || []).map((d) => ({
@@ -140,6 +150,7 @@ export function ProjectSidebar(props: Props) {
       cli: d.cli,
       model: d.model || null,
       status: d.status === 'thinking' ? 'idle' : d.status || 'idle',
+      live: false,
     }));
   };
 
@@ -269,10 +280,13 @@ export function ProjectSidebar(props: Props) {
                               : isLead
                                 ? 'hover:bg-accent/10'
                                 : 'hover:bg-secondary/60',
-                            !isActive && 'opacity-60',
+                            // Dim only truly-dormant (on-disk fallback) rows — a
+                            // backgrounded project with a live runtime stays full
+                            // opacity so its live status reads clearly.
+                            !a.live && 'opacity-60',
                           )}
                         >
-                          <StatusDot status={a.status} live={isActive} />
+                          <StatusDot status={a.status} live={a.live} />
                           <AgentGlyph role={a.role} cli={a.cli} selected={selected} />
                           <div className="min-w-0 flex-1">
                             <div className="flex min-w-0 items-center gap-1.5">
