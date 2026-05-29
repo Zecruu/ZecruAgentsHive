@@ -11,6 +11,7 @@ import type { ActiveProject } from '@/lib/useActiveProject';
 import { cn } from '@/lib/utils';
 import { LauncherForm } from './LauncherForm';
 import { ChatPane } from './ChatPane';
+import { HivemindDashboard } from './HivemindDashboard';
 
 interface Props {
   project: Project;
@@ -38,6 +39,15 @@ export function ProjectView({ project, rt, maximized, onToggleMaximize, missions
               onPickFolder={rt.pickFolder}
             />
           </div>
+        ) : current.role === 'hivemind' ? (
+          <HivemindDashboard
+            project={project}
+            rt={rt}
+            maximized={maximized}
+            onToggleMaximize={onToggleMaximize}
+            missionsPanelOpen={missionsPanelOpen}
+            onToggleMissionsPanel={onToggleMissionsPanel}
+          />
         ) : (
           <ChatPane
             agent={current}
