@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { Archive, AtSign, ChevronRight, FilePen, FileText, Hexagon, ImageIcon, ListPlus, Loader2, Maximize2, MessageSquare, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, TerminalSquare, Wrench, X as XIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -250,6 +250,24 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   };
 
   const empty = agent.messages.length === 0;
+  // Per-TURN changed files: index of each turn's LAST entry → files that turn
+  // edited (aggregated across its split entries, deduped). Drives the docked bar.
+  const turnEndFiles: Record<number, string[]> = {};
+  {
+    const msgs = agent.messages;
+    let acc: ToolCallData[] = [];
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].role === 'user') { acc = []; continue; } // new turn — reset
+      const tc = msgs[i].toolCalls;
+      if (tc && tc.length) acc = acc.concat(tc);
+      const lastOfTurn = i === msgs.length - 1 || msgs[i + 1].role === 'user';
+      if (lastOfTurn) {
+        const cf = changedFiles(acc);
+        if (cf.length) turnEndFiles[i] = cf;
+        acc = [];
+      }
+    }
+  }
   // Per-agent usage: running total tokens (sum of per-turn input+output) + the
   // number of completed assistant turns.
   const usageTokens = agent.messages.reduce((sum, m) => sum + (m.tokens ? m.tokens.input + m.tokens.output : 0), 0);
@@ -444,7 +462,10 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
         ) : (
           <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
             {agent.messages.map((m, i) => (
-              <MessageBubble key={i} message={m} />
+              <Fragment key={i}>
+                <MessageBubble message={m} />
+                {turnEndFiles[i] && <ChangedFilesBar files={turnEndFiles[i]} />}
+              </Fragment>
             ))}
           </div>
         )}
@@ -706,14 +727,11 @@ function MessageBubble({ message }: { message: MessageRuntime }) {
 // A manual toggle overrides the auto behavior.
 function ToolCallGroup({ calls }: { calls: ToolCallData[] }) {
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
-  const [filesOpen, setFilesOpen] = useState(false);
   const total = calls.length;
   const running = calls.filter((c) => !c.completed).length;
   const errored = calls.filter((c) => c.completed && c.isError).length;
   const anyRunning = running > 0;
   const open = userToggled !== null ? userToggled : anyRunning;
-  // Cursor-style "N Files" changed-files summary for this tool group.
-  const changed = changedFiles(calls);
 
   const status: { variant: 'ok' | 'err' | 'warn'; label: string } =
     anyRunning ? { variant: 'warn', label: `${running} running…` }
@@ -735,36 +753,43 @@ function ToolCallGroup({ calls }: { calls: ToolCallData[] }) {
           {status.label}
         </Badge>
       </button>
-      {changed.length > 0 && (
-        <div className="mt-1">
-          <button
-            type="button"
-            onClick={() => setFilesOpen((v) => !v)}
-            className="flex w-full items-center gap-2 rounded-md border border-border/50 bg-input/30 px-3 py-1.5 text-left text-[11px] transition-colors hover:bg-secondary/30"
-            title="Files changed this step"
-          >
-            <FilePen className="h-3 w-3 shrink-0 text-accent" />
-            <span className="font-medium">{changed.length} file{changed.length > 1 ? 's' : ''} changed</span>
-            <span className="ml-auto text-muted-foreground">Review</span>
-            <ChevronRight className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', filesOpen && 'rotate-90')} />
-          </button>
-          {filesOpen && (
-            <div className="mt-1 space-y-0.5 pl-2.5">
-              {changed.map((p) => (
-                <div key={p} className="flex items-center gap-1.5 text-[11px]" title={p}>
-                  <FileText className="h-3 w-3 shrink-0 text-accent" />
-                  <span className="font-mono">{basename(p)}</span>
-                  <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground opacity-70">{p}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
       {open && (
         <div className="mt-1.5 space-y-1.5">
           {calls.map((tc) => (
             <ToolCallCard key={tc.id} call={tc} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Per-TURN aggregate changed-files bar (Cursor-style), docked at the end of a
+// turn: all files the turn EDITED/WROTE, deduped, with Review to expand the list.
+// (Undo/Keep is intentionally not here yet — gated, pending operator scope.)
+function ChangedFilesBar({ files }: { files: string[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mx-auto w-full max-w-4xl">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 rounded-md border border-border/60 bg-input/35 px-3 py-1.5 text-left text-[11px] transition-colors hover:bg-secondary/30"
+        title="Files changed this turn"
+      >
+        <FilePen className="h-3 w-3 shrink-0 text-accent" />
+        <span className="font-medium">{files.length} File{files.length > 1 ? 's' : ''}</span>
+        <span className="ml-auto text-muted-foreground">Review</span>
+        <ChevronRight className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', open && 'rotate-90')} />
+      </button>
+      {open && (
+        <div className="mt-1 space-y-0.5 pl-2.5">
+          {files.map((p) => (
+            <div key={p} className="flex items-center gap-1.5 text-[11px]" title={p}>
+              <FileText className="h-3 w-3 shrink-0 text-accent" />
+              <span className="font-mono">{basename(p)}</span>
+              <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground opacity-70">{p}</span>
+            </div>
           ))}
         </div>
       )}
