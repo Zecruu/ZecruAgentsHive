@@ -620,6 +620,20 @@ function EmptyChip({ icon, label }: { icon: React.ReactNode; label: string }) {
 }
 
 function MessageBubble({ message }: { message: MessageRuntime }) {
+  // FIX 2: a tool-group entry (tool calls + no text) renders as JUST the group —
+  // no empty assistant bubble. OLD persisted/Cloud-Sync-pulled messages that
+  // carry BOTH text and tool calls still render both (the normal path below), so
+  // existing/synced conversations are unchanged — no migration.
+  if (message.role === 'assistant' && (message.toolCalls?.length ?? 0) > 0 && !message.text) {
+    return (
+      <div className="animate-fade-up flex w-full justify-start">
+        <div className="w-full">
+          <ToolCallGroup calls={message.toolCalls!} />
+        </div>
+      </div>
+    );
+  }
+
   const roleClasses =
     message.role === 'user'
       ? 'text-primary bg-primary/15'

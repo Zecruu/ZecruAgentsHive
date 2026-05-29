@@ -546,8 +546,10 @@ export function useActiveProject(project: Project | null): ActiveProject {
     a.turnStartedAt = Date.now();
     a.lastEventAt = Date.now();
     a.messages.push({ role: 'system', text: 'Initializing — verifying scope + reading AGENTS.md…' });
-    a.messages.push({ role: 'assistant', text: '', toolCalls: [] });
-    a.streamingIdx = a.messages.length - 1;
+    // FIX 2: no pre-pushed empty assistant bubble — entries are created lazily on
+    // the first streamed block (the "thinking" state shows via the header
+    // activity indicator). Avoids an empty text bubble before a tool-first turn.
+    a.streamingIdx = null;
     rerender();
     startStreamingChatTurn(a, '', /* bootstrap */ true);
   };
@@ -568,8 +570,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
       claudePrompt = `${prompt}\n\n[Attached images — read these paths with the Read tool to view them:]\n${lines}`;
     }
 
-    a.messages.push({ role: 'assistant', text: '', toolCalls: [] });
-    a.streamingIdx = a.messages.length - 1;
+    a.streamingIdx = null; // FIX 2: lazy entry creation (no empty placeholder bubble)
     a.retryCount = 0;
     a.cancelRequested = false;
     a.inFlight = true;
@@ -729,8 +730,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
             persist(a);
             return;
           }
-          a.messages.push({ role: 'assistant', text: '', toolCalls: [] });
-          a.streamingIdx = a.messages.length - 1;
+          a.streamingIdx = null; // FIX 2: lazy entry creation on retry too
           a.status = 'thinking';
           // New attempt of the same logical turn — reset the elapsed timer.
           a.turnStartedAt = Date.now();
@@ -760,9 +760,16 @@ export function useActiveProject(project: Project | null): ActiveProject {
       if (a.webParent && slug) {
         const parent = a.webParent;
         a.webParent = undefined;
-        const lastAssist = [...a.messages].reverse().find((m) => m.role === 'assistant');
+        // FIX 2: entries are now split — the response text is the last assistant
+        // entry WITH text; count tool calls across this turn's entries (back to
+        // the last user message).
+        const lastAssist = [...a.messages].reverse().find((m) => m.role === 'assistant' && !!m.text);
         let body = (lastAssist?.text || '').trim();
-        const tc = lastAssist?.toolCalls?.length || 0;
+        let tc = 0;
+        for (let i = a.messages.length - 1; i >= 0; i--) {
+          if (a.messages[i].role === 'user') break;
+          tc += a.messages[i].toolCalls?.length || 0;
+        }
         if (tc) body += (body ? '\n\n' : '') + `[${tc} tool call${tc > 1 ? 's' : ''}]`;
         if (!body) body = '(no text response)';
         const token = getAccessToken();
@@ -874,8 +881,7 @@ A new message or question or summary is waiting. Do this in order:
 2. Call \`mcp__agentshive__wait_for_planner_message(timeout=5)\` once.
 3. If nothing meaningful was waiting, acknowledge briefly and stand by.`;
     target.messages.push({ role: 'user', text: wakePrompt });
-    target.messages.push({ role: 'assistant', text: '', toolCalls: [] });
-    target.streamingIdx = target.messages.length - 1;
+    target.streamingIdx = null; // FIX 2: lazy entry creation (no empty placeholder bubble)
     target.inFlight = true;
     target.status = 'thinking';
     target.turnStartedAt = Date.now();
@@ -896,14 +902,33 @@ A new message or question or summary is waiting. Do this in order:
     }
     if (ev.type === 'assistant' && ev.message) {
       const content = ev.message.content || [];
-      const cur = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
       for (const c of content) {
-        if (c.type === 'text' && cur) {
-          cur.text += c.text;
-        } else if (c.type === 'tool_use' && cur) {
+        if (c.type === 'text') {
+          // FIX 2: text lives in its own bubble. Append to the current OPEN text
+          // entry; if the open entry is a tool group (or nothing's open yet),
+          // start a NEW text entry — so text AFTER a tool call begins a fresh
+          // bubble, interleaved in order.
+          const open = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
+          const openIsText = !!open && open.role === 'assistant' && !(open.toolCalls && open.toolCalls.length > 0);
+          if (openIsText && open) {
+            open.text += c.text;
+          } else {
+            a.messages.push({ role: 'assistant', text: c.text, toolCalls: [] });
+            a.streamingIdx = a.messages.length - 1;
+          }
+        } else if (c.type === 'tool_use') {
           const tc: ToolCallData = { id: c.id, name: c.name, input: c.input, completed: false };
-          cur.toolCalls = cur.toolCalls || [];
-          cur.toolCalls.push(tc);
+          // FIX 2: CONSECUTIVE tool calls group into one entry (own bubble, no
+          // text); text resuming closes the group (handled above). The open entry
+          // is a tool group iff it has toolCalls and no text.
+          const open = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
+          const openIsToolGroup = !!open && open.role === 'assistant' && !!open.toolCalls && open.toolCalls.length > 0 && !open.text;
+          if (openIsToolGroup && open) {
+            open.toolCalls!.push(tc);
+          } else {
+            a.messages.push({ role: 'assistant', text: '', toolCalls: [tc] });
+            a.streamingIdx = a.messages.length - 1;
+          }
           a.toolMap.set(c.id, tc);
           // Auto-wake: when the active agent calls a routing tool aimed at
           // another sibling, fire a wake turn on the target if it's idle.
