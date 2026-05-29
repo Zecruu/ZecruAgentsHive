@@ -49,6 +49,9 @@ export interface AgentRuntime {
   turnStartedAt: number | null;
   lastEventAt: number | null;
   createdAt: string;
+  // v2.x Cloud Sync: a conversation materialized from another device's pulled
+  // transcript is view-only (no local session) — the composer is disabled.
+  readOnly?: boolean;
   messages: MessageRuntime[];
   // v2.x: follow-up messages queued while a turn is in-flight; auto-sent in order
   // when the current turn completes. In-memory (not persisted).
@@ -285,6 +288,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
           osHint: null,
           sessionId: null,
           status: 'idle',
+          readOnly: true, // materialized from another device — view-only
           createdAt: new Date().toISOString(),
           messages: sorted.map((m) => ({
             role: m.role,
@@ -1030,6 +1034,7 @@ function rehydrate(d: AgentData): AgentRuntime {
     inFlight: false,
     turnStartedAt: null,
     lastEventAt: null,
+    readOnly: Boolean(d.readOnly),
     createdAt: d.createdAt || new Date().toISOString(),
     messages: (d.messages || []).map((m) => ({
       role: m.role,
@@ -1061,6 +1066,7 @@ function serialize(a: AgentRuntime): AgentData {
     sessionId: a.sessionId,
     // Transient busy states never persist as busy.
     status: a.status === 'thinking' || a.status === 'rate-limited' ? 'idle' : a.status,
+    readOnly: a.readOnly,
     createdAt: a.createdAt,
     updatedAt: new Date().toISOString(),
     messages: a.messages.map((m) => {

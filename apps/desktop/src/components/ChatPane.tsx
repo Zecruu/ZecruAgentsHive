@@ -139,6 +139,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   const removePending = (idx: number) => setPending((p) => p.filter((_, i) => i !== idx));
 
   const send = async () => {
+    if (agent.readOnly) return; // view-only conversation materialized from another device
     const t = draft.trim();
     if (busy) return;
     // P4: while a turn is in-flight, Enter/Send QUEUES the follow-up (text only)
@@ -294,6 +295,9 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
           </code>
         </div>
         <div className="flex items-center gap-2">
+          {agent.readOnly && (
+            <Badge variant="muted" className="normal-case">from another device · read-only</Badge>
+          )}
           {usageTurns > 0 && (
             <span
               className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground"
@@ -531,7 +535,8 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             onChange={(e) => onDraftChange(e.target.value)}
             onKeyDown={handleKey}
             onPaste={onPaste}
-            placeholder={dragOver ? 'Drop image to attach…' : `Message ${agent.label} — Enter to send, Shift+Enter for newline · paste/drop images`}
+            disabled={agent.readOnly}
+            placeholder={agent.readOnly ? 'Read-only — this conversation was synced from another device.' : dragOver ? 'Drop image to attach…' : `Message ${agent.label} — Enter to send, Shift+Enter for newline · paste/drop images`}
             className="min-h-[64px] max-h-[480px] resize-y border-0 bg-transparent p-1 shadow-none focus-visible:ring-0 focus-visible:border-0"
             rows={3}
           />
@@ -539,8 +544,8 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             <Button
               size="sm"
               onClick={send}
-              disabled={busy || (!draft.trim() && (agent.inFlight || pending.length === 0))}
-              title={agent.inFlight ? 'Queue this message — sends when the current turn finishes' : 'Send'}
+              disabled={agent.readOnly || busy || (!draft.trim() && (agent.inFlight || pending.length === 0))}
+              title={agent.readOnly ? 'Read-only — synced from another device' : agent.inFlight ? 'Queue this message — sends when the current turn finishes' : 'Send'}
             >
               {agent.inFlight ? <ListPlus className="h-3.5 w-3.5" /> : <Send className="h-3.5 w-3.5" />}
               {busy ? 'Saving…' : agent.inFlight ? 'Queue' : 'Send'}

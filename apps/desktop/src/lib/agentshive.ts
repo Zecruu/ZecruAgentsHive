@@ -123,6 +123,10 @@ export interface AgentData {
   createdAt?: string;
   updatedAt?: string;
   messages: MessageData[];
+  // v2.x Cloud Sync: true for a conversation materialized from ANOTHER device's
+  // pulled transcript — view-only (no local session/model), so the composer is
+  // disabled to avoid forking a fresh local session.
+  readOnly?: boolean;
 }
 
 export interface LaunchPayload {
