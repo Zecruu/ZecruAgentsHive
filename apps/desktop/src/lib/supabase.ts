@@ -46,14 +46,22 @@ export const supabase: SupabaseClient | null = supabaseConfigured
 let _accessToken: string | null = null;
 let _hasSession = false;
 
+// Push the token to the main process (for tenant-correct dashboard reads) on
+// every change. Keeps main's cache in sync with the renderer's live session.
+function _pushTokenToMain(token: string | null) {
+  try { (window as any).agentshive?.auth?.setToken(token); } catch { /* ignore */ }
+}
+
 if (supabase) {
   supabase.auth.getSession().then(({ data }) => {
     _accessToken = data.session?.access_token ?? null;
     _hasSession = Boolean(data.session);
+    _pushTokenToMain(_accessToken);
   });
   supabase.auth.onAuthStateChange((_event, session) => {
     _accessToken = session?.access_token ?? null;
     _hasSession = Boolean(session);
+    _pushTokenToMain(_accessToken);
   });
 }
 

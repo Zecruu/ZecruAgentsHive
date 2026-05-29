@@ -91,6 +91,11 @@ contextBridge.exposeInMainWorld('agentshive', {
     hostname: () => ipcRenderer.invoke('app:hostname'),
     version: () => ipcRenderer.invoke('app:version'),
   },
+  auth: {
+    // Push the operator's Supabase access token to main (or null on sign-out) so
+    // dashboard reads can be tenant-correct. Fire-and-forget.
+    setToken: (token) => ipcRenderer.invoke('auth:setToken', { token }),
+  },
   authStore: {
     get: (key) => ipcRenderer.invoke('authstore:get', { key }),
     set: (key, value) => ipcRenderer.invoke('authstore:set', { key, value }),

@@ -245,6 +245,9 @@ declare global {
         hostname: () => Promise<string>;
         version: () => Promise<string>;
       };
+      auth: {
+        setToken: (token: string | null) => Promise<{ ok: boolean }>;
+      };
       authStore: {
         get: (key: string) => Promise<string | null>;
         set: (key: string, value: string) => Promise<{ ok: boolean }>;

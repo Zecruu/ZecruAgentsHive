@@ -117,6 +117,21 @@ async function apiFetch(pathAndQuery, init = {}) {
   return parsed;
 }
 
+// v2.x: the operator's Supabase access token, pushed from the renderer on every
+// auth change (auth:setToken). Lets main-process dashboard READS (missions
+// export + the cross-machine state poll) query the operator's OWN tenant when
+// signed in — the dashboard endpoints now accept a Supabase JWT. Falls back to
+// the legacy shared key when signed out. Keeps the renderer IPC signatures
+// unchanged (callers don't pass a token).
+let _supabaseToken = null;
+
+// A dashboard GET that uses the operator's Supabase tenant when signed in, else
+// the legacy shared key.
+function dashboardFetch(pathAndQuery) {
+  if (_supabaseToken) return adminApiFetch('GET', pathAndQuery, _supabaseToken);
+  return apiFetch(pathAndQuery);
+}
+
 // Build the env vars an agent CLI needs to talk to AgentsHive for this
 // project. Returns a plain object — callers compose into spawn env.
 function agentEnv({ projectSlug, coderId, osHint, authToken, requireAuthToken }) {
@@ -1177,7 +1192,7 @@ function openExternalTerminalWithCommand(cmd) {
 }
 
 ipcMain.handle('dashboard:state', async (_e, { projectSlug }) => {
-  return apiFetch(`/api/dashboard/state?project=${encodeURIComponent(projectSlug)}`);
+  return dashboardFetch(`/api/dashboard/state?project=${encodeURIComponent(projectSlug)}`);
 });
 
 // --- v2.x admin/superuser API (routed through main so the admin's Supabase
@@ -1297,7 +1312,7 @@ function _renderFoundationMd(project, foundation) {
 // server-side; uses the legacy-key apiFetch like the other dashboard reads.
 ipcMain.handle('missions:export', async (_e, { projectSlug }) => {
   if (!projectSlug) return { project: null, foundation: null, missions: [] };
-  return apiFetch(`/api/dashboard/missions/export?project=${encodeURIComponent(projectSlug)}`);
+  return dashboardFetch(`/api/dashboard/missions/export?project=${encodeURIComponent(projectSlug)}`);
 });
 
 ipcMain.handle('missions:syncDocs', async (_e, { projectSlug }) => {
@@ -1354,6 +1369,14 @@ ipcMain.handle('app:hostname', () => os.hostname());
 // header version badge so it always matches the deployed release — no manual
 // bump of a hardcoded string.
 ipcMain.handle('app:version', () => app.getVersion());
+
+// Renderer pushes the operator's Supabase access token here on every auth change
+// (and clears it on sign-out) so dashboard reads can be tenant-correct. Cached in
+// main; never returned to the renderer.
+ipcMain.handle('auth:setToken', (_e, { token }) => {
+  _supabaseToken = (token && String(token)) || null;
+  return { ok: true };
+});
 
 // --- durable auth store (Supabase session persistence across updates) -------
 // The renderer's localStorage for a file:// origin is not a reliable home for
