@@ -371,10 +371,15 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
           events.push({ id, kind, target: getTarget(x), from: getFrom(x) });
         }
       };
-      push(state.p2c, 'p2c', (m) => m.target_coder_id, () => null);
-      push(state.c2p, 'c2p', () => null, (m) => m.coder_id);
-      push(state.pending_q, 'question', () => null, (q) => q.coder_id);
-      push(state.pending_s, 'summary', () => null, (s) => s.coder_id);
+      // Match the actual server JSON keys (dashboard.py:331-333). Reading the old
+      // pending_q/pending_s/p2c/c2p names returned undefined → Array.isArray failed
+      // → every q/s/p2c/c2p wake branch was a silent no-op (the reason the operator
+      // kept having to manually poke the Planner — this matches the live-verified
+      // bug found before 2.0.20).
+      push(state.messages?.planner_to_coder, 'p2c', (m) => m.target_coder_id, () => null);
+      push(state.messages?.coder_to_planner, 'c2p', () => null, (m) => m.coder_id);
+      push(state.pending_questions, 'question', () => null, (q) => q.coder_id);
+      push(state.pending_summaries, 'summary', () => null, (s) => s.coder_id);
       push(state.inbox, 'p2c', (m) => m.target_coder_id, () => null);
       // A newly-active mission (e.g. created from a remote Planner like the
       // Claude app) should wake local Coders. We key the event on the mission
@@ -466,8 +471,11 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
       try { state = await ah().dashboard.state(slug); } catch { return; }
       if (stopped) return;
       const ids: string[] = [];
-      if (Array.isArray(state.pending_q)) for (const q of state.pending_q) ids.push('q:' + (q.id ?? q.created_at ?? ''));
-      if (Array.isArray(state.pending_s)) for (const s of state.pending_s) ids.push('s:' + (s.id ?? s.created_at ?? ''));
+      // Match the server JSON keys (dashboard.py:331-332). The earlier
+      // pending_q/pending_s names were undefined → the signature was always empty
+      // → ffe902c's wake never fired. Reading the right names is the fix.
+      if (Array.isArray(state.pending_questions)) for (const q of state.pending_questions) ids.push('q:' + (q.id ?? q.created_at ?? ''));
+      if (Array.isArray(state.pending_summaries)) for (const s of state.pending_summaries) ids.push('s:' + (s.id ?? s.created_at ?? ''));
       const sig = ids.sort().join('|');
       if (!sig) { lastWake = null; return; } // no pending work — re-arm immediately on the next item
       const changed = !lastWake || lastWake.sig !== sig;

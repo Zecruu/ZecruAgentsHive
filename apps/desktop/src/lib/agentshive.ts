@@ -41,10 +41,16 @@ export interface PendingSummaryLite {
 
 export interface DashboardState {
   active_mission?: unknown;
-  pending_q?: PendingQuestionLite[];
-  pending_s?: PendingSummaryLite[];
-  c2p?: InboxMessageLite[];
-  p2c?: InboxMessageLite[];
+  // Field names match the server JSON keys (dashboard.py:_build_state_payload).
+  // Earlier code read pending_q/pending_s/p2c/c2p which were UNDEFINED in the
+  // response — silently disabling every dashboard-poll wake branch + the ffe902c
+  // Planner-wake signature. Reading the right names is the fix.
+  pending_questions?: PendingQuestionLite[];
+  pending_summaries?: PendingSummaryLite[];
+  messages?: {
+    coder_to_planner?: InboxMessageLite[];
+    planner_to_coder?: InboxMessageLite[];
+  };
   connected_coders?: Array<{ coder_id: string; last_seen?: string; os_hint?: string | null }>;
   inbox?: InboxMessageLite[];
   // ... server returns more; we tolerate unknown fields
