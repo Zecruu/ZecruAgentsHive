@@ -209,6 +209,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             or path.startswith("/admin/")
             # v2.x companion-webapp router: Supabase-JWT, _web_guard per handler.
             or path.startswith("/web/")
+            # v2.x: the companion webapp's static bundle at /app is public (just
+            # HTML/JS/CSS); its data calls go to the JWT-guarded /web/* router.
+            or path == "/app"
+            or path.startswith("/app/")
         ):
             return await call_next(request)
         header = request.headers.get("authorization", "")

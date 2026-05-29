@@ -1,9 +1,12 @@
 import os
+from pathlib import Path
 
 import uvicorn
 from fastmcp import FastMCP
+from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
 from .admin import register_admin_routes
 from .auth import BearerAuthMiddleware, ProjectContextMiddleware, TenantContextMiddleware, WebCorsMiddleware
@@ -13,6 +16,35 @@ from .db import init_engine
 from .oauth import AgentsHiveOAuthProvider
 from .tools import register_tools
 from .web import register_web_routes
+
+
+class _SPAStaticFiles(StaticFiles):
+    """StaticFiles that falls back to index.html on a 404 (SPA client routing).
+
+    Serves real assets normally; any unknown path under the mount returns the
+    app shell so client-side routes resolve. Safe for our same-origin webapp.
+    """
+
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
+
+
+def _webapp_dist_dir() -> Path:
+    """Where the built companion webapp (apps/web) lives on the deployed FS.
+
+    Overridable via AGENTSHIVE_WEBAPP_DIST; defaults to <repo-root>/apps/web/dist
+    (this file is src/agentshive/main.py, so parents[2] is the repo root). The
+    Railway build is responsible for producing dist/ there.
+    """
+    override = os.environ.get("AGENTSHIVE_WEBAPP_DIST")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[2] / "apps" / "web" / "dist"
 
 
 def build_app():
@@ -69,6 +101,18 @@ def build_app():
     # handler wrapped in _web_guard. In PUBLIC_PATHS so the user's/desktop's
     # Supabase token reaches the per-handler gate (not the legacy shared key).
     register_web_routes(app, settings)
+
+    # v2.x: serve the built companion webapp (apps/web) as static files at /app
+    # (same origin → its /web/* data calls work with no CORS). Mounted only when
+    # the build is present, so a server without a built webapp (local/dev) is
+    # unaffected. /app is exempted in BearerAuthMiddleware (static is public; the
+    # webapp's data calls hit the already-public, JWT-guarded /web/* router). The
+    # /app prefix can't shadow /api, /web, /admin, /mcp, /oauth, or /dashboard.
+    dist_dir = _webapp_dist_dir()
+    if dist_dir.is_dir():
+        app.router.routes.append(
+            Mount("/app", app=_SPAStaticFiles(directory=str(dist_dir), html=True), name="webapp")
+        )
 
     # Middleware order (Starlette wraps in LIFO, so add the innermost LAST):
     #   1. ProjectContextMiddleware + TenantContextMiddleware (added last → wrap

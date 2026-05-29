@@ -3,7 +3,10 @@ import { createClient, type Session } from '@supabase/supabase-js';
 const env = (import.meta as any).env || {};
 const SUPABASE_URL: string = env.VITE_SUPABASE_URL || '';
 const SUPABASE_ANON: string = env.VITE_SUPABASE_ANON_KEY || '';
-const BASE: string = (env.VITE_AGENTSHIVE_URL || 'http://localhost:8000').replace(/\/$/, '');
+// `??` (not `||`) so an explicit empty VITE_AGENTSHIVE_URL='' means SAME-ORIGIN
+// (relative /web/* fetches — used when the webapp is served from the agentshive
+// server itself). An UNSET var still defaults to localhost:8000 for local dev.
+const BASE: string = (env.VITE_AGENTSHIVE_URL ?? 'http://localhost:8000').replace(/\/$/, '');
 
 export const supabaseReady = Boolean(SUPABASE_URL && SUPABASE_ANON);
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON, {
