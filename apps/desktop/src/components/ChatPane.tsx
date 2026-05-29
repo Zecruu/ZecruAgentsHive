@@ -281,6 +281,15 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   // number of completed assistant turns.
   const usageTokens = agent.messages.reduce((sum, m) => sum + (m.tokens ? m.tokens.input + m.tokens.output : 0), 0);
   const usageTurns = agent.messages.filter((m) => m.role === 'assistant' && m.tokens).length;
+  // CONTEXT FILL = the LATEST turn's total input (incl. cache_read), point-in-time
+  // — what the CLI shows as "% context used". The headline; the cumulative session
+  // total above goes in the tooltip. Window % only when we KNOW the model's window.
+  let latestContext = 0;
+  for (let i = agent.messages.length - 1; i >= 0; i--) {
+    const c = agent.messages[i].tokens?.context;
+    if (typeof c === 'number' && c > 0) { latestContext = c; break; }
+  }
+  const ctxWindow = contextWindowFor(agent.model);
   // Live activity: while in-flight, show the current action + a ticking elapsed
   // timer (the parent re-renders every second via the hook's activity ticker),
   // so a long tool call / long generation reads as ALIVE rather than frozen.
@@ -340,12 +349,12 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
           {agent.readOnly && (
             <Badge variant="muted" className="normal-case">from another device · read-only</Badge>
           )}
-          {usageTurns > 0 && (
+          {latestContext > 0 && (
             <span
               className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground"
-              title={`${usageTokens.toLocaleString()} tokens across ${usageTurns} turn${usageTurns > 1 ? 's' : ''} this session`}
+              title={`Context: ${latestContext.toLocaleString()} tokens${ctxWindow ? ` of ~${ctxWindow.toLocaleString()}` : ''}\nSession: ${usageTokens.toLocaleString()} new tokens across ${usageTurns} turn${usageTurns > 1 ? 's' : ''}`}
             >
-              {fmtTokens(usageTokens)} tok · {usageTurns} turn{usageTurns > 1 ? 's' : ''}
+              {fmtTokens(latestContext)} ctx{ctxWindow ? ` · ${Math.round((latestContext / ctxWindow) * 100)}%` : ''}
             </span>
           )}
           {statusBadge}
@@ -439,12 +448,12 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             <span className="truncate">Next turn uses current model settings; in-flight work keeps its launch settings.</span>
           </div>
           <div className="hidden shrink-0 items-center gap-2 lg:flex">
-            {usageTurns > 0 && (
+            {latestContext > 0 && (
               <span
                 className="rounded-full border border-border bg-input/55 px-2.5 py-1 text-[10px] font-medium text-muted-foreground"
-                title={`${usageTokens.toLocaleString()} tokens across ${usageTurns} turn${usageTurns > 1 ? 's' : ''} this session`}
+                title={`Context: ${latestContext.toLocaleString()} tokens${ctxWindow ? ` of ~${ctxWindow.toLocaleString()}` : ''}\nSession: ${usageTokens.toLocaleString()} new tokens across ${usageTurns} turn${usageTurns > 1 ? 's' : ''}`}
               >
-                {fmtTokens(usageTokens)} tok / {usageTurns} turn{usageTurns > 1 ? 's' : ''}
+                {fmtTokens(latestContext)} ctx{ctxWindow ? ` · ${Math.round((latestContext / ctxWindow) * 100)}%` : ''}
               </span>
             )}
             {statusBadge}
@@ -638,6 +647,15 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
       </div>
     </div>
   );
+}
+
+// Known context-window sizes by model. Only Claude 4.x is confirmed (200k) — for
+// unknown models (codex/gpt-5, window unconfirmed) we return null and show the raw
+// context size with NO % rather than guess. Matched by model-id substring.
+function contextWindowFor(model: string | null): number | null {
+  const m = (model || '').toLowerCase();
+  if (m.includes('opus') || m.includes('sonnet') || m.includes('haiku')) return 200_000;
+  return null;
 }
 
 // Compact token count: 850 → "850", 4200 → "4.2k", 1_500_000 → "1.5M".

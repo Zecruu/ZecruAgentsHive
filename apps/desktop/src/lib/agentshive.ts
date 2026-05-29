@@ -89,11 +89,15 @@ export interface AttachmentData {
   mime: string;
 }
 
-// Token usage for one turn (the result event's usage). input folds in the
-// cache creation/read input tokens so it reflects real input volume.
+// Token usage for one turn (the result event's usage).
+// - input/output: NEW tokens that turn (input excludes cache_read) — summed
+//   across turns for the cumulative session total.
+// - context: the turn's TOTAL input incl. cache_read = the point-in-time context
+//   FILL (what the CLIs show as "% context used"); NOT summed across turns.
 export interface TokenUsage {
   input: number;
   output: number;
+  context?: number;
 }
 
 export interface MessageData {

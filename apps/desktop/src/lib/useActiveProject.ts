@@ -966,15 +966,15 @@ A new message or question or summary is waiting. Do this in order:
       const cur = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
       if (cur && ev.usage) {
         const u = ev.usage;
-        // NEW tokens this turn only: fresh input + tokens newly written to cache.
-        // Deliberately EXCLUDE cache_read_input_tokens — that's the whole cached
-        // conversation context RE-READ every turn (it grows with the conversation),
-        // so summing it across turns compounds into bogus millions. ev.usage is
-        // per-turn (each `claude --print` invocation reports its own), so the
-        // running header total = Σ(new input + output) stays accurate.
+        // NEW tokens this turn (input excludes cache_read — that's the whole
+        // cached context RE-READ every turn; summing it compounds to bogus
+        // millions). Summed across turns for the cumulative session total.
+        // `context` = the turn's TOTAL input incl. cache_read = the point-in-time
+        // CONTEXT FILL the CLIs show; used as the LATEST value, never summed.
         cur.tokens = {
           input: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0),
           output: u.output_tokens || 0,
+          context: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0),
         };
         rerender();
       }
