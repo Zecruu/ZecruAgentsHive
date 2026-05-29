@@ -1430,7 +1430,9 @@ function setupAutoUpdater() {
 // Renderer asks to install the downloaded update + relaunch into the new version.
 ipcMain.handle('update:quitAndInstall', () => {
   if (!app.isPackaged) return;
-  autoUpdater.quitAndInstall();
+  // (isSilent, isForceRunAfter): silent runs the one-click NSIS installer with no
+  // wizard UI, forceRunAfter relaunches into the new version — Zed-style close+reopen.
+  autoUpdater.quitAndInstall(true, true);
 });
 
 // --- window ---------------------------------------------------------------

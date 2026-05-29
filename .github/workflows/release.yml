@@ -68,6 +68,14 @@ jobs:
         # electron-builder packages dist/** (the vite output); it does NOT run
         # vite itself, so build the renderer first or the app ships empty.
         run: npm run build
+        env:
+          # Vite bakes these into the renderer bundle (publishable client values).
+          # Sourced from repo Actions variables — the gitignored .env.local that
+          # holds them locally is NOT on the CI runner, which is why the 2.0.1 CI
+          # build shipped with Supabase UNCONFIGURED (no sign-in button). Set repo
+          # vars VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY so signed-in auth works.
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
 
       - name: Package + publish (electron-builder)
         run: npx --no-install electron-builder --${{ matrix.platform }} --publish always
