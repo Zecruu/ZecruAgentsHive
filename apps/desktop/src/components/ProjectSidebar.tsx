@@ -14,13 +14,17 @@
 
 import { useEffect, useState } from 'react';
 import {
+  Bot,
   ChevronDown,
   ChevronRight,
+  Code2,
+  Crown,
   ExternalLink,
   FolderOpen,
   Loader2,
   Plus,
   RefreshCw,
+  TerminalSquare,
   X,
   Zap,
 } from 'lucide-react';
@@ -253,6 +257,7 @@ export function ProjectSidebar(props: Props) {
                   {rows.map((a) => {
                     const selected = isActive && props.activeCurrentId === a.id;
                     const canWake = isActive && (a.status === 'idle' || a.status === 'ready' || a.status === 'err');
+                    const isLead = a.role === 'hivemind';
                     return (
                       <li key={a.id}>
                         <button
@@ -261,13 +266,25 @@ export function ProjectSidebar(props: Props) {
                             'group/agent flex w-full items-center gap-2 rounded-md border border-transparent px-2 py-1.5 text-left transition-all',
                             selected
                               ? 'bg-gradient-to-b from-primary/10 to-primary/0 border-primary/40 ring-glow-primary'
-                              : 'hover:bg-secondary/60',
+                              : isLead
+                                ? 'hover:bg-accent/10'
+                                : 'hover:bg-secondary/60',
                             !isActive && 'opacity-60',
                           )}
                         >
                           <StatusDot status={a.status} live={isActive} />
+                          <AgentGlyph role={a.role} cli={a.cli} selected={selected} />
                           <div className="min-w-0 flex-1">
-                            <div className="truncate text-[13px] font-medium tracking-tight">{a.label}</div>
+                            <div className="flex min-w-0 items-center gap-1.5">
+                              <span className={cn('truncate text-[13px] font-medium tracking-tight', isLead && 'font-semibold text-accent')}>
+                                {a.label}
+                              </span>
+                              {isLead && (
+                                <span className="rounded-full border border-accent/25 bg-accent/10 px-1.5 py-0.5 text-[8.5px] font-semibold uppercase tracking-wide text-accent">
+                                  lead
+                                </span>
+                              )}
+                            </div>
                             {a.activity && a.activity.elapsedSec != null ? (
                               <div className={cn('flex items-center gap-1 truncate text-[10px]', a.activity.stalled ? 'text-warn' : 'text-accent')}>
                                 <Loader2 className="h-2.5 w-2.5 flex-none animate-spin" />
@@ -368,6 +385,35 @@ function StatusDot({ status, live }: { status: AgentStatus; live: boolean }) {
       className={cn('h-2 w-2 flex-none rounded-full', cls)}
       style={live ? { boxShadow: '0 0 6px -1px currentColor' } : undefined}
     />
+  );
+}
+
+function AgentGlyph({ role, cli, selected }: { role: Role; cli: Cli; selected: boolean }) {
+  const Icon = role === 'hivemind' ? Crown : cli === 'codex' ? TerminalSquare : cli === 'claude' ? Bot : Code2;
+  const title =
+    role === 'hivemind'
+      ? 'Hivemind / Planner'
+      : cli === 'codex'
+        ? 'Coder · Codex'
+        : cli === 'claude'
+          ? 'Coder · Claude'
+          : 'Coder';
+
+  return (
+    <span
+      className={cn(
+        'flex h-6 w-6 flex-none items-center justify-center rounded-md border transition-colors',
+        role === 'hivemind'
+          ? 'border-accent/35 bg-accent/10 text-accent'
+          : cli === 'codex'
+            ? 'border-primary/30 bg-primary/10 text-primary'
+            : 'border-border bg-input/65 text-muted-foreground',
+        selected && 'bg-background/35',
+      )}
+      title={title}
+    >
+      <Icon className="h-3.5 w-3.5" />
+    </span>
   );
 }
 
