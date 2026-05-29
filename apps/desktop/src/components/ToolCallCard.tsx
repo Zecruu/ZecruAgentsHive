@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { ChevronRight, FileText, Loader2, TerminalSquare } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
-import { basename, toolCommand, toolFileTarget, type ToolCallData } from '@/lib/agentshive';
+import { basename, editStats, toolCommand, toolFileTarget, type ToolCallData } from '@/lib/agentshive';
 
 interface Props {
   call: ToolCallData;
@@ -13,6 +13,7 @@ export function ToolCallCard({ call }: Props) {
   const status = !call.completed ? 'running' : call.isError ? 'err' : 'ok';
   const variant = status === 'ok' ? 'ok' : status === 'err' ? 'err' : 'muted';
   const file = toolFileTarget(call);
+  const stats = file && file.changed ? editStats(call) : null;
   const cmd = toolCommand(call);
   const inputPreview = oneLine(call.input);
   const resultText = typeof call.result === 'string' ? call.result : JSON.stringify(call.result ?? null, null, 2);
@@ -46,6 +47,13 @@ export function ToolCallCard({ call }: Props) {
               >
                 <FileText className="h-2.5 w-2.5" />
                 {basename(file.path)}
+              </span>
+            )}
+            {stats && (stats.added > 0 || stats.removed > 0) && (
+              <span className="shrink-0 font-mono text-[10px]" title={`${stats.added} insertion(s), ${stats.removed} deletion(s)`}>
+                {stats.added > 0 && <span className="text-success">+{stats.added}</span>}
+                {stats.added > 0 && stats.removed > 0 && ' '}
+                {stats.removed > 0 && <span className="text-destructive">-{stats.removed}</span>}
               </span>
             )}
             <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">{file ? '' : inputPreview}</span>

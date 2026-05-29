@@ -6,7 +6,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
-import { ah, MODEL_OPTIONS, EFFORT_OPTIONS, basename, changedFiles, type AttachmentData, type SkillItem, type ToolCallData } from '@/lib/agentshive';
+import { ah, MODEL_OPTIONS, EFFORT_OPTIONS, basename, changedFilesWithStats, type AttachmentData, type FileChange, type SkillItem, type ToolCallData } from '@/lib/agentshive';
 import { agentActivity, formatActivity, type AgentRuntime, type MessageRuntime } from '@/lib/useActiveProject';
 import { ToolCallCard } from './ToolCallCard';
 import { MarkdownBody } from './Markdown';
@@ -262,7 +262,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   const empty = agent.messages.length === 0;
   // Per-TURN changed files: index of each turn's LAST entry → files that turn
   // edited (aggregated across its split entries, deduped). Drives the docked bar.
-  const turnEndFiles: Record<number, string[]> = {};
+  const turnEndFiles: Record<number, FileChange[]> = {};
   {
     const msgs = agent.messages;
     let acc: ToolCallData[] = [];
@@ -272,7 +272,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
       if (tc && tc.length) acc = acc.concat(tc);
       const lastOfTurn = i === msgs.length - 1 || msgs[i + 1].role === 'user';
       if (lastOfTurn) {
-        const cf = changedFiles(acc);
+        const cf = changedFilesWithStats(acc);
         if (cf.length) turnEndFiles[i] = cf;
         acc = [];
       }
@@ -800,7 +800,7 @@ function ToolCallGroup({ calls }: { calls: ToolCallData[] }) {
 // turn: all files the turn EDITED/WROTE, deduped. Review expands the list; Undo
 // reverts them to git HEAD (git-repo-gated, current contents backed up first);
 // Keep dismisses the bar.
-function ChangedFilesBar({ files, projectSlug, canUndo }: { files: string[]; projectSlug: string; canUndo: boolean }) {
+function ChangedFilesBar({ files, projectSlug, canUndo }: { files: FileChange[]; projectSlug: string; canUndo: boolean }) {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<'idle' | 'undoing' | 'reverted' | 'error'>('idle');
   const [note, setNote] = useState<string | null>(null);
@@ -812,7 +812,7 @@ function ChangedFilesBar({ files, projectSlug, canUndo }: { files: string[]; pro
     if (!canUndo || state === 'undoing' || state === 'reverted') return;
     setState('undoing');
     try {
-      const r = await ah().files.undoEdits(projectSlug, files);
+      const r = await ah().files.undoEdits(projectSlug, files.map((f) => f.path));
       if (r.ok) {
         setState('reverted');
         setNote(r.skipped && r.skipped.length ? `${r.skipped.length} untracked skipped` : null);
@@ -867,11 +867,18 @@ function ChangedFilesBar({ files, projectSlug, canUndo }: { files: string[]; pro
       </div>
       {open && (
         <div className="mt-1 space-y-0.5 pl-2.5">
-          {files.map((p) => (
-            <div key={p} className="flex items-center gap-1.5 text-[11px]" title={p}>
+          {files.map((f) => (
+            <div key={f.path} className="flex items-center gap-1.5 text-[11px]" title={f.path}>
               <FileText className="h-3 w-3 shrink-0 text-accent" />
-              <span className="font-mono">{basename(p)}</span>
-              <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground opacity-70">{p}</span>
+              <span className="font-mono">{basename(f.path)}</span>
+              {(f.added > 0 || f.removed > 0) && (
+                <span className="shrink-0 font-mono text-[10px]">
+                  {f.added > 0 && <span className="text-success">+{f.added}</span>}
+                  {f.added > 0 && f.removed > 0 && ' '}
+                  {f.removed > 0 && <span className="text-destructive">-{f.removed}</span>}
+                </span>
+              )}
+              <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground opacity-70">{f.path}</span>
             </div>
           ))}
         </div>

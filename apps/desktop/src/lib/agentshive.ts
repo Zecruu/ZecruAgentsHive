@@ -460,6 +460,59 @@ export function changedFiles(calls: ToolCallData[]): string[] {
   return out;
 }
 
+// Line-count diff for an edit tool call. Edit = old→new line delta; MultiEdit =
+// summed over edits[]; Write = new content as all-insertions. A sensible
+// line-count delta (not a true LCS diff) — enough for the "+N -M" affordance.
+export interface EditStat {
+  added: number;
+  removed: number;
+}
+function _lineCount(s: unknown): number {
+  return typeof s === 'string' && s.length ? s.split('\n').length : 0;
+}
+export function editStats(call: ToolCallData): EditStat | null {
+  const name = (call.name || '').split('__').pop() || call.name || '';
+  const input = (call.input || {}) as Record<string, any>;
+  if (name === 'Edit') {
+    return { removed: _lineCount(input.old_string), added: _lineCount(input.new_string) };
+  }
+  if (name === 'MultiEdit') {
+    const edits = Array.isArray(input.edits) ? input.edits : [];
+    let added = 0;
+    let removed = 0;
+    for (const e of edits) { removed += _lineCount(e?.old_string); added += _lineCount(e?.new_string); }
+    return { added, removed };
+  }
+  if (name === 'Write') {
+    return { added: _lineCount(input.content), removed: 0 };
+  }
+  return null;
+}
+
+// Changed files for a group of tool calls WITH aggregated +/- line stats per
+// path (deduped, first-touch order).
+export interface FileChange {
+  path: string;
+  added: number;
+  removed: number;
+}
+export function changedFilesWithStats(calls: ToolCallData[]): FileChange[] {
+  const byPath = new Map<string, FileChange>();
+  const order: string[] = [];
+  for (const c of calls) {
+    const t = toolFileTarget(c);
+    if (!t || !t.changed) continue;
+    if (!byPath.has(t.path)) { byPath.set(t.path, { path: t.path, added: 0, removed: 0 }); order.push(t.path); }
+    const st = editStats(c);
+    if (st) {
+      const fc = byPath.get(t.path)!;
+      fc.added += st.added;
+      fc.removed += st.removed;
+    }
+  }
+  return order.map((p) => byPath.get(p)!);
+}
+
 export function basename(p: string): string {
   const parts = p.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || p;
