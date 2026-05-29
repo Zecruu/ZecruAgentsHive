@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Archive, Crown, FolderOpen, Loader2, Maximize2, Minimize2, PanelRight, RadioTower } from 'lucide-react';
+import { Archive, ChevronRight, Crown, FolderOpen, Loader2, Maximize2, Minimize2, PanelRight, RadioTower } from 'lucide-react';
 import { ah, type ExportedMission, type MissionsExport, type Project } from '@/lib/agentshive';
 import { agentActivity, formatActivity, type ActiveProject } from '@/lib/useActiveProject';
 import { Badge } from '@/components/ui/badge';
@@ -22,6 +22,9 @@ export function HivemindDashboard({ project, rt, maximized, onToggleMaximize, mi
   const { agents, current } = rt;
   const [missions, setMissions] = useState<MissionsExport | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [missionCollapsed, setMissionCollapsed] = useState<boolean>(() => {
+    try { return localStorage.getItem('ah:hivemindMissionCollapsed') !== '0'; } catch { return true; }
+  });
 
   const load = useCallback(async () => {
     try {
@@ -43,6 +46,13 @@ export function HivemindDashboard({ project, rt, maximized, onToggleMaximize, mi
 
   const activity = agentActivity(current, Date.now());
   const activeMission = missions?.missions?.find((m) => m.status === 'active') || null;
+  const toggleMissionCollapsed = () => {
+    setMissionCollapsed((collapsed) => {
+      const next = !collapsed;
+      try { localStorage.setItem('ah:hivemindMissionCollapsed', next ? '1' : '0'); } catch {}
+      return next;
+    });
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
@@ -97,7 +107,12 @@ export function HivemindDashboard({ project, rt, maximized, onToggleMaximize, mi
         </div>
       </header>
 
-      <MissionOverview mission={activeMission} err={err} />
+      <MissionOverview
+        mission={activeMission}
+        err={err}
+        collapsed={missionCollapsed}
+        onToggle={toggleMissionCollapsed}
+      />
 
       <div className="min-h-0 flex-1">
         <ChatPane
@@ -130,30 +145,50 @@ function InfoPill({ children, icon }: { children: React.ReactNode; icon?: React.
   );
 }
 
-function MissionOverview({ mission, err }: { mission: ExportedMission | null; err: string | null }) {
+function MissionOverview({
+  mission,
+  err,
+  collapsed,
+  onToggle,
+}: {
+  mission: ExportedMission | null;
+  err: string | null;
+  collapsed: boolean;
+  onToggle: () => void;
+}) {
   return (
-    <section className="flex-none rounded-lg border border-border/70 bg-card/70 p-3">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <h3 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
-          <RadioTower className="h-3.5 w-3.5 text-accent" /> Active Mission
-        </h3>
-        {mission && <Badge variant="ok">{mission.status}</Badge>}
+    <section className="flex-none rounded-lg border border-border/70 bg-card/70 p-2.5">
+      <div className={cn('flex items-center justify-between gap-2', !collapsed && 'mb-2')}>
+        <button
+          type="button"
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-input/35"
+          title={collapsed ? 'Expand active mission' : 'Collapse active mission'}
+        >
+          <ChevronRight className={cn('h-3.5 w-3.5 flex-none text-muted-foreground transition-transform', !collapsed && 'rotate-90')} />
+          <RadioTower className="h-3.5 w-3.5 flex-none text-accent" />
+          <span className="shrink-0 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Active Mission</span>
+          {mission && <span className="min-w-0 truncate text-[13px] font-semibold tracking-tight text-foreground">{mission.name}</span>}
+        </button>
+        {mission && <Badge variant="ok" className="shrink-0">{mission.status}</Badge>}
       </div>
       {err ? (
         <p className="text-xs text-destructive">Failed to load missions: {err}</p>
       ) : mission ? (
-        <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
-          <div className="min-w-0">
-            <div className="truncate text-[15px] font-semibold tracking-tight">{mission.name}</div>
-            <p className="mt-1 max-h-20 overflow-hidden whitespace-pre-wrap break-words text-[12px] leading-relaxed text-muted-foreground">
-              {preview(mission.spec || '')}
-            </p>
+        !collapsed && (
+          <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+            <div className="min-w-0">
+              <div className="truncate text-[15px] font-semibold tracking-tight">{mission.name}</div>
+              <p className="mt-1 max-h-20 overflow-hidden whitespace-pre-wrap break-words text-[12px] leading-relaxed text-muted-foreground">
+                {preview(mission.spec || '')}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-start gap-2 text-[10px] text-muted-foreground lg:justify-end">
+              <InfoPill>{(mission.summaries || []).length} report{(mission.summaries || []).length === 1 ? '' : 's'}</InfoPill>
+              <InfoPill>{mission.mission_id.slice(0, 8)}</InfoPill>
+            </div>
           </div>
-          <div className="flex flex-wrap items-start gap-2 text-[10px] text-muted-foreground lg:justify-end">
-            <InfoPill>{(mission.summaries || []).length} report{(mission.summaries || []).length === 1 ? '' : 's'}</InfoPill>
-            <InfoPill>{mission.mission_id.slice(0, 8)}</InfoPill>
-          </div>
-        </div>
+        )
       ) : (
         <p className="text-[12px] text-muted-foreground">No active mission loaded yet.</p>
       )}
