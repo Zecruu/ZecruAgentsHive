@@ -182,6 +182,22 @@ def do_web_relay(parent_id: Optional[str], slug: str, agent_key: Optional[str], 
         return _web_msg_dict(m)
 
 
+def do_web_relay_ack(message_id: str) -> dict[str, Any]:
+    """Webapp → server: acknowledge an agent_to_web message the web client has
+    CONSUMED (rendered). EPHEMERAL: the row is DELETED on this confirmed-consume
+    ack — not a blind TTL — so an in-flight relay message is never dropped before
+    the client has it. Tenant-scoped + direction-checked. Idempotent. (Pairs with
+    the web_to_agent purge in do_web_ack; together the relay channel is ephemeral
+    while the durable history lives in the SyncedMessage transcript store.)"""
+    with Session(get_engine()) as session:
+        m = session.get(Message, message_id)
+        if m is None or m.tenant_id != current_tenant() or m.direction != AGENT_TO_WEB:
+            return {"error": "no such message"}
+        session.delete(m)
+        session.commit()
+        return {"ok": True, "message_id": message_id}
+
+
 def upsert_presence(slug: str, agents: list[dict[str, Any]]) -> dict[str, Any]:
     """Desktop relay: publish/refresh the tenant's agent roster + heartbeat."""
     now = _utcnow()
@@ -471,6 +487,13 @@ def _make_ack(_s: Settings):
     return h
 
 
+def _make_relay_ack(_s: Settings):
+    async def h(request: Request) -> Response:
+        body = await _read_json(request)
+        return JSONResponse(do_web_relay_ack((body.get("message_id") or "").strip()))
+    return h
+
+
 def _make_relay(_s: Settings):
     async def h(request: Request) -> Response:
         body = await _read_json(request)
@@ -567,6 +590,7 @@ def register_web_routes(app, settings: Settings) -> None:
         ("/web/inbound", _make_inbound(settings), ["GET"]),
         ("/web/ack", _make_ack(settings), ["POST"]),
         ("/web/relay", _make_relay(settings), ["POST"]),
+        ("/web/relay-ack", _make_relay_ack(settings), ["POST"]),
         ("/web/presence", _make_presence(settings), ["POST"]),
         # v2.x Cloud Sync (opt-in): entitlements + transcript push/pull.
         ("/web/me", _make_me(settings), ["GET"]),
