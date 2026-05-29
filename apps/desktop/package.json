@@ -3,6 +3,7 @@
   "version": "2.0.0",
   "private": true,
   "description": "AgentsHive — multi-agent control center. React + shadcn + Electron.",
+  "author": "Zecru",
   "main": "electron/main.js",
   "scripts": {
     "build": "vite build",
@@ -16,6 +17,7 @@
   "build": {
     "appId": "com.zecru.agentshive",
     "productName": "AgentsHive",
+    "npmRebuild": false,
     "directories": {
       "output": "dist-electron"
     },
