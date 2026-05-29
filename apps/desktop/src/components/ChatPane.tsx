@@ -295,19 +295,6 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
     }
     return out;
   }, [agent.messages, agent.lastEventAt]);
-  // Per-agent usage: running total tokens (sum of per-turn input+output) + the
-  // number of completed assistant turns.
-  const usageTokens = agent.messages.reduce((sum, m) => sum + (m.tokens ? m.tokens.input + m.tokens.output : 0), 0);
-  const usageTurns = agent.messages.filter((m) => m.role === 'assistant' && m.tokens).length;
-  // CONTEXT FILL = the LATEST turn's total input (incl. cache_read), point-in-time
-  // — what the CLI shows as "% context used". The headline; the cumulative session
-  // total above goes in the tooltip. Window % only when we KNOW the model's window.
-  let latestContext = 0;
-  for (let i = agent.messages.length - 1; i >= 0; i--) {
-    const c = agent.messages[i].tokens?.context;
-    if (typeof c === 'number' && c > 0) { latestContext = c; break; }
-  }
-  const ctxWindow = contextWindowFor(agent.model);
   // Live activity: while in-flight, show the current action + a ticking elapsed
   // timer (the parent re-renders every second via the hook's activity ticker),
   // so a long tool call / long generation reads as ALIVE rather than frozen.
@@ -366,14 +353,6 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
           <div className="flex shrink-0 items-center gap-2">
           {agent.readOnly && (
             <Badge variant="muted" className="normal-case">from another device · read-only</Badge>
-          )}
-          {latestContext > 0 && (
-            <span
-              className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground"
-              title={`Context: ${latestContext.toLocaleString()} tokens${ctxWindow ? ` of ~${ctxWindow.toLocaleString()}` : ''}\nSession: ${usageTokens.toLocaleString()} new tokens across ${usageTurns} turn${usageTurns > 1 ? 's' : ''}`}
-            >
-              {fmtTokens(latestContext)} ctx{ctxWindow ? ` · ${Math.round((latestContext / ctxWindow) * 100)}%` : ''}
-            </span>
           )}
           {statusBadge}
           <div className="relative">
@@ -476,14 +455,6 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             <span className="truncate">Next turn uses current model settings; in-flight work keeps its launch settings.</span>
           </div>
           <div className="hidden shrink-0 items-center gap-2 lg:flex">
-            {latestContext > 0 && (
-              <span
-                className="rounded-full border border-border bg-input/55 px-2.5 py-1 text-[10px] font-medium text-muted-foreground"
-                title={`Context: ${latestContext.toLocaleString()} tokens${ctxWindow ? ` of ~${ctxWindow.toLocaleString()}` : ''}\nSession: ${usageTokens.toLocaleString()} new tokens across ${usageTurns} turn${usageTurns > 1 ? 's' : ''}`}
-              >
-                {fmtTokens(latestContext)} ctx{ctxWindow ? ` · ${Math.round((latestContext / ctxWindow) * 100)}%` : ''}
-              </span>
-            )}
             {statusBadge}
           </div>
         </div>
@@ -677,15 +648,6 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   );
 }
 
-// Known context-window sizes by model. Only Claude 4.x is confirmed (200k) — for
-// unknown models (codex/gpt-5, window unconfirmed) we return null and show the raw
-// context size with NO % rather than guess. Matched by model-id substring.
-function contextWindowFor(model: string | null): number | null {
-  const m = (model || '').toLowerCase();
-  if (m.includes('opus') || m.includes('sonnet') || m.includes('haiku')) return 200_000;
-  return null;
-}
-
 // P4: collapsed "Thinking" disclosure showing the model's real extended-thinking
 // text (only rendered when the stream actually emits thinking blocks — not faked).
 function ThinkingEntry({ text }: { text: string }) {
@@ -710,13 +672,6 @@ function ThinkingEntry({ text }: { text: string }) {
   );
 }
 
-// Compact token count: 850 → "850", 4200 → "4.2k", 1_500_000 → "1.5M".
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(n >= 10_000 ? 0 : 1) + 'k';
-  return String(n);
-}
-
 function EmptyChip({ icon, label }: { icon: React.ReactNode; label: string }) {
   return (
     <span className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-input/45 px-2.5 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -734,7 +689,6 @@ function EmptyChip({ icon, label }: { icon: React.ReactNode; label: string }) {
 // (cheaper than embedding the whole body in the key on every keystroke).
 function bubbleSig(m: MessageRuntime): string {
   let s = `${m.role}|${m.thinking ? 't' : ''}|${m.text.length}`;
-  if (m.tokens) s += `|k${m.tokens.input},${m.tokens.output}`;
   if (m.attachments) s += `|a${m.attachments.length}`;
   const calls = m.toolCalls;
   if (calls && calls.length) {
@@ -791,14 +745,6 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: Messag
         <span className={cn('rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider', roleClasses)}>
           {message.role}
         </span>
-        {message.tokens && (
-          <span
-            className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground"
-            title={`${message.tokens.input.toLocaleString()} in · ${message.tokens.output.toLocaleString()} out`}
-          >
-            {fmtTokens(message.tokens.input + message.tokens.output)} tok
-          </span>
-        )}
       </div>
       <div className={cn('relative break-words rounded-lg border px-3.5 py-2.5 text-[12px] leading-normal shadow-[0_1px_0_hsl(0_0%_100%/0.03)_inset]', bodyClasses, isAssistant && 'pl-4')}>
         {isAssistant && <span className="absolute bottom-2 left-0 top-2 w-0.5 rounded-full bg-accent/55" />}
