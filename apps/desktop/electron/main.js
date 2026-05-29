@@ -125,11 +125,14 @@ async function apiFetch(pathAndQuery, init = {}) {
 // unchanged (callers don't pass a token).
 let _supabaseToken = null;
 
-// A dashboard GET that uses the operator's Supabase tenant when signed in, else
-// the legacy shared key.
-function dashboardFetch(pathAndQuery) {
-  if (_supabaseToken) return adminApiFetch('GET', pathAndQuery, _supabaseToken);
-  return apiFetch(pathAndQuery);
+// A dashboard request that uses the operator's Supabase tenant when signed in,
+// else the legacy shared key. Defaults to GET; pass {method, body} for writes
+// (e.g. projects:create) so a signed-in user's writes land under THEIR tenant —
+// not the legacy tenant — matching where their agents/MCP connection resolve.
+function dashboardFetch(pathAndQuery, opts = {}) {
+  const method = opts.method || 'GET';
+  if (_supabaseToken) return adminApiFetch(method, pathAndQuery, _supabaseToken, opts.body);
+  return apiFetch(pathAndQuery, method === 'GET' ? {} : { method, body: opts.body });
 }
 
 // Build the env vars an agent CLI needs to talk to AgentsHive for this
@@ -500,12 +503,17 @@ ipcMain.handle('config:set', (_e, patch) => {
   };
 });
 
+// Tenant-aware (dashboardFetch): when signed in, list/create projects under the
+// operator's Supabase tenant — matching where their agents/MCP connection resolve
+// — instead of the legacy tenant. A legacy-only project row would be invisible to
+// a signed-in Planner ("project does not exist"). Falls back to the legacy key
+// when signed out. Renderer signatures unchanged.
 ipcMain.handle('projects:list', async () => {
-  return apiFetch('/api/dashboard/projects');
+  return dashboardFetch('/api/dashboard/projects');
 });
 
 ipcMain.handle('projects:create', async (_e, { slug, name }) => {
-  return apiFetch('/api/dashboard/projects', { method: 'POST', body: { slug, name } });
+  return dashboardFetch('/api/dashboard/projects', { method: 'POST', body: { slug, name } });
 });
 
 // --- embedded PTY IPC ----------------------------------------------------
