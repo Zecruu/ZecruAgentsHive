@@ -144,7 +144,7 @@ export function ProjectSidebar(props: Props) {
   };
 
   return (
-    <aside className="relative flex w-72 flex-none flex-col overflow-hidden border-r border-border/60 glass">
+    <aside className="relative flex w-72 flex-none flex-col overflow-hidden border-r border-border/60 sidebar-glass">
       {/* Add control */}
       <div className="border-b border-border/60 p-2.5">
         <Button
