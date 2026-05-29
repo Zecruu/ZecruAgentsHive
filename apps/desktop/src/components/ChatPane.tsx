@@ -506,7 +506,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             </div>
           </div>
         ) : (
-          <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
+          <div className="mx-auto flex w-full max-w-4xl flex-col gap-3">
             {agent.messages.map((m, i) => (
               <Fragment key={i}>
                 <MessageBubble message={m} sig={bubbleSig(m)} />
@@ -780,13 +780,13 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: Messag
       ? 'border-primary/30 bg-gradient-to-b from-primary/14 to-primary/5'
       : message.role === 'assistant'
         ? 'border-accent/20 bg-card/70'
-        : 'border-border/40 bg-muted/20 text-muted-foreground text-[12.5px]';
+        : 'border-border/40 bg-muted/20 text-muted-foreground text-[11.5px]';
   const isUser = message.role === 'user';
   const isAssistant = message.role === 'assistant';
 
   return (
     <div className={cn('animate-fade-up flex w-full', isUser ? 'justify-end' : 'justify-start')}>
-      <div className={cn('space-y-1.5', isUser ? 'w-fit max-w-[78%]' : 'w-full')}>
+      <div className={cn('space-y-1', isUser ? 'w-fit max-w-[78%]' : 'w-full')}>
       <div className={cn('flex items-center gap-2 text-[11px] text-muted-foreground', isUser && 'justify-end')}>
         <span className={cn('rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider', roleClasses)}>
           {message.role}
@@ -800,7 +800,7 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: Messag
           </span>
         )}
       </div>
-      <div className={cn('relative break-words rounded-lg border px-3.5 py-3 text-[13.5px] leading-relaxed shadow-[0_1px_0_hsl(0_0%_100%/0.03)_inset]', bodyClasses, isAssistant && 'pl-4')}>
+      <div className={cn('relative break-words rounded-lg border px-3.5 py-2.5 text-[12px] leading-normal shadow-[0_1px_0_hsl(0_0%_100%/0.03)_inset]', bodyClasses, isAssistant && 'pl-4')}>
         {isAssistant && <span className="absolute bottom-2 left-0 top-2 w-0.5 rounded-full bg-accent/55" />}
         {message.text
           ? (message.role === 'system'
