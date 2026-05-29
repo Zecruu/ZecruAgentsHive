@@ -31,7 +31,7 @@ from . import dashboard_events
 from .config import Settings
 from .db import CoderHeartbeat, Message, Mission, Project, Question, Summary, get_engine
 from .project import current_project, validate_slug
-from .tenant import current_tenant
+from .tenant import current_identity, current_tenant
 from .tools import (
     AGENTSHIVE_VERSION,
     MAX_TEXT_LEN,
@@ -133,13 +133,26 @@ def _require_same_origin(request: Request) -> bool:
 
 
 def _require_dashboard_auth(request: Request, settings: Settings) -> bool:
-    """Return True if the request carries a valid bearer header OR a valid signed cookie."""
+    """Return True if the request carries a valid bearer header OR a valid signed cookie.
+
+    Three accepted credentials (all additive):
+      1. the legacy shared key (constant-time compare) — tenant=LEGACY,
+      2. a verified Supabase JWT — TenantContextMiddleware already bound tenant=sub
+         + IDENTITY_CONTEXT from it, so we just honor that verified identity (this
+         is what makes the desktop's per-tenant missions panel / state poll work
+         for a SIGNED-IN operator; same isolation as the /web/* surface),
+      3. a valid signed dashboard cookie (the browser dashboard).
+    """
     # Bearer header path — same key as /mcp, constant-time compare.
     header = request.headers.get("authorization", "")
     if header.lower().startswith("bearer "):
         presented = header[7:].strip()
         if hmac.compare_digest(presented.encode("utf-8"), settings.api_key.encode("utf-8")):
             return True
+
+    # Supabase-JWT path — the middleware verified it + bound tenant=sub already.
+    if current_identity() is not None:
+        return True
 
     # Cookie path.
     raw = request.cookies.get(COOKIE_NAME)
