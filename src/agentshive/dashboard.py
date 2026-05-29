@@ -258,6 +258,14 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
 
         pending_q: list[dict[str, Any]] = []
         pending_s: list[dict[str, Any]] = []
+        # Undelivered planner_to_coder messages for the active mission. Drives the
+        # desktop's per-coder wake fallback (mirror of the Planner-wake one) — the
+        # client builds a per-coder signature client-side, matching
+        # wait_for_planner_message's v1.11 delivery matrix: target_coder_id NULL is
+        # a broadcast (every coder), a named target reaches that coder only.
+        # Lean payload (id + target + created_at — no body) and capped at 200 so a
+        # runaway can't bloat the dashboard state response.
+        pending_from_planner: list[dict[str, Any]] = []
         c2p: list[dict[str, Any]] = []
         p2c: list[dict[str, Any]] = []
         if active is not None:
@@ -275,6 +283,23 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
                     select(Summary)
                     .where(Summary.mission_id == active.id, Summary.response.is_(None))
                     .order_by(Summary.created_at)
+                ).all()
+            ]
+            pending_from_planner = [
+                {
+                    "id": m.id,
+                    "target_coder_id": m.target_coder_id,
+                    "created_at": (m.created_at.isoformat() if m.created_at else None),
+                }
+                for m in session.exec(
+                    select(Message)
+                    .where(
+                        Message.mission_id == active.id,
+                        Message.direction == "planner_to_coder",
+                        Message.delivered_at.is_(None),
+                    )
+                    .order_by(Message.created_at)
+                    .limit(200)
                 ).all()
             ]
             c2p = _recent_messages(session, active.id, direction="coder_to_planner")
@@ -330,6 +355,7 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
             "recent_missions": recent,
             "pending_questions": pending_q,
             "pending_summaries": pending_s,
+            "pending_from_planner": pending_from_planner,
             "messages": {"coder_to_planner": c2p, "planner_to_coder": p2c},
             "inbox": inbox,
             "server_info": server_info,
