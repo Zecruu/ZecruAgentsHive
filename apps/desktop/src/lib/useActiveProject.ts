@@ -357,6 +357,9 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
   // fn, so the hivemind's settle() can trigger an immediate re-check (defined in
   // the Planner-wake reliability effect below). Default no-op until assigned.
   const checkPendingRef = useRef<(reason: string) => void>(() => {});
+  // Same pattern, OTHER direction: a coder's settle() triggers a per-coder
+  // pending-from-planner re-check (defined in the Coder-wake fallback effect).
+  const checkCoderPendingRef = useRef<(reason: string) => void>(() => {});
   useEffect(() => {
     if (!slug || !isActive) return; // single-active: only the displayed project polls
     seenIdsRef.current = new Set();
@@ -496,6 +499,96 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
       clearTimeout(tInit);
       clearInterval(tPoll);
       checkPendingRef.current = () => {};
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  // Coder-wake reliability fallback — symmetric to the Planner-wake one above
+  // (ffe902c + the 2.0.20 field-name fix). The push wake (maybeWakeOnToolUse) can
+  // miss planner→coder messages when the coder is in-flight at delivery time or
+  // a stream tool_use drops (transport socket-closed errors we've hit). So
+  // independently — for THIS project's coders, on EVERY open project (NOT
+  // isActive-gated, so the loop progresses even when another project is displayed)
+  // — read the server's UNDELIVERED planner_to_coder messages (state.pending_from_planner,
+  // added in the matching server commit) and wake each IDLE non-hivemind agent
+  // that has work waiting. PER-CODER signature dedup (one entry per coder agent,
+  // not project-global): wake when the coder's signature is non-empty AND (changed
+  // since the last wake OR past the 75s re-arm window). Empty pending for a coder
+  // resets that coder's signature. Matches wait_for_planner_message's v1.11
+  // delivery matrix: target_coder_id NULL is broadcast (every coder); a named
+  // target reaches only the matching coder (normalized via normCoderId).
+  useEffect(() => {
+    if (!slug) return;
+    const REARM_MS = 75000;
+    const lastWake = new Map<string, { sig: string; at: number }>(); // agentId → state
+    let stopped = false;
+
+    const doCheck = async (reason: string) => {
+      if (stopped) return;
+      const coders = agentsRef.current.filter((a) => a.role !== 'hivemind' && !a.inFlight);
+      if (coders.length === 0) return;
+      let state: any;
+      try { state = await ah().dashboard.state(slug); } catch { return; }
+      if (stopped) return;
+      const msgs = Array.isArray(state.pending_from_planner) ? state.pending_from_planner : [];
+      if (msgs.length === 0) {
+        // No pending planner→coder anywhere — clear all per-coder signatures so
+        // the next planner message rearms immediately for whichever coder it's for.
+        lastWake.clear();
+        return;
+      }
+      // Group: broadcast ids (target=NULL) reach every coder; targeted ids only
+      // the matching coder (normalized the same way as wait_for_planner_message).
+      const broadcastIds: string[] = [];
+      const targetedByCoder = new Map<string, string[]>();
+      for (const m of msgs) {
+        const id = String(m.id ?? m.created_at ?? '');
+        if (!id) continue;
+        const target = m.target_coder_id;
+        if (target == null || target === '') {
+          broadcastIds.push(id);
+        } else {
+          const want = normCoderId(String(target));
+          const arr = targetedByCoder.get(want) ?? [];
+          arr.push(id);
+          targetedByCoder.set(want, arr);
+        }
+      }
+      const sortedBroadcast = [...broadcastIds].sort();
+      for (const c of coders) {
+        const my = normCoderId(c.coderId || c.label);
+        const mine = (targetedByCoder.get(my) ?? []).sort();
+        if (sortedBroadcast.length === 0 && mine.length === 0) {
+          lastWake.delete(c.id);
+          continue;
+        }
+        const sig = [...sortedBroadcast, ...mine].join('|');
+        const prev = lastWake.get(c.id);
+        const changed = !prev || prev.sig !== sig;
+        const stale = !!prev && Date.now() - prev.at > REARM_MS;
+        if (!changed && !stale) continue;
+        // Re-resolve AFTER the await — the push wake may have just started it.
+        const fresh = agentsRef.current.find((x) => x.id === c.id);
+        if (!fresh || fresh.inFlight) continue;
+        lastWake.set(c.id, { sig, at: Date.now() });
+        wakeAgent(fresh, `pending:${reason}`);
+      }
+      // Drop dedup entries for agents that no longer exist (archived) so the map
+      // doesn't leak across long sessions.
+      const liveIds = new Set(agentsRef.current.map((a) => a.id));
+      for (const id of Array.from(lastWake.keys())) {
+        if (!liveIds.has(id)) lastWake.delete(id);
+      }
+    };
+    checkCoderPendingRef.current = (reason: string) => { void doCheck(reason); };
+
+    const tInit = setTimeout(() => doCheck('init'), 8000);
+    const tPoll = setInterval(() => doCheck('poll'), 15000);
+    return () => {
+      stopped = true;
+      clearTimeout(tInit);
+      clearInterval(tPoll);
+      checkCoderPendingRef.current = () => {};
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
@@ -840,7 +933,13 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
       // still work — instant recovery without waiting for the ~15s poll. The
       // signature dedup in checkPendingRef prevents an error-loop (an errored turn
       // doesn't clear pending → same signature → no immediate re-wake).
-      if (a.role === 'hivemind') setTimeout(() => checkPendingRef.current('settle'), 1500);
+      // Symmetric for coders: settle → re-check pending_from_planner for this coder
+      // (a planner→coder message that arrived while it was mid-turn).
+      if (a.role === 'hivemind') {
+        setTimeout(() => checkPendingRef.current('settle'), 1500);
+      } else {
+        setTimeout(() => checkCoderPendingRef.current('settle'), 1500);
+      }
       if (!ok) return;
 
       // Cloud Sync (opt-in): push the finalized transcript after a clean settle.

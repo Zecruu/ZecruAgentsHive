@@ -47,6 +47,9 @@ export interface DashboardState {
   // Planner-wake signature. Reading the right names is the fix.
   pending_questions?: PendingQuestionLite[];
   pending_summaries?: PendingSummaryLite[];
+  // Undelivered planner_to_coder messages for the active mission — drives the
+  // desktop's per-coder wake fallback (2.0.21). target_coder_id NULL = broadcast.
+  pending_from_planner?: Array<{ id?: string | number; target_coder_id?: string | null; created_at?: string }>;
   messages?: {
     coder_to_planner?: InboxMessageLite[];
     planner_to_coder?: InboxMessageLite[];
