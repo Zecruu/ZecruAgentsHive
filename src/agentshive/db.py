@@ -217,8 +217,61 @@ class Tenant(SQLModel, table=True):
     stripe_subscription_id: Optional[str] = Field(default=None)
     # Admin-toggled. A banned tenant's token is rejected at auth time.
     banned: bool = Field(default=False, index=True)
+    # v2.x Cloud Sync (opt-in paid add-on; Stripe billing DEFERRED). Admin-assignable
+    # entitlement; pro_unlimited resolves to True via cloud_sync_enabled(). When this
+    # is False (and not pro_unlimited) the tenant's conversation transcripts never
+    # leave the user's machine — privacy-first default.
+    cloud_sync: bool = Field(default=False)
     email: Optional[str] = Field(default=None)  # cached for admin display; source of truth is Supabase
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+# --- v2.x Cloud Sync (opt-in): tenant-scoped conversation transcript store ---
+#
+# When a tenant ENABLES Cloud Sync (entitlement-gated — see cloud_sync_enabled),
+# the desktop pushes its per-agent conversation transcripts here for cross-device
+# + companion-webapp access. PRIVACY-FIRST: with the entitlement off / opted out,
+# NOTHING is written here — transcripts stay on the user's machine.
+#
+# Strictly tenant-scoped. tenant_id is denormalized onto SyncedMessage as the LIVE
+# enforced filter that closes by-id access (same pattern as the coordination
+# tables). Identity/upsert key is a CLIENT-GENERATED per-message UUID (msg_uuid),
+# NOT the array index — so local re-index / clear / reorder can never overwrite the
+# wrong server row. `idx` is render ORDER only.
+
+class SyncedConversation(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "project_slug", "agent_id", name="uq_syncedconvo_tenant_project_agent"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    tenant_id: str = Field(index=True)
+    project_slug: str = Field(index=True)
+    agent_id: str = Field(index=True)
+    label: Optional[str] = None
+    role: Optional[str] = None
+    cli: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class SyncedMessage(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "msg_uuid", name="uq_syncedmsg_tenant_uuid"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    # Denormalized owning tenant — the LIVE filter on by-id access (IDOR-closing).
+    tenant_id: str = Field(index=True)
+    # Client-generated stable id; the upsert identity together with tenant_id.
+    msg_uuid: str = Field(index=True)
+    project_slug: str = Field(index=True)
+    agent_id: str = Field(index=True)
+    idx: int = Field(default=0)  # render ORDER within the conversation (not identity)
+    role: str = Field(default="assistant")
+    text: str = Field(default="")
+    tool_calls: Optional[list] = Field(default=None, sa_column=Column(JSON))
+    tokens: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
 # v2.x companion-webapp presence: the desktop upserts one row per local agent so
@@ -648,6 +701,19 @@ def _apply_inline_migrations(engine: Engine) -> None:
                 if col_name not in proj_cols:
                     conn.execute(text(f"ALTER TABLE project ADD COLUMN {col_name} {col_def}"))
 
+    # v2.x Cloud Sync: cloud_sync entitlement column on tenant (dialect-aware
+    # boolean default — Postgres wants FALSE, SQLite accepts 0). The new
+    # SyncedConversation/SyncedMessage tables are created by create_all (which adds
+    # MISSING tables on existing DBs too — same as WebAgentPresence), so no explicit
+    # CREATE TABLE here. Additive + idempotent.
+    vcs_inspector = inspect(engine)
+    if "tenant" in vcs_inspector.get_table_names():
+        tenant_cols = {c["name"] for c in vcs_inspector.get_columns("tenant")}
+        if "cloud_sync" not in tenant_cols:
+            default = "FALSE" if engine.dialect.name == "postgresql" else "0"
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE tenant ADD COLUMN cloud_sync BOOLEAN NOT NULL DEFAULT {default}"))
+
 
 def get_engine() -> Engine:
     if _engine is None:
@@ -679,6 +745,18 @@ def get_or_create_tenant(session, tenant_id: str, email: Optional[str] = None) -
         session.commit()
         session.refresh(row)
     return row
+
+
+def cloud_sync_enabled(tenant_row: Optional["Tenant"]) -> bool:
+    """Row-based Cloud Sync entitlement — the SINGLE source of truth. True when the
+    tenant has the cloud_sync flag set OR is on pro_unlimited. Deliberately does NOT
+    consult request identity (is_admin): entitlement is a property of the tenant ROW,
+    so an admin viewing another tenant never accidentally treats it as entitled. When
+    billing turns on later, a Stripe webhook just sets Tenant.cloud_sync — nothing
+    downstream hardcodes plan names."""
+    if tenant_row is None:
+        return False
+    return bool(tenant_row.cloud_sync) or tenant_row.plan == PLAN_PRO_UNLIMITED
 
 
 def is_tenant_banned(tenant_id: str) -> bool:

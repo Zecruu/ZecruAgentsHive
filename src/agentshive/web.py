@@ -32,13 +32,26 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .config import Settings
-from .db import Message, Project, WebAgentPresence, get_engine
+from .db import (
+    Message,
+    Project,
+    SyncedConversation,
+    SyncedMessage,
+    Tenant,  # noqa: F401  (imported for clarity; used via get_or_create_tenant)
+    WebAgentPresence,
+    cloud_sync_enabled,
+    get_engine,
+    get_or_create_tenant,
+)
 from .tenant import current_identity, current_tenant
 from .tools import MAX_TEXT_LEN, _validate_text
 
 WEB_TO_AGENT = "web_to_agent"
 AGENT_TO_WEB = "agent_to_web"
 PRESENCE_TTL_SECONDS = 30  # desktop online if it published within this window
+# Per-message transcript text cap (defensive — a single synced message shouldn't
+# blow up a row). Generous vs MAX_TEXT_LEN since transcripts hold full agent turns.
+MAX_SYNC_TEXT_LEN = 500_000
 
 
 def _utcnow() -> datetime:
@@ -126,16 +139,19 @@ def fetch_web_inbound(limit: int = 20) -> list[dict[str, Any]]:
 
 
 def do_web_ack(message_id: str) -> dict[str, Any]:
-    """Desktop relay: mark a web_to_agent message delivered (tenant-scoped) so it
-    isn't re-injected on the next poll. Idempotent."""
+    """Desktop relay: acknowledge a web_to_agent message (tenant-scoped) after the
+    desktop has injected the turn. EPHEMERAL: the row is DELETED on ack (not just
+    stamped) to keep the cloud footprint minimal — there's a real ack here so the
+    at-least-once guarantee holds (a crash before ack leaves the row for redelivery).
+    Idempotent (a second ack just no-ops). NOTE: agent_to_web purge is DEFERRED to
+    the webapp slice — its SSE consumer has no per-message ack yet, so purging it now
+    risks dropping in-flight relay messages; design that purge with the consumer."""
     with Session(get_engine()) as session:
         m = session.get(Message, message_id)
         if m is None or m.tenant_id != current_tenant() or m.direction != WEB_TO_AGENT:
             return {"error": "no such message"}
-        if m.delivered_at is None:
-            m.delivered_at = _utcnow()
-            session.add(m)
-            session.commit()
+        session.delete(m)
+        session.commit()
         return {"ok": True, "message_id": message_id}
 
 
@@ -248,6 +264,153 @@ def fetch_agent_to_web_since(tenant_id: str, after: Optional[datetime]) -> list[
         return list(session.exec(stmt.order_by(Message.created_at)).all())
 
 
+# ---------- v2.x Cloud Sync (opt-in): entitlements + transcript push/pull --------
+
+def tenant_cloud_sync_enabled() -> bool:
+    """Resolve the CURRENT tenant's Cloud Sync entitlement (row-based)."""
+    with Session(get_engine()) as session:
+        row = get_or_create_tenant(session, current_tenant())
+        return cloud_sync_enabled(row)
+
+
+def do_web_me() -> dict[str, Any]:
+    """The current tenant's identity + entitlements. The desktop reads this to gate
+    the Cloud Sync toggle (enabled only when cloud_sync resolves True)."""
+    ident = current_identity() or {}
+    tenant = current_tenant()
+    with Session(get_engine()) as session:
+        row = get_or_create_tenant(session, tenant, email=ident.get("email"))
+        return {
+            "sub": tenant,
+            "email": row.email or ident.get("email"),
+            "plan": row.plan,
+            "cloud_sync": cloud_sync_enabled(row),
+        }
+
+
+def do_sync_push(slug: str, agent_id: str, label: Optional[str], role: Optional[str],
+                 cli: Optional[str], messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Desktop → cloud: idempotent upsert of one agent's transcript. ENTITLEMENT-
+    GATED + PRIVACY-FIRST: writes NOTHING when Cloud Sync is off (defense in depth —
+    even a direct call can't leak transcripts). `messages` = [{uuid, idx, role, text,
+    tool_calls, tokens, created_at}]. Upsert identity is (tenant_id, uuid); render
+    order is `idx`. Last push wins (LWW via updated_at = now)."""
+    if not tenant_cloud_sync_enabled():
+        return {"error": "Cloud Sync is not enabled for this account.", "gated": True}
+    if not slug or not agent_id:
+        return {"error": "project and agent_id are required"}
+    tenant = current_tenant()
+    now = _utcnow()
+    with Session(get_engine()) as session:
+        convo = session.exec(
+            select(SyncedConversation).where(
+                SyncedConversation.tenant_id == tenant,
+                SyncedConversation.project_slug == slug,
+                SyncedConversation.agent_id == agent_id,
+            )
+        ).first()
+        if convo is None:
+            convo = SyncedConversation(tenant_id=tenant, project_slug=slug, agent_id=agent_id, created_at=now)
+        if label is not None:
+            convo.label = label
+        if role is not None:
+            convo.role = role
+        if cli is not None:
+            convo.cli = cli
+        convo.updated_at = now
+        session.add(convo)
+        synced = 0
+        for m in (messages or []):
+            muuid = str(m.get("uuid") or "").strip()
+            if not muuid:
+                continue  # uuid is the upsert identity — skip anything without one
+            existing = session.exec(
+                select(SyncedMessage).where(
+                    SyncedMessage.tenant_id == tenant,
+                    SyncedMessage.msg_uuid == muuid,
+                )
+            ).first()
+            row = existing or SyncedMessage(tenant_id=tenant, msg_uuid=muuid, created_at=now)
+            row.project_slug = slug
+            row.agent_id = agent_id
+            row.idx = int(m.get("idx") or 0)
+            row.role = str(m.get("role") or "assistant")
+            row.text = str(m.get("text") or "")[:MAX_SYNC_TEXT_LEN]
+            tc = m.get("tool_calls")
+            row.tool_calls = tc if isinstance(tc, list) else None
+            tk = m.get("tokens")
+            row.tokens = tk if isinstance(tk, dict) else None
+            row.updated_at = now
+            session.add(row)
+            synced += 1
+        session.commit()
+        return {"ok": True, "agent_id": agent_id, "synced": synced}
+
+
+def do_sync_pull(slug: str, since_iso: Optional[str] = None) -> dict[str, Any]:
+    """Cloud → desktop: the tenant's transcripts for a project, optionally only those
+    updated after `since` (ISO8601 cursor). ENTITLEMENT-GATED. Returns conversations
+    (with messages ordered by idx) + a `cursor` (max updated_at seen) for the next
+    incremental pull. Strictly tenant-scoped."""
+    if not tenant_cloud_sync_enabled():
+        return {"error": "Cloud Sync is not enabled for this account.", "gated": True}
+    tenant = current_tenant()
+    after: Optional[datetime] = None
+    if since_iso:
+        try:
+            after = _aware(datetime.fromisoformat(since_iso))
+        except Exception:
+            after = None
+    with Session(get_engine()) as session:
+        convo_stmt = select(SyncedConversation).where(SyncedConversation.tenant_id == tenant)
+        if slug:
+            convo_stmt = convo_stmt.where(SyncedConversation.project_slug == slug)
+        convos = session.exec(convo_stmt).all()
+
+        msg_stmt = select(SyncedMessage).where(SyncedMessage.tenant_id == tenant)
+        if slug:
+            msg_stmt = msg_stmt.where(SyncedMessage.project_slug == slug)
+        if after is not None:
+            msg_stmt = msg_stmt.where(SyncedMessage.updated_at > after)
+        msgs = session.exec(msg_stmt.order_by(SyncedMessage.agent_id, SyncedMessage.idx)).all()
+
+        by_agent: dict[str, list[dict[str, Any]]] = {}
+        max_updated = after
+        for m in msgs:
+            by_agent.setdefault(m.agent_id, []).append({
+                "uuid": m.msg_uuid,
+                "idx": m.idx,
+                "role": m.role,
+                "text": m.text,
+                "tool_calls": m.tool_calls,
+                "tokens": m.tokens,
+                "created_at": _aware(m.created_at).isoformat(),
+                "updated_at": _aware(m.updated_at).isoformat(),
+            })
+            mu = _aware(m.updated_at)
+            if max_updated is None or mu > max_updated:
+                max_updated = mu
+
+        out_convos = []
+        for c in convos:
+            ms = by_agent.get(c.agent_id, [])
+            if after is not None and not ms:
+                continue  # incremental pull: skip conversations with nothing new
+            out_convos.append({
+                "agent_id": c.agent_id,
+                "project_slug": c.project_slug,
+                "label": c.label,
+                "role": c.role,
+                "cli": c.cli,
+                "updated_at": _aware(c.updated_at).isoformat(),
+                "messages": ms,
+            })
+        return {
+            "conversations": out_convos,
+            "cursor": max_updated.isoformat() if max_updated else None,
+        }
+
+
 # ---------- HTTP handlers (each wrapped in _web_guard at registration) ----------
 
 async def _read_json(request: Request) -> dict:
@@ -325,6 +488,36 @@ def _make_presence(_s: Settings):
     return h
 
 
+def _make_me(_s: Settings):
+    async def h(_request: Request) -> Response:
+        return JSONResponse(do_web_me())
+    return h
+
+
+def _make_sync_push(_s: Settings):
+    async def h(request: Request) -> Response:
+        body = await _read_json(request)
+        res = do_sync_push(
+            (body.get("project") or "").strip().lower(),
+            (body.get("agent_id") or "").strip(),
+            body.get("label"),
+            body.get("role"),
+            body.get("cli"),
+            body.get("messages") if isinstance(body.get("messages"), list) else [],
+        )
+        return JSONResponse(res, status_code=402 if res.get("gated") else 200)
+    return h
+
+
+def _make_sync_pull(_s: Settings):
+    async def h(request: Request) -> Response:
+        slug = (request.query_params.get("project") or "").strip().lower()
+        since = request.query_params.get("since") or None
+        res = do_sync_pull(slug, since)
+        return JSONResponse(res, status_code=402 if res.get("gated") else 200)
+    return h
+
+
 def _make_stream(_s: Settings):
     KEEPALIVE = 20
 
@@ -375,6 +568,10 @@ def register_web_routes(app, settings: Settings) -> None:
         ("/web/ack", _make_ack(settings), ["POST"]),
         ("/web/relay", _make_relay(settings), ["POST"]),
         ("/web/presence", _make_presence(settings), ["POST"]),
+        # v2.x Cloud Sync (opt-in): entitlements + transcript push/pull.
+        ("/web/me", _make_me(settings), ["GET"]),
+        ("/web/sync/push", _make_sync_push(settings), ["POST"]),
+        ("/web/sync/pull", _make_sync_pull(settings), ["GET"]),
     ]
     for path, handler, methods in routes:
         app.router.routes.append(Route(path, _web_guard(handler), methods=methods))

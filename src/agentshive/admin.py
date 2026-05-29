@@ -143,6 +143,7 @@ def _make_list_users(_settings: Settings):
                     "plan": (t.plan if t else (meta.get("plan") or "free")),
                     "subscription_status": (t.subscription_status if t else "none"),
                     "trial_reports_used": (t.trial_reports_used if t else 0),
+                    "cloud_sync": (bool(t.cloud_sync) if t else False),
                     "banned": (bool(t.banned) if t else bool(u.get("banned_until"))),
                     "created_at": u.get("created_at"),
                     "project_count": pc,
@@ -215,6 +216,24 @@ def _make_set_plan(_settings: Settings):
     return handler
 
 
+def _make_set_cloud_sync(_settings: Settings):
+    async def handler(request: Request) -> Response:
+        if not is_admin():
+            return _forbidden()
+        sub = request.path_params.get("sub", "")
+        if not _UUID_RE.match(sub):
+            return JSONResponse({"error": "invalid user id"}, status_code=400)
+        body = await _read_json(request)
+        enabled = bool(body.get("enabled"))
+        with Session(get_engine()) as session:
+            t = get_or_create_tenant(session, sub)
+            t.cloud_sync = enabled
+            session.add(t)
+            session.commit()
+        return JSONResponse({"ok": True, "sub": sub, "cloud_sync": enabled})
+    return handler
+
+
 def _make_remove_user(_settings: Settings):
     async def handler(request: Request) -> Response:
         if not is_admin():
@@ -276,6 +295,7 @@ def register_admin_routes(app, settings: Settings) -> None:
         ("/admin/users/{sub}/ban", _make_set_banned(settings, True), ["POST"]),
         ("/admin/users/{sub}/unban", _make_set_banned(settings, False), ["POST"]),
         ("/admin/users/{sub}/plan", _make_set_plan(settings), ["POST"]),
+        ("/admin/users/{sub}/cloud-sync", _make_set_cloud_sync(settings), ["POST"]),
         ("/admin/users/{sub}/remove", _make_remove_user(settings), ["POST"]),
     ]
     for path, handler, methods in routes:
