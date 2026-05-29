@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils';
 import { ah, MODEL_OPTIONS, EFFORT_OPTIONS, basename, changedFiles, type AttachmentData, type SkillItem, type ToolCallData } from '@/lib/agentshive';
 import { agentActivity, formatActivity, type AgentRuntime, type MessageRuntime } from '@/lib/useActiveProject';
 import { ToolCallCard } from './ToolCallCard';
+import { MarkdownBody } from './Markdown';
 
 interface PendingAttachment {
   name: string;
@@ -720,9 +721,13 @@ function MessageBubble({ message }: { message: MessageRuntime }) {
           </span>
         )}
       </div>
-      <div className={cn('relative whitespace-pre-wrap break-words rounded-lg border px-3.5 py-3 text-[13.5px] leading-relaxed shadow-[0_1px_0_hsl(0_0%_100%/0.03)_inset]', bodyClasses, isAssistant && 'pl-4')}>
+      <div className={cn('relative break-words rounded-lg border px-3.5 py-3 text-[13.5px] leading-relaxed shadow-[0_1px_0_hsl(0_0%_100%/0.03)_inset]', bodyClasses, isAssistant && 'pl-4')}>
         {isAssistant && <span className="absolute bottom-2 left-0 top-2 w-0.5 rounded-full bg-accent/55" />}
-        {message.text || (message.role === 'assistant' && <span className="text-muted-foreground">…</span>)}
+        {message.text
+          ? (message.role === 'system'
+              ? <span className="whitespace-pre-wrap">{message.text}</span>
+              : <MarkdownBody text={message.text} />)
+          : (message.role === 'assistant' && <span className="text-muted-foreground">…</span>)}
         {message.attachments && message.attachments.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-2">
             {message.attachments.map((a, i) => (
