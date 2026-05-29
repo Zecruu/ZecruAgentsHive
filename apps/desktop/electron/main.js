@@ -1322,6 +1322,11 @@ ipcMain.handle('dashboard:open', (_e, { projectSlug }) => {
 
 ipcMain.handle('app:hostname', () => os.hostname());
 
+// The running app's version (from the packaged/app package.json). Drives the
+// header version badge so it always matches the deployed release — no manual
+// bump of a hardcoded string.
+ipcMain.handle('app:version', () => app.getVersion());
+
 // --- slash-command / skill catalog ---------------------------------------
 // Enumerate file-based skills + prompt commands for the chat input's `/`
 // autocomplete. Only PROMPT-EXPANSION items are returned (skills + command

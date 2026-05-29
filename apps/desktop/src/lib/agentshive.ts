@@ -219,6 +219,7 @@ declare global {
       };
       app: {
         hostname: () => Promise<string>;
+        version: () => Promise<string>;
       };
       skills: {
         list: (projectSlug: string) => Promise<SkillItem[]>;

@@ -18,6 +18,7 @@ import {
   ChevronRight,
   ExternalLink,
   FolderOpen,
+  Loader2,
   Plus,
   RefreshCw,
   X,
@@ -33,7 +34,7 @@ import {
   type Role,
   type Cli,
 } from '@/lib/agentshive';
-import type { AgentRuntime } from '@/lib/useActiveProject';
+import { agentActivity, formatActivity, type AgentActivity, type AgentRuntime } from '@/lib/useActiveProject';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -48,6 +49,8 @@ interface RowAgent {
   cli: Cli;
   model: string | null;
   status: AgentStatus;
+  // Live activity for the ACTIVE project's agents (undefined for dormant ones).
+  activity?: AgentActivity;
 }
 
 interface Props {
@@ -115,6 +118,7 @@ export function ProjectSidebar(props: Props) {
 
   const rowsFor = (slug: string): RowAgent[] => {
     if (slug === activeSlug) {
+      const now = Date.now();
       return activeAgents.map((a) => ({
         id: a.id,
         label: a.label,
@@ -122,6 +126,7 @@ export function ProjectSidebar(props: Props) {
         cli: a.cli,
         model: a.model,
         status: a.status,
+        activity: agentActivity(a, now),
       }));
     }
     return (inactiveAgents[slug] || []).map((d) => ({
@@ -263,9 +268,16 @@ export function ProjectSidebar(props: Props) {
                           <StatusDot status={a.status} live={isActive} />
                           <div className="min-w-0 flex-1">
                             <div className="truncate text-[13px] font-medium tracking-tight">{a.label}</div>
-                            <div className="truncate text-[10px] text-muted-foreground">
-                              {a.role} · {a.cli}{a.model ? ` · ${a.model}` : ''}
-                            </div>
+                            {a.activity && a.activity.elapsedSec != null ? (
+                              <div className={cn('flex items-center gap-1 truncate text-[10px]', a.activity.stalled ? 'text-warn' : 'text-accent')}>
+                                <Loader2 className="h-2.5 w-2.5 flex-none animate-spin" />
+                                <span className="truncate">{formatActivity(a.activity)}</span>
+                              </div>
+                            ) : (
+                              <div className="truncate text-[10px] text-muted-foreground">
+                                {a.role} · {a.cli}{a.model ? ` · ${a.model}` : ''}
+                              </div>
+                            )}
                           </div>
                           {canWake && (
                             <Zap

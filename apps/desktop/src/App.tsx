@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Settings as SettingsIcon, LogOut, ShieldAlert, LogIn, RefreshCw } from 'lucide-react';
 import { ah, type ConfigState } from '@/lib/agentshive';
 import { onAuthChange, signOut, supabaseConfigured } from '@/lib/supabase';
@@ -25,12 +25,16 @@ export default function App() {
   // hint while it downloads.
   const [updateReady, setUpdateReady] = useState(false);
   const [downloadPct, setDownloadPct] = useState<number | null>(null);
+  // The running app's version (from the main process), shown in the header
+  // badge so it always matches the deployed release — never a hardcoded string.
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
       const c = await ah().config.get();
       setConfig(c);
     })();
+    ah().app.version().then(setAppVersion).catch(() => {});
     const off = onAuthChange((s) => {
       setSession(s);
       setAuthReady(true);
@@ -89,7 +93,7 @@ export default function App() {
           <img src="./icon.png" alt="" className="h-5 w-5" />
           <span>AgentsHive</span>
           <Badge variant="outline" className="ml-1 text-[10px] normal-case">
-            v2.0
+            {appVersion ? `v${appVersion}` : '…'}
           </Badge>
         </div>
         <div className="flex items-center gap-2">
@@ -155,36 +159,76 @@ export default function App() {
         </div>
       </header>
 
-      <main className={cn('relative z-0 flex-1 overflow-hidden', authed && view === 'workspace' ? '' : 'flex flex-col')}>
-        {view === 'settings' && config ? (
-          <Settings
-            config={config}
-            firstRun={!(config.legacyKeyEnabled && config.apiKeyConfigured) && !session}
-            onSaved={async () => {
-              await reloadConfig();
-              setView(settingsReturn === 'settings' ? 'workspace' : settingsReturn);
-            }}
-            onCancel={() => setView(settingsReturn === 'settings' ? 'workspace' : settingsReturn)}
-          />
-        ) : !authReady || !config ? (
+      <main className="relative z-0 flex-1 overflow-hidden">
+        {!authReady || !config ? (
           <div className="flex h-full items-center justify-center text-sm text-muted-foreground">connecting…</div>
-        ) : view === 'signin' ? (
-          <SignIn
-            legacyKeyEnabled={config.legacyKeyEnabled}
-            onUseLegacyKey={() => { setSettingsReturn('workspace'); setView('settings'); }}
-            onBack={authed ? () => setView('workspace') : undefined}
-          />
         ) : !authed ? (
-          <SignIn
-            legacyKeyEnabled={config.legacyKeyEnabled}
-            onUseLegacyKey={() => { setSettingsReturn('workspace'); setView('settings'); }}
-          />
-        ) : view === 'admin' && isAdmin ? (
-          <AdminPanel />
+          // Hard auth gate: there's no workspace to preserve yet, so the
+          // sign-in / legacy-key-entry screens are full-screen replacements.
+          view === 'settings' ? (
+            <div className="h-full overflow-y-auto scrollbar-thin">
+              <Settings
+                config={config}
+                firstRun={!(config.legacyKeyEnabled && config.apiKeyConfigured) && !session}
+                onSaved={async () => { await reloadConfig(); setView('workspace'); }}
+                onCancel={() => setView('workspace')}
+              />
+            </div>
+          ) : (
+            <SignIn
+              legacyKeyEnabled={config.legacyKeyEnabled}
+              onUseLegacyKey={() => { setSettingsReturn('workspace'); setView('settings'); }}
+            />
+          )
         ) : (
-          <Workspace />
+          // Authed: the Workspace stays MOUNTED so its useActiveProject runtime
+          // (and any in-flight agent turn) survives. Settings / Sign-in / Admin
+          // render as OVERLAYS above it — they never unmount the workspace, so
+          // opening them no longer cancels running agents. The overlay sits
+          // inside <main> (below the z-10 header), so the header stays usable.
+          <>
+            <Workspace />
+            {view === 'settings' && (
+              <Overlay>
+                <Settings
+                  config={config}
+                  firstRun={false}
+                  onSaved={async () => {
+                    await reloadConfig();
+                    setView(settingsReturn === 'settings' ? 'workspace' : settingsReturn);
+                  }}
+                  onCancel={() => setView(settingsReturn === 'settings' ? 'workspace' : settingsReturn)}
+                />
+              </Overlay>
+            )}
+            {view === 'signin' && (
+              <Overlay>
+                <SignIn
+                  legacyKeyEnabled={config.legacyKeyEnabled}
+                  onUseLegacyKey={() => { setSettingsReturn('workspace'); setView('settings'); }}
+                  onBack={() => setView('workspace')}
+                />
+              </Overlay>
+            )}
+            {view === 'admin' && isAdmin && (
+              <Overlay>
+                <AdminPanel />
+              </Overlay>
+            )}
+          </>
         )}
       </main>
+    </div>
+  );
+}
+
+// A full-area scrim layered above the (still-mounted) Workspace. Positioned
+// inside <main>, so it covers the workspace but not the z-10 header — the
+// header controls (Settings gear, Admin, Sign-in, Sign-out) stay clickable.
+function Overlay({ children }: { children: ReactNode }) {
+  return (
+    <div className="absolute inset-0 z-20 overflow-y-auto scrollbar-thin bg-background/95 backdrop-blur-sm">
+      {children}
     </div>
   );
 }

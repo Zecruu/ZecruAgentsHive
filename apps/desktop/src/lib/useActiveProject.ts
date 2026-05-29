@@ -40,6 +40,12 @@ export interface AgentRuntime {
   sessionId: string | null;
   status: AgentStatus;
   inFlight: boolean;
+  // Live-activity timing (transient, not persisted). turnStartedAt is set when a
+  // turn goes in-flight and cleared on terminal settle; it drives the elapsed
+  // timer. lastEventAt bumps on every stream event so the UI can flag a turn
+  // that's still running but has gone quiet (>30s) as "still working".
+  turnStartedAt: number | null;
+  lastEventAt: number | null;
   createdAt: string;
   messages: MessageRuntime[];
   // v2.x: follow-up messages queued while a turn is in-flight; auto-sent in order
@@ -95,6 +101,55 @@ export interface MessageRuntime {
   toolCalls?: ToolCallData[];
   cost?: number;
   attachments?: AttachmentData[];
+}
+
+// Live activity snapshot for the "is this agent alive or frozen?" indicator.
+// Derived (not stored): call agentActivity(agent, Date.now()) each render while
+// a ticker forces re-renders, so elapsedSec visibly increments.
+export interface AgentActivity {
+  state: 'running-tool' | 'thinking' | 'rate-limited' | 'ready' | 'idle' | 'err';
+  label: string; // e.g. "running Bash", "thinking", "rate-limited", "ready"
+  elapsedSec: number | null; // seconds since the turn started; null when not in-flight
+  stalled: boolean; // in-flight but no stream event for >30s — likely a long op, not dead
+}
+
+// STALL threshold: a turn that's in-flight but hasn't emitted a stream event in
+// this long reads as "still working" rather than fabricating progress.
+const STALL_MS = 30000;
+
+function prettyToolName(name: string): string {
+  // mcp__server__tool → tool; otherwise the name as-is.
+  return name.split('__').pop() || name;
+}
+
+export function agentActivity(a: AgentRuntime, now: number): AgentActivity {
+  const elapsedSec = a.inFlight && a.turnStartedAt ? Math.max(0, Math.floor((now - a.turnStartedAt) / 1000)) : null;
+  const stalled = Boolean(a.inFlight && a.lastEventAt && now - a.lastEventAt > STALL_MS);
+  if (a.inFlight) {
+    if (a.status === 'rate-limited') return { state: 'rate-limited', label: 'rate-limited', elapsedSec, stalled };
+    // The current action = the latest still-open tool call in the streaming msg.
+    const msg = a.streamingIdx != null ? a.messages[a.streamingIdx] : undefined;
+    const calls = msg?.toolCalls;
+    if (calls && calls.length) {
+      for (let i = calls.length - 1; i >= 0; i--) {
+        if (!calls[i].completed) {
+          return { state: 'running-tool', label: `running ${prettyToolName(calls[i].name)}`, elapsedSec, stalled };
+        }
+      }
+    }
+    return { state: 'thinking', label: 'thinking', elapsedSec, stalled };
+  }
+  if (a.status === 'err') return { state: 'err', label: 'error', elapsedSec: null, stalled: false };
+  if (a.status === 'idle') return { state: 'idle', label: 'idle', elapsedSec: null, stalled: false };
+  return { state: 'ready', label: 'ready', elapsedSec: null, stalled: false };
+}
+
+// One-line display string for an activity: "running Bash · 14s", "thinking · 22s",
+// "still working · 45s" when stalled, or just "ready"/"idle"/"error" when not in-flight.
+export function formatActivity(act: AgentActivity): string {
+  if (act.elapsedSec == null) return act.label;
+  const head = act.stalled ? 'still working' : act.label;
+  return `${head} · ${act.elapsedSec}s`;
 }
 
 // What to select once the active project's agents finish loading. Set
@@ -357,6 +412,19 @@ export function useActiveProject(project: Project | null): ActiveProject {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
+  // Live-activity ticker. While ANY agent has a turn in-flight, force a
+  // re-render every second so the elapsed timers (ChatPane header + sidebar
+  // rows) visibly increment — the key "it's alive, not frozen" signal. Idle
+  // projects never re-render (guarded by the inFlight check), so this costs
+  // nothing when nothing's running.
+  useEffect(() => {
+    if (!slug) return;
+    const id = setInterval(() => {
+      if (agentsRef.current.some((a) => a.inFlight)) rerender();
+    }, 1000);
+    return () => clearInterval(id);
+  }, [slug, rerender]);
+
   const pickFolder = async () => {
     if (!slug) return;
     const picked = await ah().paths.pick(slug);
@@ -387,6 +455,8 @@ export function useActiveProject(project: Project | null): ActiveProject {
       sessionId: null,
       status: 'ready',
       inFlight: false,
+      turnStartedAt: null,
+      lastEventAt: null,
       createdAt: new Date().toISOString(),
       messages: [],
       queue: [],
@@ -409,6 +479,8 @@ export function useActiveProject(project: Project | null): ActiveProject {
     a.cancelRequested = false;
     a.inFlight = true;
     a.status = 'thinking';
+    a.turnStartedAt = Date.now();
+    a.lastEventAt = Date.now();
     a.messages.push({ role: 'system', text: 'Initializing — verifying scope + reading AGENTS.md…' });
     a.messages.push({ role: 'assistant', text: '', toolCalls: [] });
     a.streamingIdx = a.messages.length - 1;
@@ -438,9 +510,25 @@ export function useActiveProject(project: Project | null): ActiveProject {
     a.cancelRequested = false;
     a.inFlight = true;
     a.status = 'thinking';
+    a.turnStartedAt = Date.now();
+    a.lastEventAt = Date.now();
     rerender();
     persist(a);
     startStreamingChatTurn(a, claudePrompt, false);
+  };
+
+  // Drain the next queued follow-up as a fresh turn. Re-armed on EVERY turn end
+  // (clean completion OR user Stop), so the whole queue sends in order, one per
+  // turn, until empty. The shift happens INSIDE the guards so a message is never
+  // lost to a race (the old code shifted before an async guard and could drop
+  // it). Archived agents (removed from the roster) are skipped — their queue
+  // dies with them.
+  const drainQueue = (a: AgentRuntime) => {
+    if (a.inFlight || a.queue.length === 0) return;
+    if (!agentsRef.current.some((x) => x.id === a.id)) return; // archived
+    const next = a.queue.shift() as string;
+    rerender();
+    _startUserTurn(a, next);
   };
 
   const sendTurn = (prompt: string, attachments?: AttachmentData[]) => {
@@ -513,10 +601,15 @@ export function useActiveProject(project: Project | null): ActiveProject {
         a.cancelRequested = false;
         a.retryCount = 0;
         a.inFlight = false;
+        a.turnStartedAt = null;
         a.status = 'idle';
         a.streamingIdx = null;
         rerender();
         persist(a);
+        // Stop cancels the CURRENT turn but keeps the queue moving — the user
+        // stopped to get to their follow-ups, not to discard them. (Archive
+        // removed the agent from the roster, so drainQueue safely no-ops there.)
+        setTimeout(() => drainQueue(a), 0);
         return;
       }
 
@@ -541,6 +634,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
             a.cancelRequested = false;
             a.retryCount = 0;
             a.inFlight = false;
+            a.turnStartedAt = null;
             a.status = 'idle';
             rerender();
             persist(a);
@@ -549,6 +643,9 @@ export function useActiveProject(project: Project | null): ActiveProject {
           a.messages.push({ role: 'assistant', text: '', toolCalls: [] });
           a.streamingIdx = a.messages.length - 1;
           a.status = 'thinking';
+          // New attempt of the same logical turn — reset the elapsed timer.
+          a.turnStartedAt = Date.now();
+          a.lastEventAt = Date.now();
           rerender();
           startStreamingChatTurn(a, prompt, bootstrap);
         }, backoff);
@@ -559,6 +656,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
       if (!ok && errText) a.messages.push({ role: 'system', text: errText });
       a.retryCount = 0;
       a.inFlight = false;
+      a.turnStartedAt = null;
       a.status = ok ? 'ready' : 'err';
       a.streamingIdx = null;
       rerender();
@@ -578,12 +676,8 @@ export function useActiveProject(project: Project | null): ActiveProject {
         const token = getAccessToken();
         if (token) ah().web.relay(token, parent, slug, a.id, body).catch(() => {});
       }
-      // P4: drain the next queued follow-up (if any) as the next turn.
-      if (a.queue.length > 0) {
-        const next = a.queue.shift() as string;
-        rerender();
-        setTimeout(() => { if (!a.inFlight) _startUserTurn(a, next); }, 0);
-      }
+      // P4: keep draining the queue (one message per turn) until it's empty.
+      setTimeout(() => drainQueue(a), 0);
     };
 
     const offDone = ah().chat.onDone(a.id, ({ code }) => settle(code === 0));
@@ -692,6 +786,8 @@ A new message or question or summary is waiting. Do this in order:
     target.streamingIdx = target.messages.length - 1;
     target.inFlight = true;
     target.status = 'thinking';
+    target.turnStartedAt = Date.now();
+    target.lastEventAt = Date.now();
     rerender();
     persist(target);
     startStreamingChatTurn(target, wakePrompt, false);
@@ -699,6 +795,9 @@ A new message or question or summary is waiting. Do this in order:
 
   const handleEvent = (a: AgentRuntime, ev: ChatEvent) => {
     if (!ev || !ev.type) return;
+    // Any stream event proves the turn is alive — bump the activity heartbeat so
+    // the UI's "still working" stall detection only trips on genuine quiet.
+    a.lastEventAt = Date.now();
     if (ev.type === 'system' && ev.subtype === 'init') {
       if (ev.session_id) a.sessionId = ev.session_id;
       return;
@@ -785,10 +884,13 @@ A new message or question or summary is waiting. Do this in order:
       a.cancelRequested = false;
       a.retryCount = 0;
       a.inFlight = false;
+      a.turnStartedAt = null;
       a.status = 'idle';
       a.streamingIdx = null;
       rerender();
       persist(a);
+      // Stopping during a rate-limit wait still advances the queue.
+      setTimeout(() => drainQueue(a), 0);
       return;
     }
     // Live process: tree-kill it; settle() sees cancelRequested and finishes clean.
@@ -833,6 +935,8 @@ function rehydrate(d: AgentData): AgentRuntime {
     sessionId: d.sessionId || null,
     status: 'idle',
     inFlight: false,
+    turnStartedAt: null,
+    lastEventAt: null,
     createdAt: d.createdAt || new Date().toISOString(),
     messages: (d.messages || []).map((m) => ({
       role: m.role,

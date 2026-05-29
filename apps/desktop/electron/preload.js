@@ -89,6 +89,7 @@ contextBridge.exposeInMainWorld('agentshive', {
   },
   app: {
     hostname: () => ipcRenderer.invoke('app:hostname'),
+    version: () => ipcRenderer.invoke('app:version'),
   },
   skills: {
     list: (projectSlug) => ipcRenderer.invoke('skills:list', { projectSlug }),

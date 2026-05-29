@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Archive, AtSign, ChevronRight, Hexagon, ListPlus, Maximize2, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, Wrench, X as XIcon } from 'lucide-react';
+import { Archive, AtSign, ChevronRight, Hexagon, ListPlus, Loader2, Maximize2, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, Wrench, X as XIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -7,7 +7,7 @@ import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
 import { ah, MODEL_OPTIONS, EFFORT_OPTIONS, type AttachmentData, type SkillItem, type ToolCallData } from '@/lib/agentshive';
-import type { AgentRuntime, MessageRuntime } from '@/lib/useActiveProject';
+import { agentActivity, formatActivity, type AgentRuntime, type MessageRuntime } from '@/lib/useActiveProject';
 import { ToolCallCard } from './ToolCallCard';
 
 interface PendingAttachment {
@@ -251,11 +251,17 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   // number of completed assistant turns.
   const usageCost = agent.messages.reduce((sum, m) => sum + (typeof m.cost === 'number' ? m.cost : 0), 0);
   const usageTurns = agent.messages.filter((m) => m.role === 'assistant' && typeof m.cost === 'number').length;
-  const statusBadge =
-    agent.status === 'thinking' ? <Badge variant="warn">thinking…</Badge>
-    : agent.status === 'rate-limited' ? <Badge variant="warn">rate-limited…</Badge>
-    : agent.status === 'err' ? <Badge variant="err">error</Badge>
-    : agent.status === 'idle' ? <Badge variant="muted">idle</Badge>
+  // Live activity: while in-flight, show the current action + a ticking elapsed
+  // timer (the parent re-renders every second via the hook's activity ticker),
+  // so a long tool call / long generation reads as ALIVE rather than frozen.
+  const activity = agentActivity(agent, Date.now());
+  const statusBadge = agent.inFlight ? (
+    <Badge variant="warn" className="gap-1 normal-case">
+      <Loader2 className="h-3 w-3 animate-spin" />
+      {formatActivity(activity)}
+    </Badge>
+  ) : activity.state === 'err' ? <Badge variant="err">error</Badge>
+    : activity.state === 'idle' ? <Badge variant="muted">idle</Badge>
     : <Badge variant="ok">ready</Badge>;
 
   const orderedSiblings = [...siblings].sort((a, b) => {
