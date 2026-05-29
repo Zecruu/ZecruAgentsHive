@@ -91,6 +91,11 @@ contextBridge.exposeInMainWorld('agentshive', {
     hostname: () => ipcRenderer.invoke('app:hostname'),
     version: () => ipcRenderer.invoke('app:version'),
   },
+  authStore: {
+    get: (key) => ipcRenderer.invoke('authstore:get', { key }),
+    set: (key, value) => ipcRenderer.invoke('authstore:set', { key, value }),
+    remove: (key) => ipcRenderer.invoke('authstore:remove', { key }),
+  },
   skills: {
     list: (projectSlug) => ipcRenderer.invoke('skills:list', { projectSlug }),
   },

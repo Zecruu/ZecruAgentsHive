@@ -22,6 +22,7 @@ import {
   type Project,
   type Role,
   type ToolCallData,
+  type TokenUsage,
 } from '@/lib/agentshive';
 import { getAccessToken, hasSupabaseSession } from '@/lib/supabase';
 import type { LauncherValues } from '@/components/LauncherForm';
@@ -99,7 +100,7 @@ export interface MessageRuntime {
   text: string;
   at?: string;
   toolCalls?: ToolCallData[];
-  cost?: number;
+  tokens?: TokenUsage;
   attachments?: AttachmentData[];
 }
 
@@ -838,8 +839,13 @@ A new message or question or summary is waiting. Do this in order:
     }
     if (ev.type === 'result') {
       const cur = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
-      if (cur && typeof ev.total_cost_usd === 'number') {
-        cur.cost = ev.total_cost_usd;
+      if (cur && ev.usage) {
+        const u = ev.usage;
+        // Real input volume = fresh input + cache creation + cache reads.
+        cur.tokens = {
+          input: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0),
+          output: u.output_tokens || 0,
+        };
         rerender();
       }
       return;
@@ -943,7 +949,7 @@ function rehydrate(d: AgentData): AgentRuntime {
       text: m.text,
       at: m.at,
       toolCalls: m.toolCalls,
-      cost: m.cost,
+      tokens: m.tokens,
       attachments: m.attachments,
     })),
     queue: [],
@@ -974,7 +980,7 @@ function serialize(a: AgentRuntime): AgentData {
       text: m.text,
       at: m.at,
       toolCalls: m.toolCalls,
-      cost: m.cost,
+      tokens: m.tokens,
       attachments: m.attachments,
     })),
   };

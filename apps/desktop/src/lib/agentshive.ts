@@ -89,12 +89,19 @@ export interface AttachmentData {
   mime: string;
 }
 
+// Token usage for one turn (the result event's usage). input folds in the
+// cache creation/read input tokens so it reflects real input volume.
+export interface TokenUsage {
+  input: number;
+  output: number;
+}
+
 export interface MessageData {
   role: 'user' | 'assistant' | 'system';
   text: string;
   at?: string;
   toolCalls?: ToolCallData[];
-  cost?: number;
+  tokens?: TokenUsage;
   attachments?: AttachmentData[];
 }
 
@@ -168,6 +175,12 @@ export interface ChatEvent {
     >;
   };
   total_cost_usd?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
   text?: string;
 }
 
@@ -220,6 +233,11 @@ declare global {
       app: {
         hostname: () => Promise<string>;
         version: () => Promise<string>;
+      };
+      authStore: {
+        get: (key: string) => Promise<string | null>;
+        set: (key: string, value: string) => Promise<{ ok: boolean }>;
+        remove: (key: string) => Promise<{ ok: boolean }>;
       };
       skills: {
         list: (projectSlug: string) => Promise<SkillItem[]>;

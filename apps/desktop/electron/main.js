@@ -647,6 +647,22 @@ function makeCodexEventParser() {
           // now (kept out of the chat to reduce noise).
           break;
         }
+        case 'turn.completed': {
+          // Best-effort token usage so codex agents show a token count too.
+          // Field names vary across codex versions — tolerate the common ones.
+          const u = obj.usage;
+          if (u) {
+            out.push({
+              type: 'result',
+              usage: {
+                input_tokens: u.input_tokens || 0,
+                output_tokens: u.output_tokens || 0,
+                cache_read_input_tokens: u.cached_input_tokens || u.cache_read_input_tokens || 0,
+              },
+            });
+          }
+          break;
+        }
         case 'error': {
           out.push({ type: 'raw', text: 'codex: ' + errorHint(obj.message || JSON.stringify(obj)) });
           break;
@@ -1326,6 +1342,36 @@ ipcMain.handle('app:hostname', () => os.hostname());
 // header version badge so it always matches the deployed release — no manual
 // bump of a hardcoded string.
 ipcMain.handle('app:version', () => app.getVersion());
+
+// --- durable auth store (Supabase session persistence across updates) -------
+// The renderer's localStorage for a file:// origin is not a reliable home for
+// the Supabase session across installs/updates (an update can land the renderer
+// on a fresh storage area, signing the user out). userData IS preserved across
+// updates, so we back supabase-js's auth storage with a small JSON file there.
+const AUTH_STORE_FILE = () => path.join(app.getPath('userData'), 'auth-store.json');
+function readAuthStore() {
+  try { return JSON.parse(fs.readFileSync(AUTH_STORE_FILE(), 'utf8')) || {}; } catch { return {}; }
+}
+function writeAuthStore(obj) {
+  fs.mkdirSync(path.dirname(AUTH_STORE_FILE()), { recursive: true });
+  fs.writeFileSync(AUTH_STORE_FILE(), JSON.stringify(obj), 'utf8');
+}
+ipcMain.handle('authstore:get', (_e, { key }) => {
+  const s = readAuthStore();
+  return Object.prototype.hasOwnProperty.call(s, key) ? s[key] : null;
+});
+ipcMain.handle('authstore:set', (_e, { key, value }) => {
+  const s = readAuthStore();
+  s[key] = value;
+  writeAuthStore(s);
+  return { ok: true };
+});
+ipcMain.handle('authstore:remove', (_e, { key }) => {
+  const s = readAuthStore();
+  delete s[key];
+  writeAuthStore(s);
+  return { ok: true };
+});
 
 // --- slash-command / skill catalog ---------------------------------------
 // Enumerate file-based skills + prompt commands for the chat input's `/`

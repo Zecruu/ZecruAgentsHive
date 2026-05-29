@@ -18,9 +18,28 @@ const ANON: string | undefined = env.VITE_SUPABASE_ANON_KEY;
 
 export const supabaseConfigured = Boolean(URL && ANON);
 
+// Persist the session in a userData-backed file (via the main process) instead
+// of renderer localStorage. localStorage for a file:// origin doesn't reliably
+// survive an app install/update, which signed the operator out on every update;
+// userData is preserved across updates, so the session sticks. Falls back to
+// supabase-js's default (localStorage) if the bridge isn't present.
+const electronAuthStorage =
+  typeof window !== 'undefined' && window.agentshive?.authStore
+    ? {
+        getItem: (key: string) => window.agentshive.authStore.get(key),
+        setItem: (key: string, value: string) => window.agentshive.authStore.set(key, value).then(() => undefined),
+        removeItem: (key: string) => window.agentshive.authStore.remove(key).then(() => undefined),
+      }
+    : undefined;
+
 export const supabase: SupabaseClient | null = supabaseConfigured
   ? createClient(URL as string, ANON as string, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
+      auth: {
+        storage: electronAuthStorage,
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+      },
     })
   : null;
 

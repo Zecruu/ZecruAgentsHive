@@ -247,10 +247,10 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   };
 
   const empty = agent.messages.length === 0;
-  // Per-agent usage: running total cost (sum of per-turn result costs) + the
+  // Per-agent usage: running total tokens (sum of per-turn input+output) + the
   // number of completed assistant turns.
-  const usageCost = agent.messages.reduce((sum, m) => sum + (typeof m.cost === 'number' ? m.cost : 0), 0);
-  const usageTurns = agent.messages.filter((m) => m.role === 'assistant' && typeof m.cost === 'number').length;
+  const usageTokens = agent.messages.reduce((sum, m) => sum + (m.tokens ? m.tokens.input + m.tokens.output : 0), 0);
+  const usageTurns = agent.messages.filter((m) => m.role === 'assistant' && m.tokens).length;
   // Live activity: while in-flight, show the current action + a ticking elapsed
   // timer (the parent re-renders every second via the hook's activity ticker),
   // so a long tool call / long generation reads as ALIVE rather than frozen.
@@ -297,9 +297,9 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
           {usageTurns > 0 && (
             <span
               className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground"
-              title={`Total cost across ${usageTurns} turn${usageTurns > 1 ? 's' : ''} this session`}
+              title={`${usageTokens.toLocaleString()} tokens across ${usageTurns} turn${usageTurns > 1 ? 's' : ''} this session`}
             >
-              ${usageCost.toFixed(4)} · {usageTurns} turn{usageTurns > 1 ? 's' : ''}
+              {fmtTokens(usageTokens)} tok · {usageTurns} turn{usageTurns > 1 ? 's' : ''}
             </span>
           )}
           {statusBadge}
@@ -558,6 +558,13 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   );
 }
 
+// Compact token count: 850 → "850", 4200 → "4.2k", 1_500_000 → "1.5M".
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(n >= 10_000 ? 0 : 1) + 'k';
+  return String(n);
+}
+
 function MessageBubble({ message }: { message: MessageRuntime }) {
   const roleClasses =
     message.role === 'user'
@@ -578,9 +585,12 @@ function MessageBubble({ message }: { message: MessageRuntime }) {
         <span className={cn('rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider', roleClasses)}>
           {message.role}
         </span>
-        {typeof message.cost === 'number' && (
-          <span className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground">
-            ${message.cost.toFixed(4)}
+        {message.tokens && (
+          <span
+            className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground"
+            title={`${message.tokens.input.toLocaleString()} in · ${message.tokens.output.toLocaleString()} out`}
+          >
+            {fmtTokens(message.tokens.input + message.tokens.output)} tok
           </span>
         )}
       </div>
