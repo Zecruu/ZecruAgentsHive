@@ -1,0 +1,18 @@
+# Keep the Docker build context small + reproducible. The server image needs only
+# pyproject.toml, src/, run.py, and apps/web SOURCE (built fresh in-image). Exclude
+# the desktop Electron app entirely, all node_modules, build outputs, VCS + secrets.
+.git
+.gitignore
+**/node_modules
+**/dist
+**/dist-electron
+apps/desktop
+*.spec
+.venv
+venv
+**/__pycache__
+**/*.pyc
+.env
+.env.*
+**/.env
+**/.env.*
