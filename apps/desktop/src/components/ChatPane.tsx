@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Archive, AtSign, ChevronRight, Hexagon, ListPlus, Loader2, Maximize2, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, Wrench, X as XIcon } from 'lucide-react';
+import { Archive, AtSign, ChevronRight, Hexagon, ImageIcon, ListPlus, Loader2, Maximize2, MessageSquare, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, TerminalSquare, Wrench, X as XIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -256,6 +256,11 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   // timer (the parent re-renders every second via the hook's activity ticker),
   // so a long tool call / long generation reads as ALIVE rather than frozen.
   const activity = agentActivity(agent, Date.now());
+  const statusDotClass =
+    agent.inFlight ? 'bg-warn animate-pulse-ring'
+    : activity.state === 'err' ? 'bg-destructive'
+    : activity.state === 'idle' ? 'bg-muted-foreground'
+    : 'bg-success';
   const statusBadge = agent.inFlight ? (
     <Badge variant="warn" className="gap-1 normal-case">
       <Loader2 className="h-3 w-3 animate-spin" />
@@ -284,17 +289,25 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
       onDragLeave={() => setDragOver(false)}
       onDrop={onDrop}
     >
-      <div className="flex flex-none items-center justify-between border-b border-border/60 px-5 py-3">
-        <div>
-          <h3 className="text-[15px] font-semibold tracking-tight">{agent.label}</h3>
-          <code className="text-[11px] text-muted-foreground">
+      <div className="flex flex-none flex-col border-b border-border/60 bg-card/35">
+        <div className="flex min-h-[58px] items-center justify-between gap-4 px-5 py-3">
+          <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span
+              className={cn('h-2.5 w-2.5 flex-none rounded-full', statusDotClass)}
+              style={{ boxShadow: '0 0 8px -1px currentColor' }}
+              title={agent.inFlight ? 'Running' : activity.state}
+            />
+            <h3 className="truncate text-[16px] font-semibold tracking-tight">{agent.label}</h3>
+          </div>
+          <div className="mt-1 font-mono text-[11px] text-muted-foreground">
             {agent.role} · {agent.cli}{agent.model ? ` · ${agent.model}` : ''}
             {/* codex always runs --dangerously-bypass-approvals-and-sandbox, so it's
                 unsandboxed regardless of the skip-perms checkbox — surface that. */}
             {agent.cli === 'codex' ? ' · unsandboxed' : (agent.skipPerms ? ' · skip-perms' : '')}
-          </code>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
           {agent.readOnly && (
             <Badge variant="muted" className="normal-case">from another device · read-only</Badge>
           )}
@@ -389,20 +402,45 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
           <Button variant="ghost" size="sm" onClick={onArchive}>
             <Archive className="h-3.5 w-3.5" /> Archive
           </Button>
+          </div>
+        </div>
+        <div className="flex min-h-[36px] items-center justify-between gap-3 border-t border-border/40 px-5 py-2">
+          <div className="flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
+            <TerminalSquare className="h-3.5 w-3.5 flex-none" />
+            <span className="truncate">Next turn uses current model settings; in-flight work keeps its launch settings.</span>
+          </div>
+          <div className="hidden shrink-0 items-center gap-2 lg:flex">
+            {usageTurns > 0 && (
+              <span
+                className="rounded-full border border-border bg-input/55 px-2.5 py-1 text-[10px] font-medium text-muted-foreground"
+                title={`${usageTokens.toLocaleString()} tokens across ${usageTurns} turn${usageTurns > 1 ? 's' : ''} this session`}
+              >
+                {fmtTokens(usageTokens)} tok / {usageTurns} turn{usageTurns > 1 ? 's' : ''}
+              </span>
+            )}
+            {statusBadge}
+          </div>
         </div>
       </div>
 
-      <div ref={messagesRef} className="flex-1 overflow-y-auto scrollbar-thin px-5 py-4">
+      <div ref={messagesRef} className="flex-1 overflow-y-auto scrollbar-thin px-4 py-5">
         {empty ? (
-          <div className="mx-auto max-w-md py-16 text-center">
-            <Hexagon className="mx-auto h-8 w-8 text-accent" style={{ filter: 'drop-shadow(0 0 12px hsl(38 92% 60% / 0.4))' }} />
-            <div className="mt-2 text-sm">Type a prompt, paste an image, or drop a file.</div>
-            <p className="text-[12px] text-muted-foreground">
+          <div className="mx-auto flex max-w-md flex-col items-center py-20 text-center">
+            <div className="flex h-12 w-12 items-center justify-center rounded-lg border border-accent/25 bg-accent/10 text-accent">
+              <Hexagon className="h-6 w-6" />
+            </div>
+            <div className="mt-4 text-sm font-medium">Open a turn with {agent.label}</div>
+            <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">
               Reasoning, tool calls, and results render as cards — not raw TTY.
             </p>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <EmptyChip icon={<MessageSquare className="h-3 w-3" />} label="message" />
+              <EmptyChip icon={<ImageIcon className="h-3 w-3" />} label="image" />
+              <EmptyChip icon={<TerminalSquare className="h-3 w-3" />} label="/ skills" />
+            </div>
           </div>
         ) : (
-          <div className="space-y-3.5">
+          <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
             {agent.messages.map((m, i) => (
               <MessageBubble key={i} message={m} />
             ))}
@@ -410,10 +448,11 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
         )}
       </div>
 
-      <div className="flex-none border-t border-border/60 px-5 py-3">
+      <div className="flex-none border-t border-border/60 bg-card/35 px-4 py-3">
+        <div className="mx-auto w-full max-w-4xl">
         {orderedSiblings.length > 0 && (
-          <div className="mb-2 flex flex-wrap items-center gap-1.5">
-            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Mention</span>
+          <div className="mb-2 flex flex-wrap items-center gap-1.5 rounded-md border border-border/50 bg-input/25 px-2 py-1.5">
+            <span className="mr-1 text-[10px] uppercase tracking-wider text-muted-foreground">Mention</span>
             {orderedSiblings.map((s) => (
               <button
                 key={s.id}
@@ -436,9 +475,9 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
         )}
 
         {pending.length > 0 && (
-          <div className="mb-2 flex flex-wrap items-center gap-2">
+          <div className="mb-2 flex gap-2 overflow-x-auto rounded-md border border-border/50 bg-input/25 p-2 scrollbar-thin">
             {pending.map((p, i) => (
-              <div key={i} className="relative inline-flex items-center gap-2 rounded-md border border-border bg-input/60 p-1 pr-2">
+              <div key={i} className="relative inline-flex shrink-0 items-center gap-2 rounded-md border border-border bg-input/65 p-1 pr-2">
                 <img src={p.dataUrl} alt={p.name} className="h-10 w-10 rounded object-cover" />
                 <div className="flex flex-col">
                   <span className="max-w-[180px] truncate text-[11px]">{p.name}</span>
@@ -453,7 +492,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
         )}
 
         {agent.queue.length > 0 && (
-          <div className="mb-2 space-y-1">
+          <div className="mb-2 space-y-1.5 rounded-md border border-border/50 bg-input/25 p-2">
             <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
               Queued ({agent.queue.length}) — sends after the current turn
             </span>
@@ -475,7 +514,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
 
         <div className="relative">
         {showSkillMenu && (
-          <div className="absolute bottom-full left-0 right-0 z-20 mb-1.5 max-h-64 overflow-y-auto scrollbar-thin rounded-lg border border-border bg-popover/95 p-1 shadow-[0_12px_40px_-16px_hsl(222_60%_0%/0.7)] backdrop-blur">
+          <div className="absolute bottom-full left-0 right-0 z-20 mb-2 max-h-64 overflow-y-auto scrollbar-thin rounded-lg border border-border bg-popover/95 p-1.5 shadow-[0_12px_40px_-16px_hsl(222_60%_0%/0.7)] backdrop-blur">
             <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
               Skills &amp; commands · ↑↓ to navigate · Enter to insert
             </div>
@@ -503,8 +542,8 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
         )}
         <div
           className={cn(
-            'flex items-end gap-2 rounded-lg border border-input bg-input/70 p-2 transition-all',
-            'focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30',
+            'flex items-end gap-2 rounded-lg border border-input bg-input/75 p-2 shadow-[0_1px_0_hsl(0_0%_100%/0.04)_inset] transition-all',
+            'focus-within:border-ring focus-within:bg-input/90 focus-within:ring-2 focus-within:ring-ring/30',
             dragOver && 'border-primary ring-2 ring-primary/30',
           )}
         >
@@ -537,7 +576,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             onPaste={onPaste}
             disabled={agent.readOnly}
             placeholder={agent.readOnly ? 'Read-only — this conversation was synced from another device.' : dragOver ? 'Drop image to attach…' : `Message ${agent.label} — Enter to send, Shift+Enter for newline · paste/drop images`}
-            className="min-h-[64px] max-h-[480px] resize-y border-0 bg-transparent p-1 shadow-none focus-visible:ring-0 focus-visible:border-0"
+            className="min-h-[72px] max-h-[480px] resize-y border-0 bg-transparent p-1 text-[13.5px] leading-relaxed shadow-none focus-visible:ring-0 focus-visible:border-0"
             rows={3}
           />
           <div className="flex flex-col gap-1.5">
@@ -559,6 +598,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
         </div>
         </div>
       </div>
+      </div>
     </div>
   );
 }
@@ -570,6 +610,15 @@ function fmtTokens(n: number): string {
   return String(n);
 }
 
+function EmptyChip({ icon, label }: { icon: React.ReactNode; label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-input/45 px-2.5 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+      {icon}
+      {label}
+    </span>
+  );
+}
+
 function MessageBubble({ message }: { message: MessageRuntime }) {
   const roleClasses =
     message.role === 'user'
@@ -579,14 +628,17 @@ function MessageBubble({ message }: { message: MessageRuntime }) {
         : 'text-muted-foreground bg-muted/40';
   const bodyClasses =
     message.role === 'user'
-      ? 'border-primary/30 bg-gradient-to-b from-primary/10 to-primary/0'
+      ? 'border-primary/30 bg-gradient-to-b from-primary/14 to-primary/5'
       : message.role === 'assistant'
         ? 'border-accent/20 bg-card/70'
         : 'border-border/40 bg-muted/20 text-muted-foreground text-[12.5px]';
+  const isUser = message.role === 'user';
+  const isAssistant = message.role === 'assistant';
 
   return (
-    <div className="animate-fade-up space-y-1.5">
-      <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+    <div className={cn('animate-fade-up flex w-full', isUser ? 'justify-end' : 'justify-start')}>
+      <div className={cn('space-y-1.5', isUser ? 'w-fit max-w-[78%]' : 'w-full')}>
+      <div className={cn('flex items-center gap-2 text-[11px] text-muted-foreground', isUser && 'justify-end')}>
         <span className={cn('rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider', roleClasses)}>
           {message.role}
         </span>
@@ -599,7 +651,8 @@ function MessageBubble({ message }: { message: MessageRuntime }) {
           </span>
         )}
       </div>
-      <div className={cn('whitespace-pre-wrap break-words rounded-lg border px-3.5 py-2.5 text-[13.5px] leading-relaxed', bodyClasses)}>
+      <div className={cn('relative whitespace-pre-wrap break-words rounded-lg border px-3.5 py-3 text-[13.5px] leading-relaxed shadow-[0_1px_0_hsl(0_0%_100%/0.03)_inset]', bodyClasses, isAssistant && 'pl-4')}>
+        {isAssistant && <span className="absolute bottom-2 left-0 top-2 w-0.5 rounded-full bg-accent/55" />}
         {message.text || (message.role === 'assistant' && <span className="text-muted-foreground">…</span>)}
         {message.attachments && message.attachments.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-2">
@@ -621,6 +674,7 @@ function MessageBubble({ message }: { message: MessageRuntime }) {
       {message.toolCalls && message.toolCalls.length > 0 && (
         <ToolCallGroup calls={message.toolCalls} />
       )}
+      </div>
     </div>
   );
 }
@@ -647,12 +701,15 @@ function ToolCallGroup({ calls }: { calls: ToolCallData[] }) {
       <button
         type="button"
         onClick={() => setUserToggled(!open)}
-        className="flex w-full items-center gap-2 rounded-md border border-border/60 bg-input/40 px-3 py-1.5 text-left text-xs transition-colors hover:bg-secondary/40"
+        className="flex w-full items-center gap-2 rounded-md border border-border/60 bg-input/45 px-3 py-2 text-left text-xs transition-colors hover:bg-secondary/40"
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', open && 'rotate-90')} />
         <Wrench className="h-3 w-3 shrink-0 text-muted-foreground" />
         <span className="font-medium">{total} tool call{total > 1 ? 's' : ''}</span>
-        <Badge variant={status.variant} className="ml-auto">{status.label}</Badge>
+        <Badge variant={status.variant} className="ml-auto gap-1">
+          {anyRunning && <Loader2 className="h-3 w-3 animate-spin" />}
+          {status.label}
+        </Badge>
       </button>
       {open && (
         <div className="mt-1.5 space-y-1.5">
