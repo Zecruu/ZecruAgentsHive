@@ -40,6 +40,8 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   const [busy, setBusy] = useState(false);
   // Per-agent model/effort tuning popover (changes apply on the next turn).
   const [tuneOpen, setTuneOpen] = useState(false);
+  // Whether this project's folder is a git repo — gates the per-turn Undo action.
+  const [gitRepo, setGitRepo] = useState(false);
   // `/` slash-command autocomplete. Skills/commands live under ~/.claude; they
   // expand in claude's headless --print mode (codex doesn't expand them, but we
   // still surface the list for reference + quick insert, per the operator).
@@ -57,6 +59,13 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
     ah().skills.list(projectSlug)
       .then((s) => { if (alive) setSkills(s || []); })
       .catch((e) => { console.warn('skills.list failed', e); if (alive) setSkills([]); });
+    return () => { alive = false; };
+  }, [projectSlug]);
+
+  // Is the project folder a git repo? Gates the per-turn Undo action.
+  useEffect(() => {
+    let alive = true;
+    ah().files.isGitRepo(projectSlug).then((r) => { if (alive) setGitRepo(Boolean(r)); }).catch(() => {});
     return () => { alive = false; };
   }, [projectSlug]);
 
@@ -464,7 +473,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             {agent.messages.map((m, i) => (
               <Fragment key={i}>
                 <MessageBubble message={m} />
-                {turnEndFiles[i] && <ChangedFilesBar files={turnEndFiles[i]} />}
+                {turnEndFiles[i] && <ChangedFilesBar files={turnEndFiles[i]} projectSlug={projectSlug} canUndo={gitRepo} />}
               </Fragment>
             ))}
           </div>
@@ -765,23 +774,74 @@ function ToolCallGroup({ calls }: { calls: ToolCallData[] }) {
 }
 
 // Per-TURN aggregate changed-files bar (Cursor-style), docked at the end of a
-// turn: all files the turn EDITED/WROTE, deduped, with Review to expand the list.
-// (Undo/Keep is intentionally not here yet — gated, pending operator scope.)
-function ChangedFilesBar({ files }: { files: string[] }) {
+// turn: all files the turn EDITED/WROTE, deduped. Review expands the list; Undo
+// reverts them to git HEAD (git-repo-gated, current contents backed up first);
+// Keep dismisses the bar.
+function ChangedFilesBar({ files, projectSlug, canUndo }: { files: string[]; projectSlug: string; canUndo: boolean }) {
   const [open, setOpen] = useState(false);
+  const [state, setState] = useState<'idle' | 'undoing' | 'reverted' | 'error'>('idle');
+  const [note, setNote] = useState<string | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+
+  if (dismissed) return null;
+
+  const undo = async () => {
+    if (!canUndo || state === 'undoing' || state === 'reverted') return;
+    setState('undoing');
+    try {
+      const r = await ah().files.undoEdits(projectSlug, files);
+      if (r.ok) {
+        setState('reverted');
+        setNote(r.skipped && r.skipped.length ? `${r.skipped.length} untracked skipped` : null);
+      } else {
+        setState('error');
+        setNote(r.reason || 'undo failed');
+      }
+    } catch {
+      setState('error');
+      setNote('undo failed');
+    }
+  };
+
   return (
     <div className="mx-auto w-full max-w-4xl">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 rounded-md border border-border/60 bg-input/35 px-3 py-1.5 text-left text-[11px] transition-colors hover:bg-secondary/30"
-        title="Files changed this turn"
-      >
-        <FilePen className="h-3 w-3 shrink-0 text-accent" />
-        <span className="font-medium">{files.length} File{files.length > 1 ? 's' : ''}</span>
-        <span className="ml-auto text-muted-foreground">Review</span>
-        <ChevronRight className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', open && 'rotate-90')} />
-      </button>
+      <div className="flex items-center gap-2 rounded-md border border-border/60 bg-input/35 px-3 py-1.5 text-[11px]">
+        <button type="button" onClick={() => setOpen((v) => !v)} className="flex min-w-0 items-center gap-2 text-left transition-colors hover:text-foreground" title="Files changed this turn">
+          <FilePen className="h-3 w-3 shrink-0 text-accent" />
+          <span className="font-medium">{files.length} File{files.length > 1 ? 's' : ''}</span>
+          <span className="text-muted-foreground">Review</span>
+          <ChevronRight className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', open && 'rotate-90')} />
+        </button>
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {state === 'reverted' ? (
+            <span className="text-success">Reverted{note ? ` · ${note}` : ''}</span>
+          ) : state === 'error' ? (
+            <span className="text-destructive" title={note || ''}>Undo failed</span>
+          ) : (
+            <>
+              {canUndo && (
+                <button
+                  type="button"
+                  onClick={undo}
+                  disabled={state === 'undoing'}
+                  title="Revert this turn's files to the last commit (not the exact pre-turn state). Current contents are backed up first."
+                  className="rounded border border-border px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground disabled:opacity-50"
+                >
+                  {state === 'undoing' ? 'Undoing…' : 'Undo'}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setDismissed(true)}
+                title="Dismiss — keep the changes"
+                className="rounded border border-border px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground"
+              >
+                Keep
+              </button>
+            </>
+          )}
+        </div>
+      </div>
       {open && (
         <div className="mt-1 space-y-0.5 pl-2.5">
           {files.map((p) => (

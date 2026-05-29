@@ -13,7 +13,7 @@ const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 // node-pty for embedded terminals. We use the @homebridge prebuilt fork
 // since the upstream node-pty needs Visual Studio Build Tools on Windows.
 let pty = null;
@@ -1368,6 +1368,80 @@ function writeAuthStore(obj) {
   fs.mkdirSync(path.dirname(AUTH_STORE_FILE()), { recursive: true });
   fs.writeFileSync(AUTH_STORE_FILE(), JSON.stringify(obj), 'utf8');
 }
+// --- file-edit Undo/Keep (git-restore) --------------------------------------
+// Revert a turn's changed files to their git HEAD. SECURITY: git runs via
+// execFile with an ARGS ARRAY (no shell), and the file_paths come from agent
+// tool inputs (untrusted) — the `--` separator + no-shell exec prevents any
+// argument/shell injection. Only TRACKED paths inside the project's git worktree
+// are touched; we back up current contents to userData first so Undo is itself
+// recoverable.
+function _projectCwd(projectSlug) {
+  const cfg = readConfig();
+  const cwd = projectSlug ? (cfg.projectPaths || {})[projectSlug] : null;
+  return cwd && fs.existsSync(cwd) ? cwd : null;
+}
+function _runGit(cwd, args) {
+  return new Promise((resolve) => {
+    execFile('git', args, { cwd, windowsHide: true, timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || '') });
+    });
+  });
+}
+async function _isGitRepo(cwd) {
+  const r = await _runGit(cwd, ['rev-parse', '--is-inside-work-tree']);
+  return r.code === 0 && r.stdout.trim() === 'true';
+}
+
+ipcMain.handle('files:isGitRepo', async (_e, { projectSlug }) => {
+  const cwd = _projectCwd(projectSlug);
+  if (!cwd) return false;
+  return _isGitRepo(cwd);
+});
+
+ipcMain.handle('files:undoEdits', async (_e, { projectSlug, paths }) => {
+  const cwd = _projectCwd(projectSlug);
+  if (!cwd) return { ok: false, reason: 'no folder set for this project' };
+  if (!Array.isArray(paths) || paths.length === 0) return { ok: false, reason: 'no paths' };
+  if (!(await _isGitRepo(cwd))) return { ok: false, reason: 'not-a-git-repo' };
+
+  // Keep only paths that are TRACKED in this worktree (untracked/new files have
+  // no HEAD to restore to — report them as skipped rather than touching them).
+  const clean = paths.filter((p) => typeof p === 'string' && p.length > 0);
+  const tracked = [];
+  const skipped = [];
+  for (const p of clean) {
+    const r = await _runGit(cwd, ['ls-files', '--error-unmatch', '--', p]);
+    if (r.code === 0) tracked.push(p);
+    else skipped.push(p);
+  }
+  if (tracked.length === 0) return { ok: false, reason: 'no tracked files to revert', skipped };
+
+  // Back up current contents BEFORE reverting (recoverable Undo).
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupDir = path.join(app.getPath('userData'), 'edit-backups', safeSlug(projectSlug || 'project'), stamp);
+  const manifest = [];
+  try {
+    fs.mkdirSync(backupDir, { recursive: true });
+    tracked.forEach((p, i) => {
+      try {
+        if (fs.existsSync(p)) {
+          const dest = path.join(backupDir, `${i}__${String(p).replace(/[^a-z0-9._-]/gi, '_').slice(-80)}`);
+          fs.copyFileSync(p, dest);
+          manifest.push({ path: p, backup: dest });
+        }
+      } catch { /* skip unreadable */ }
+    });
+    fs.writeFileSync(path.join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+  } catch { /* backup is best-effort; proceed with the revert */ }
+
+  // Revert tracked paths to HEAD — execFile, args array, `--` guard. No shell.
+  const res = await _runGit(cwd, ['restore', '--source=HEAD', '--', ...tracked]);
+  if (res.code !== 0) {
+    return { ok: false, reason: (res.stderr || 'git restore failed').trim().slice(0, 300), backupDir };
+  }
+  return { ok: true, reverted: tracked, skipped, backupDir };
+});
+
 ipcMain.handle('authstore:get', (_e, { key }) => {
   const s = readAuthStore();
   return Object.prototype.hasOwnProperty.call(s, key) ? s[key] : null;

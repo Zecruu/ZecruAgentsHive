@@ -96,6 +96,10 @@ contextBridge.exposeInMainWorld('agentshive', {
     set: (key, value) => ipcRenderer.invoke('authstore:set', { key, value }),
     remove: (key) => ipcRenderer.invoke('authstore:remove', { key }),
   },
+  files: {
+    isGitRepo: (projectSlug) => ipcRenderer.invoke('files:isGitRepo', { projectSlug }),
+    undoEdits: (projectSlug, paths) => ipcRenderer.invoke('files:undoEdits', { projectSlug, paths }),
+  },
   skills: {
     list: (projectSlug) => ipcRenderer.invoke('skills:list', { projectSlug }),
   },

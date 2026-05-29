@@ -246,6 +246,10 @@ declare global {
         set: (key: string, value: string) => Promise<{ ok: boolean }>;
         remove: (key: string) => Promise<{ ok: boolean }>;
       };
+      files: {
+        isGitRepo: (projectSlug: string) => Promise<boolean>;
+        undoEdits: (projectSlug: string, paths: string[]) => Promise<UndoEditsResult>;
+      };
       skills: {
         list: (projectSlug: string) => Promise<SkillItem[]>;
       };
@@ -404,6 +408,15 @@ export interface AdminUser {
   created_at: string | null;
   project_count: number;
   mission_count: number;
+}
+
+// Result of a git-restore Undo of a turn's changed files.
+export interface UndoEditsResult {
+  ok: boolean;
+  reverted?: string[];
+  skipped?: string[];
+  reason?: string;
+  backupDir?: string;
 }
 
 export const ah = () => window.agentshive;
