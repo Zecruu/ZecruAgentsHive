@@ -1,8 +1,8 @@
 import { useState } from 'react';
-import { ChevronRight, Loader2 } from 'lucide-react';
+import { ChevronRight, FileText, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
-import type { ToolCallData } from '@/lib/agentshive';
+import { basename, toolFileTarget, type ToolCallData } from '@/lib/agentshive';
 
 interface Props {
   call: ToolCallData;
@@ -12,6 +12,7 @@ export function ToolCallCard({ call }: Props) {
   const [open, setOpen] = useState(false);
   const status = !call.completed ? 'running' : call.isError ? 'err' : 'ok';
   const variant = status === 'ok' ? 'ok' : status === 'err' ? 'err' : 'muted';
+  const file = toolFileTarget(call);
   const inputPreview = oneLine(call.input);
   const resultText = typeof call.result === 'string' ? call.result : JSON.stringify(call.result ?? null, null, 2);
   const inputJson = JSON.stringify(call.input || {}, null, 2);
@@ -25,7 +26,19 @@ export function ToolCallCard({ call }: Props) {
       >
         <ChevronRight className={cn('h-3 w-3 transition-transform', open && 'rotate-90')} />
         <span className="font-mono text-[11.5px] font-semibold text-accent">{call.name}</span>
-        <span className="flex-1 truncate font-mono text-[11px] text-muted-foreground">{inputPreview}</span>
+        {file && (
+          <span
+            className={cn(
+              'inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[10px]',
+              file.changed ? 'border-accent/40 bg-accent/10 text-accent' : 'border-border bg-input/40 text-muted-foreground',
+            )}
+            title={`${file.changed ? 'edited' : 'read'} · ${file.path}`}
+          >
+            <FileText className="h-2.5 w-2.5" />
+            {basename(file.path)}
+          </span>
+        )}
+        <span className="flex-1 truncate font-mono text-[11px] text-muted-foreground">{file ? '' : inputPreview}</span>
         {status === 'running' && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
         <Badge variant={variant} className="ml-auto">{status === 'running' ? 'running…' : status}</Badge>
       </button>

@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { Archive, AtSign, ChevronRight, Hexagon, ImageIcon, ListPlus, Loader2, Maximize2, MessageSquare, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, TerminalSquare, Wrench, X as XIcon } from 'lucide-react';
+import { Archive, AtSign, ChevronRight, FilePen, FileText, Hexagon, ImageIcon, ListPlus, Loader2, Maximize2, MessageSquare, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, TerminalSquare, Wrench, X as XIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
-import { ah, MODEL_OPTIONS, EFFORT_OPTIONS, type AttachmentData, type SkillItem, type ToolCallData } from '@/lib/agentshive';
+import { ah, MODEL_OPTIONS, EFFORT_OPTIONS, basename, changedFiles, type AttachmentData, type SkillItem, type ToolCallData } from '@/lib/agentshive';
 import { agentActivity, formatActivity, type AgentRuntime, type MessageRuntime } from '@/lib/useActiveProject';
 import { ToolCallCard } from './ToolCallCard';
 
@@ -706,11 +706,14 @@ function MessageBubble({ message }: { message: MessageRuntime }) {
 // A manual toggle overrides the auto behavior.
 function ToolCallGroup({ calls }: { calls: ToolCallData[] }) {
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
+  const [filesOpen, setFilesOpen] = useState(false);
   const total = calls.length;
   const running = calls.filter((c) => !c.completed).length;
   const errored = calls.filter((c) => c.completed && c.isError).length;
   const anyRunning = running > 0;
   const open = userToggled !== null ? userToggled : anyRunning;
+  // Cursor-style "N Files" changed-files summary for this tool group.
+  const changed = changedFiles(calls);
 
   const status: { variant: 'ok' | 'err' | 'warn'; label: string } =
     anyRunning ? { variant: 'warn', label: `${running} running…` }
@@ -732,6 +735,32 @@ function ToolCallGroup({ calls }: { calls: ToolCallData[] }) {
           {status.label}
         </Badge>
       </button>
+      {changed.length > 0 && (
+        <div className="mt-1">
+          <button
+            type="button"
+            onClick={() => setFilesOpen((v) => !v)}
+            className="flex w-full items-center gap-2 rounded-md border border-border/50 bg-input/30 px-3 py-1.5 text-left text-[11px] transition-colors hover:bg-secondary/30"
+            title="Files changed this step"
+          >
+            <FilePen className="h-3 w-3 shrink-0 text-accent" />
+            <span className="font-medium">{changed.length} file{changed.length > 1 ? 's' : ''} changed</span>
+            <span className="ml-auto text-muted-foreground">Review</span>
+            <ChevronRight className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', filesOpen && 'rotate-90')} />
+          </button>
+          {filesOpen && (
+            <div className="mt-1 space-y-0.5 pl-2.5">
+              {changed.map((p) => (
+                <div key={p} className="flex items-center gap-1.5 text-[11px]" title={p}>
+                  <FileText className="h-3 w-3 shrink-0 text-accent" />
+                  <span className="font-mono">{basename(p)}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground opacity-70">{p}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       {open && (
         <div className="mt-1.5 space-y-1.5">
           {calls.map((tc) => (

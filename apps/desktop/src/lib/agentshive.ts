@@ -408,6 +408,43 @@ export interface AdminUser {
 
 export const ah = () => window.agentshive;
 
+// --- file-edit visibility (Cursor-style "what files the agent touched") -------
+// Built-in claude tools that touch a file carry the path in their input. Edit/
+// Write/MultiEdit/NotebookEdit CHANGE the file; Read just reads it. (codex shell
+// calls have no file_path → null.)
+const FILE_CHANGE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+export function toolFileTarget(call: ToolCallData): { path: string; changed: boolean } | null {
+  const name = (call.name || '').split('__').pop() || call.name || '';
+  const input = (call.input || {}) as Record<string, unknown>;
+  const raw = input.file_path ?? input.notebook_path;
+  const path = typeof raw === 'string' && raw ? raw : null;
+  if (!path) return null;
+  if (FILE_CHANGE_TOOLS.has(name)) return { path, changed: true };
+  if (name === 'Read') return { path, changed: false };
+  return null;
+}
+
+/** Deduped set of files CHANGED (not just read) by a group of tool calls, in
+ *  first-touch order. */
+export function changedFiles(calls: ToolCallData[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of calls) {
+    const t = toolFileTarget(c);
+    if (t && t.changed && !seen.has(t.path)) {
+      seen.add(t.path);
+      out.push(t.path);
+    }
+  }
+  return out;
+}
+
+export function basename(p: string): string {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || p;
+}
+
 export function unwrapProjects(raw: { projects: Project[] } | Project[]): Project[] {
   if (Array.isArray(raw)) return raw;
   if (raw && Array.isArray(raw.projects)) return raw.projects;
