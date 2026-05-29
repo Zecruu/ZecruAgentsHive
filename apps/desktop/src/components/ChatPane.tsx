@@ -29,7 +29,7 @@ interface Props {
   onToggleMaximize?: () => void;
   missionsPanelOpen?: boolean;
   onToggleMissionsPanel?: () => void;
-  onQueue: (text: string) => void;
+  onQueue: (text: string, attachments?: AttachmentData[]) => void;
   onRemoveQueued: (idx: number) => void;
 }
 
@@ -138,32 +138,34 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
 
   const removePending = (idx: number) => setPending((p) => p.filter((_, i) => i !== idx));
 
+  // Persist any pending images to disk → AttachmentData[] (path + dataUrl).
+  const savePending = async (): Promise<AttachmentData[]> => {
+    const saved: AttachmentData[] = [];
+    for (const p of pending) {
+      const r = await ah().attachments.save({ agentId: agent.id, projectSlug, name: p.name, dataUrl: p.dataUrl });
+      saved.push({ name: p.name, path: r.path, dataUrl: p.dataUrl, mime: p.mime });
+    }
+    return saved;
+  };
+
   const send = async () => {
     if (agent.readOnly) return; // view-only conversation materialized from another device
     const t = draft.trim();
     if (busy) return;
-    // P4: while a turn is in-flight, Enter/Send QUEUES the follow-up (text only)
-    // instead of being blocked; it auto-sends when the current turn finishes.
-    if (agent.inFlight) {
-      if (t) { onQueue(t); setDraft(''); }
-      return;
-    }
     if (!t && pending.length === 0) return;
     setBusy(true);
     try {
-      const saved: AttachmentData[] = [];
-      for (const p of pending) {
-        const r = await ah().attachments.save({
-          agentId: agent.id,
-          projectSlug,
-          name: p.name,
-          dataUrl: p.dataUrl,
-        });
-        saved.push({ name: p.name, path: r.path, dataUrl: p.dataUrl, mime: p.mime });
-      }
+      const saved = await savePending();
       setDraft('');
       setPending([]);
-      onSend(t, saved.length ? saved : undefined);
+      // P4: while a turn is in-flight, QUEUE the follow-up — now WITH its
+      // attachments (saved to disk + carried on the queued entry), so an image
+      // attached while busy is sent when the queue drains instead of dropped.
+      if (agent.inFlight) {
+        onQueue(t, saved.length ? saved : undefined);
+      } else {
+        onSend(t, saved.length ? saved : undefined);
+      }
     } finally {
       setBusy(false);
     }
@@ -499,7 +501,12 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             {agent.queue.map((q, i) => (
               <div key={i} className="flex items-center gap-2 rounded-md border border-border/60 bg-input/40 px-2 py-1 text-[12px]">
                 <ListPlus className="h-3 w-3 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 flex-1 truncate" title={q}>{q}</span>
+                <span className="min-w-0 flex-1 truncate" title={q.text}>{q.text || <span className="text-muted-foreground italic">(image only)</span>}</span>
+                {q.attachments && q.attachments.length > 0 && (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border bg-input/50 px-1.5 text-[10px] text-muted-foreground" title={`${q.attachments.length} image${q.attachments.length > 1 ? 's' : ''} attached`}>
+                    <Paperclip className="h-2.5 w-2.5" />{q.attachments.length}
+                  </span>
+                )}
                 <button
                   onClick={() => onRemoveQueued(i)}
                   className="shrink-0 rounded-full p-0.5 hover:bg-destructive/20"
@@ -583,7 +590,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             <Button
               size="sm"
               onClick={send}
-              disabled={agent.readOnly || busy || (!draft.trim() && (agent.inFlight || pending.length === 0))}
+              disabled={agent.readOnly || busy || (!draft.trim() && pending.length === 0)}
               title={agent.readOnly ? 'Read-only — synced from another device' : agent.inFlight ? 'Queue this message — sends when the current turn finishes' : 'Send'}
             >
               {agent.inFlight ? <ListPlus className="h-3.5 w-3.5" /> : <Send className="h-3.5 w-3.5" />}

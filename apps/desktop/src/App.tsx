@@ -1,7 +1,8 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Settings as SettingsIcon, LogOut, ShieldAlert, LogIn, RefreshCw } from 'lucide-react';
+import { Settings as SettingsIcon, LogOut, ShieldAlert, LogIn, RefreshCw, Sun, Moon } from 'lucide-react';
 import { ah, type ConfigState } from '@/lib/agentshive';
 import { onAuthChange, signOut, supabaseConfigured } from '@/lib/supabase';
+import { getCachedTheme, reconcileTheme, setTheme, type Theme } from '@/lib/theme';
 import type { Session } from '@supabase/supabase-js';
 import { Settings } from '@/components/Settings';
 import { Workspace } from '@/components/Workspace';
@@ -28,6 +29,7 @@ export default function App() {
   // The running app's version (from the main process), shown in the header
   // badge so it always matches the deployed release — never a hardcoded string.
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [theme, setThemeState] = useState<Theme>(getCachedTheme());
 
   useEffect(() => {
     (async () => {
@@ -35,6 +37,8 @@ export default function App() {
       setConfig(c);
     })();
     ah().app.version().then(setAppVersion).catch(() => {});
+    // Reconcile theme from the durable store (in case localStorage was wiped).
+    reconcileTheme().then(setThemeState).catch(() => {});
     const off = onAuthChange((s) => {
       setSession(s);
       setAuthReady(true);
@@ -84,6 +88,12 @@ export default function App() {
   const handleSignOut = async () => {
     await signOut();
     setSession(null);
+  };
+
+  const toggleTheme = () => {
+    const next: Theme = theme === 'dark' ? 'light' : 'dark';
+    setThemeState(next);
+    setTheme(next);
   };
 
   return (
@@ -145,6 +155,14 @@ export default function App() {
               <LogOut className="h-4 w-4" />
             </Button>
           )}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={toggleTheme}
+            title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          </Button>
           <Button
             variant="ghost"
             size="icon"

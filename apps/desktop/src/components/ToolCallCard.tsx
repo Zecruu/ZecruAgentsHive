@@ -17,7 +17,7 @@ export function ToolCallCard({ call }: Props) {
   const inputJson = JSON.stringify(call.input || {}, null, 2);
 
   return (
-    <div className="overflow-hidden rounded-md border border-border/70 bg-[hsl(222_33%_7%/0.85)] shadow-[0_1px_0_hsl(0_0%_100%/0.03)_inset]">
+    <div className="overflow-hidden rounded-md border border-border/70 bg-card/70 shadow-[0_1px_0_hsl(0_0%_100%/0.03)_inset]">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -30,7 +30,7 @@ export function ToolCallCard({ call }: Props) {
         <Badge variant={variant} className="ml-auto">{status === 'running' ? 'running…' : status}</Badge>
       </button>
       {open && (
-        <div className="max-h-72 overflow-y-auto scrollbar-thin border-t border-border/60 bg-[hsl(222_50%_3%)] p-3 font-mono text-[11px] whitespace-pre-wrap break-words">
+        <div className="max-h-72 overflow-y-auto scrollbar-thin border-t border-border/60 bg-input/30 p-3 font-mono text-[11px] whitespace-pre-wrap break-words">
           <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">input</div>
           <pre className="m-0 rounded-md border border-border/50 bg-background/60 p-2 font-mono text-[11px] leading-relaxed text-foreground/90">{inputJson}</pre>
           {call.completed && (

@@ -3,8 +3,34 @@
 @tailwind utilities;
 
 @layer base {
+  /* LIGHT palette (default — applies when <html> has NO .dark class). */
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 217 91% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 214 32% 95%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 214 32% 95%;
+    --muted-foreground: 215 16% 42%;
+    --accent: 38 92% 45%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 32% 88%;
+    --input: 214 32% 92%;
+    --ring: 217 91% 52%;
+    --success: 142 71% 38%;
+    --warn: 38 92% 42%;
+    --radius: 0.5rem;
+  }
+
+  /* DARK palette (shadcn dark + AgentsHive tweaks) — overrides light when .dark. */
   :root.dark {
-    /* shadcn dark palette + AgentsHive tweaks */
     --background: 222 47% 5%;
     --foreground: 210 40% 98%;
     --card: 222 33% 9%;
@@ -35,20 +61,29 @@
     @apply bg-background text-foreground antialiased;
     font-feature-settings: 'ss01', 'cv11';
     overflow: hidden;
+    /* Light: a soft, clean wash. Dark overrides below. */
+    background:
+      radial-gradient(1100px 750px at -10% -10%, hsl(217 91% 60% / 0.06), transparent 60%),
+      linear-gradient(180deg, hsl(var(--background)) 0%, hsl(214 32% 96%) 100%);
+    background-attachment: fixed;
+  }
+  html.dark body {
     background:
       radial-gradient(1200px 800px at -10% -10%, hsl(217 91% 60% / 0.10), transparent 60%),
       radial-gradient(1000px 700px at 120% 110%, hsl(265 80% 60% / 0.08), transparent 60%),
       linear-gradient(180deg, hsl(var(--background)) 0%, hsl(222 50% 4%) 100%);
-    background-attachment: fixed;
   }
   body::before {
     content: '';
     position: fixed;
     inset: 0;
     pointer-events: none;
+    z-index: 0;
+  }
+  /* The blue screen-glow is a dark-mode effect only. */
+  html.dark body::before {
     background: radial-gradient(800px 500px at 50% -10%, hsl(217 91% 60% / 0.06), transparent 70%);
     mix-blend-mode: screen;
-    z-index: 0;
   }
 }
 

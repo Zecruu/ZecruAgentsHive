@@ -54,8 +54,9 @@ export interface AgentRuntime {
   readOnly?: boolean;
   messages: MessageRuntime[];
   // v2.x: follow-up messages queued while a turn is in-flight; auto-sent in order
-  // when the current turn completes. In-memory (not persisted).
-  queue: string[];
+  // when the current turn completes. In-memory (not persisted). Each carries its
+  // own attachments so an image attached while busy survives the queue.
+  queue: QueuedMessage[];
   // v2.x companion webapp: when a turn was injected by a web message, the
   // originating web_to_agent message id — so onDone relays the response back
   // (agent_to_web, correlated). Transient.
@@ -97,6 +98,13 @@ function isRateLimitText(s: string | null | undefined): boolean {
 // raw strings misses the match and wakes the wrong (or no) coder. Fix A.
 function normCoderId(s: string | null | undefined): string {
   return (s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+// A follow-up queued while a turn is in-flight — text + any attachments, so an
+// image attached while busy isn't dropped (sent when the queue drains).
+export interface QueuedMessage {
+  text: string;
+  attachments?: AttachmentData[];
 }
 
 export interface MessageRuntime {
@@ -189,7 +197,7 @@ export interface ActiveProject {
   createAgent: (v: LauncherValues) => void;
   sendTurn: (prompt: string, attachments?: AttachmentData[]) => void;
   setAgentModelEffort: (model: string | null, effort: string) => void;
-  queueMessage: (text: string) => void;
+  queueMessage: (text: string, attachments?: AttachmentData[]) => void;
   removeQueued: (idx: number) => void;
   wakeAgent: (a: AgentRuntime, reason: string) => void;
   archive: (a: AgentRuntime) => void;
@@ -591,9 +599,9 @@ export function useActiveProject(project: Project | null): ActiveProject {
   const drainQueue = (a: AgentRuntime) => {
     if (a.inFlight || a.queue.length === 0) return;
     if (!agentsRef.current.some((x) => x.id === a.id)) return; // archived
-    const next = a.queue.shift() as string;
+    const next = a.queue.shift()!;
     rerender();
-    _startUserTurn(a, next);
+    _startUserTurn(a, next.text, next.attachments);
   };
 
   // Cloud Sync push (opt-in). Fire-and-forget AFTER a turn settles — so it never
@@ -642,9 +650,10 @@ export function useActiveProject(project: Project | null): ActiveProject {
   };
 
   // P4: queue a follow-up while a turn is in-flight; drained on turn done.
-  const queueMessage = (text: string) => {
-    if (!current || !text.trim()) return;
-    current.queue.push(text);
+  const queueMessage = (text: string, attachments?: AttachmentData[]) => {
+    if (!current) return;
+    if (!text.trim() && (!attachments || attachments.length === 0)) return;
+    current.queue.push({ text, attachments });
     rerender();
   };
 
