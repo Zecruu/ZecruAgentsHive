@@ -13,6 +13,7 @@
 // Exactly one host is isActive at a time (the single-active web invariant).
 
 import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { Compass } from 'lucide-react';
 import { ah, unwrapProjects, type Project } from '@/lib/agentshive';
 import { useActiveProject, type ActiveProject, type AgentRuntime } from '@/lib/useActiveProject';
 import { ProjectSidebar } from './ProjectSidebar';
@@ -208,7 +209,7 @@ export function Workspace() {
   const sidebarHidden = chatMaximized && !!activeProject && !!activeRt?.current && !activeRt?.showLauncher;
 
   return (
-    <div className="flex h-full">
+    <div className="relative flex h-full">
       {/* Persistent per-project runtimes. Each stays mounted while its project is
           open (so an in-flight turn survives switching away); they render nothing
           and publish into rtRegistry. Exactly one is isActive. */}
@@ -271,6 +272,17 @@ export function Workspace() {
           refreshKey={refreshKey}
           onClose={toggleMissionsPanel}
         />
+      )}
+      {activeProject && activeRt && !missionsPanelOpen && !chatMaximized && (
+        <button
+          type="button"
+          onClick={toggleMissionsPanel}
+          className="absolute right-2 top-1/2 z-20 flex -translate-y-1/2 items-center gap-1.5 rounded-full border border-border/70 bg-card/80 px-2.5 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground shadow-[0_8px_28px_-18px_hsl(0_0%_0%/0.55)] backdrop-blur transition-colors hover:border-accent/45 hover:bg-card hover:text-accent"
+          title="Show missions panel"
+        >
+          <Compass className="h-3.5 w-3.5" />
+          <span className="[writing-mode:vertical-rl]">Missions</span>
+        </button>
       )}
     </div>
   );
