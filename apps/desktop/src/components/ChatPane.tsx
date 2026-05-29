@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from 'react';
 import { Archive, AtSign, Brain, ChevronRight, FilePen, FileText, Hexagon, ImageIcon, ListPlus, Loader2, Maximize2, MessageSquare, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, TerminalSquare, Wrench, X as XIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -262,8 +262,12 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   const empty = agent.messages.length === 0;
   // Per-TURN changed files: index of each turn's LAST entry → files that turn
   // edited (aggregated across its split entries, deduped). Drives the docked bar.
-  const turnEndFiles: Record<number, FileChange[]> = {};
-  {
+  // Memoized: messages mutate IN PLACE (stable array ref), so we key on
+  // lastEventAt — it bumps on every stream event, so this recomputes the diff
+  // aggregation live DURING a turn but NOT on composer keystrokes (the typing-lag
+  // fix: a keystroke is local draft state and never touches the agent runtime).
+  const turnEndFiles = useMemo<Record<number, FileChange[]>>(() => {
+    const out: Record<number, FileChange[]> = {};
     const msgs = agent.messages;
     let acc: ToolCallData[] = [];
     for (let i = 0; i < msgs.length; i++) {
@@ -273,11 +277,12 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
       const lastOfTurn = i === msgs.length - 1 || msgs[i + 1].role === 'user';
       if (lastOfTurn) {
         const cf = changedFilesWithStats(acc);
-        if (cf.length) turnEndFiles[i] = cf;
+        if (cf.length) out[i] = cf;
         acc = [];
       }
     }
-  }
+    return out;
+  }, [agent.messages, agent.lastEventAt]);
   // Per-agent usage: running total tokens (sum of per-turn input+output) + the
   // number of completed assistant turns.
   const usageTokens = agent.messages.reduce((sum, m) => sum + (m.tokens ? m.tokens.input + m.tokens.output : 0), 0);
@@ -482,7 +487,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
           <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
             {agent.messages.map((m, i) => (
               <Fragment key={i}>
-                <MessageBubble message={m} />
+                <MessageBubble message={m} sig={bubbleSig(m)} />
                 {turnEndFiles[i] && <ChangedFilesBar files={turnEndFiles[i]} projectSlug={projectSlug} canUndo={gitRepo} />}
               </Fragment>
             ))}
@@ -699,7 +704,30 @@ function EmptyChip({ icon, label }: { icon: React.ReactNode; label: string }) {
   );
 }
 
-function MessageBubble({ message }: { message: MessageRuntime }) {
+// A cheap per-message signature of every MUTABLE field MessageBubble renders.
+// Messages mutate IN PLACE (the runtime appends text / flips tool-call state on
+// the SAME object), so React.memo can't compare object refs — instead the parent
+// snapshots this primitive string at render time and memo compares THAT. text is
+// append-only during streaming, so its length is a faithful change detector
+// (cheaper than embedding the whole body in the key on every keystroke).
+function bubbleSig(m: MessageRuntime): string {
+  let s = `${m.role}|${m.thinking ? 't' : ''}|${m.text.length}`;
+  if (m.tokens) s += `|k${m.tokens.input},${m.tokens.output}`;
+  if (m.attachments) s += `|a${m.attachments.length}`;
+  const calls = m.toolCalls;
+  if (calls && calls.length) {
+    for (const c of calls) {
+      const r = typeof c.result === 'string' ? c.result.length : c.result == null ? 0 : 1;
+      s += `|${c.id}:${c.completed ? 1 : 0}:${c.isError ? 1 : 0}:${r}`;
+    }
+  }
+  return s;
+}
+
+// memo'd on `sig` (the primitive snapshot above) so unchanged bubbles skip
+// re-render entirely while the composer draft changes — the rest of the
+// typing-lag fix on top of memoizing MarkdownBody.
+const MessageBubble = memo(function MessageBubble({ message }: { message: MessageRuntime; sig: string }) {
   // P4: a thinking/reasoning entry renders as a collapsed "Thinking" disclosure.
   if (message.role === 'assistant' && message.thinking) {
     return <ThinkingEntry text={message.text} />;
@@ -780,7 +808,7 @@ function MessageBubble({ message }: { message: MessageRuntime }) {
       </div>
     </div>
   );
-}
+}, (prev, next) => prev.sig === next.sig);
 
 // One collapsible group for a turn's tool calls. Collapsed by default so the
 // conversation reads clean; auto-expands while any call is still running so live

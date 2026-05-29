@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '@/lib/utils';
@@ -11,7 +12,13 @@ import { cn } from '@/lib/utils';
 // react-markdown v10 dropped the `inline` prop on `code`; we detect a fenced
 // block by the `language-*` class the renderer adds and let <pre> style blocks,
 // rendering everything else as an inline pill.
-export function MarkdownBody({ text, className }: { text: string; className?: string }) {
+//
+// memo'd on its primitive props: markdown parsing is expensive, and the parent
+// ChatPane re-renders on every composer keystroke. Without this, each bubble
+// re-parsed its markdown per keystroke (the 2.0.11 typing-lag regression). Both
+// props are primitives, so the default shallow compare re-parses ONLY when a
+// message's text actually changes (i.e. streaming) — not when the draft does.
+export const MarkdownBody = memo(function MarkdownBody({ text, className }: { text: string; className?: string }) {
   return (
     <div className={cn('break-words text-[13.5px] leading-relaxed', className)}>
       <ReactMarkdown
@@ -49,4 +56,4 @@ export function MarkdownBody({ text, className }: { text: string; className?: st
       </ReactMarkdown>
     </div>
   );
-}
+});
