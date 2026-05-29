@@ -2,11 +2,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import JSON, Column
+from sqlalchemy import JSON, Column, UniqueConstraint
 from sqlalchemy.engine import Engine
 from sqlmodel import Field, SQLModel, create_engine
 
 from .config import Settings
+from .tenant import LEGACY_TENANT
 
 
 def _utcnow() -> datetime:
@@ -28,22 +29,48 @@ class Project(SQLModel, table=True):
     are all scoped to a project. Coders bind to a project at the URL level
     (`?project=zecru-widget` on the MCP URL) and the request-time middleware sets
     the project ContextVar that every `_do_*` helper reads.
+
+    v2.x: also tenant-scoped. `(tenant_id, slug)` is unique — the same slug can
+    exist independently under different tenants — and `_project_id()` resolves by
+    that pair, which is the single chokepoint that isolates every child query.
     """
+    # v2.x: per-tenant slug uniqueness replaces the old global UNIQUE(slug). On a
+    # fresh DB create_all builds this composite constraint; on the existing prod
+    # DB the global unique is swapped to this by scripts/migrate_tenancy.py.
+    __table_args__ = (UniqueConstraint("tenant_id", "slug", name="uq_project_tenant_slug"),)
+
     id: str = Field(default_factory=_uuid, primary_key=True)
+    # v2.x: owning tenant. Supabase user id (sub) for real tenants, or LEGACY_TENANT
+    # for pre-v2 / shared-key data. Indexed because resolution filters on it.
+    tenant_id: str = Field(default=LEGACY_TENANT, index=True)
     # URL-facing identifier. Validated server-side (kebab-case, 1-42 chars). "default"
     # is reserved and created by _apply_inline_migrations; all other slugs come from
-    # POST /api/dashboard/projects which calls project.validate_slug().
-    slug: str = Field(index=True, unique=True)
+    # POST /api/dashboard/projects which calls project.validate_slug(). No longer
+    # globally unique — unique only within a tenant (see __table_args__).
+    slug: str = Field(index=True)
     name: str  # Display name shown in the dashboard switcher; user-editable.
     description: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
     # Soft-archive (Planner Q3): hides from the switcher but preserves all child data.
     # Hard delete is v1.9.x.
     archived_at: Optional[datetime] = None
+    # v2.x foundation mission: the project's durable north-star goal. Captured from
+    # the FIRST mission created (or set/refined explicitly) and NEVER superseded —
+    # so a fresh-context Planner can always recover what the project is ultimately
+    # about. Stored on the project row (1:1, tenant-scoped) rather than as a Mission
+    # so the rotating-active-mission supersede logic can't touch it.
+    foundation_name: Optional[str] = None
+    foundation_spec: Optional[str] = None
+    foundation_set_at: Optional[datetime] = None
 
 
 class Mission(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
+    # v2.x: denormalized owning tenant. Resolution already isolates project-rooted
+    # queries; this column is the LIVE filter for by-id lookups (session.get(Mission,
+    # id)) so a tenant can't touch another tenant's row by guessing an id. Nullable
+    # because legacy rows are backfilled by _apply_inline_migrations; new writes set it.
+    tenant_id: Optional[str] = Field(default=None, index=True)
     # v1.9: every mission belongs to exactly one project. NOT NULL — legacy rows
     # backfilled to "default" by _apply_inline_migrations.
     project_id: str = Field(foreign_key="project.id", index=True)
@@ -60,6 +87,8 @@ class Mission(SQLModel, table=True):
 
 class Question(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
+    # v2.x: denormalized tenant — LIVE filter for by-id access (answer_question).
+    tenant_id: Optional[str] = Field(default=None, index=True)
     mission_id: str = Field(foreign_key="mission.id", index=True)
     body: str
     answer: Optional[str] = None
@@ -72,6 +101,8 @@ class Question(SQLModel, table=True):
 
 class Summary(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
+    # v2.x: denormalized tenant — LIVE filter for by-id access (respond_to_summary).
+    tenant_id: Optional[str] = Field(default=None, index=True)
     mission_id: str = Field(foreign_key="mission.id", index=True)
     body: str
     response: Optional[str] = None
@@ -101,6 +132,8 @@ class Message(SQLModel, table=True):
     # no active mission, OR set it to the active mission's id as a soft
     # "this happened during mission X" association.
     mission_id: Optional[str] = Field(default=None, foreign_key="mission.id", index=True)
+    # v2.x: denormalized tenant — LIVE filter for by-id access (ack_message).
+    tenant_id: Optional[str] = Field(default=None, index=True)
     # v1.9: every message belongs to exactly one project (including inbox messages).
     # Nullable because legacy pre-v1.9 rows existed before the column did; the
     # migration backfills to "default". New writes always set this.
@@ -118,6 +151,12 @@ class Message(SQLModel, table=True):
     # call) only see broadcast messages.
     coder_id: Optional[str] = Field(default=None)
     target_coder_id: Optional[str] = Field(default=None)
+    # v2.x companion webapp relay. agent_key = the desktop agent.id this message is
+    # for (web_to_agent) or from (agent_to_web). parent_id correlates an agent_to_web
+    # response back to the originating web_to_agent so the webapp threads it. Both
+    # nullable/additive; only set on the web_to_agent / agent_to_web directions.
+    agent_key: Optional[str] = Field(default=None, index=True)
+    parent_id: Optional[str] = Field(default=None, index=True)
 
 
 # v1.13: per-Coder heartbeat for multi-Coder workflows. Lets the Connected
@@ -138,6 +177,9 @@ class Message(SQLModel, table=True):
 class CoderHeartbeat(SQLModel, table=True):
     project_id: str = Field(foreign_key="project.id", primary_key=True)
     coder_id: str = Field(primary_key=True)
+    # v2.x: denormalized tenant (project_id already implies it, but kept for
+    # consistency + any future by-id access). Nullable; backfilled by migration.
+    tenant_id: Optional[str] = Field(default=None, index=True)
     last_seen: datetime = Field(default_factory=_utcnow)
     # v1.15: device hint ("windows" | "macos" | "linux"). Surfaces on the
     # Connected Coders dashboard panel as an OS icon so the user can tell at
@@ -145,6 +187,53 @@ class CoderHeartbeat(SQLModel, table=True):
     # Coders across Windows + Mac in one mission). Validated server-side
     # against a strict allow-list; None means "unknown / cloud Coder".
     os_hint: Optional[str] = Field(default=None)
+
+
+# --- v2.x per-tenant account / billing / plan ----------------------------
+#
+# One row per tenant (Supabase sub, or LEGACY_TENANT). Holds the plan + the
+# billing/trial counters Stripe (deferred) will later drive, plus the `banned`
+# flag the admin panel toggles. Lazily created on first touch via
+# get_or_create_tenant. The legacy tenant is seeded pro_unlimited so the
+# transitional shared-key path (and our own dogfood coordination) is never
+# trial-gated.
+
+PLAN_FREE = "free"
+PLAN_PRO = "pro"
+PLAN_PRO_UNLIMITED = "pro_unlimited"
+VALID_PLANS = frozenset({PLAN_FREE, PLAN_PRO, PLAN_PRO_UNLIMITED})
+
+
+class Tenant(SQLModel, table=True):
+    # tenant_id = Supabase user id (sub), or LEGACY_TENANT. Matches the tenant_id
+    # stamped on every scoped row.
+    tenant_id: str = Field(primary_key=True)
+    plan: str = Field(default=PLAN_FREE, index=True)
+    # P2 (deferred) billing fields — present so the gate + admin panel can read
+    # them now and Stripe can populate them later without another migration.
+    subscription_status: str = Field(default="none")
+    trial_reports_used: int = Field(default=0)
+    stripe_customer_id: Optional[str] = Field(default=None)
+    stripe_subscription_id: Optional[str] = Field(default=None)
+    # Admin-toggled. A banned tenant's token is rejected at auth time.
+    banned: bool = Field(default=False, index=True)
+    email: Optional[str] = Field(default=None)  # cached for admin display; source of truth is Supabase
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# v2.x companion-webapp presence: the desktop upserts one row per local agent so
+# the webapp can list a tenant's agents and show desktop online/offline (via
+# last_seen freshness). Tenant-scoped; agent_key = the desktop agent.id.
+class WebAgentPresence(SQLModel, table=True):
+    tenant_id: str = Field(primary_key=True)
+    agent_key: str = Field(primary_key=True)
+    project_id: Optional[str] = Field(default=None, index=True)
+    project_slug: Optional[str] = Field(default=None)
+    label: Optional[str] = None
+    role: Optional[str] = None
+    cli: Optional[str] = None
+    status: Optional[str] = None
+    last_seen: datetime = Field(default_factory=_utcnow)
 
 
 # --- v1.7 OAuth 2.1 storage ---------------------------------------------
@@ -163,6 +252,9 @@ class CoderHeartbeat(SQLModel, table=True):
 class OAuthClient(SQLModel, table=True):
     # client_id is the public identifier issued at registration time.
     client_id: str = Field(primary_key=True)
+    # v2.x: tenant that registered the dynamic client. Legacy/public DCR uses
+    # LEGACY_TENANT; authenticated DCR can cap clients per real tenant.
+    tenant_id: Optional[str] = Field(default=None, index=True)
     # client_secret is None for public clients (PKCE-only, no secret).
     client_secret: Optional[str] = None
     client_name: Optional[str] = None
@@ -189,6 +281,9 @@ class OAuthAuthorizationCode(SQLModel, table=True):
     resource: Optional[str] = None
     used: bool = False  # single-use enforcement
     created_at: datetime = Field(default_factory=_utcnow)
+    # v2.x: the Supabase tenant (sub) of the user who consented. Carried onto the
+    # minted access token so the Claude-app MCP connector is tenant-bound.
+    tenant_id: Optional[str] = Field(default=None)
 
 
 class OAuthAccessToken(SQLModel, table=True):
@@ -199,6 +294,9 @@ class OAuthAccessToken(SQLModel, table=True):
     resource: Optional[str] = None
     revoked: bool = False
     created_at: datetime = Field(default_factory=_utcnow)
+    # v2.x: tenant (Supabase sub) this token acts as. load_access_token surfaces it
+    # so the request's tenant context can be bound from the OAuth token.
+    tenant_id: Optional[str] = Field(default=None)
 
 
 class OAuthRefreshToken(SQLModel, table=True):
@@ -208,6 +306,9 @@ class OAuthRefreshToken(SQLModel, table=True):
     expires_at: int  # unix seconds
     revoked: bool = False
     created_at: datetime = Field(default_factory=_utcnow)
+    # v2.x: tenant carried through refresh rotation so a refreshed access token
+    # stays bound to the same tenant.
+    tenant_id: Optional[str] = Field(default=None)
 
 
 _engine: Optional[Engine] = None
@@ -317,11 +418,12 @@ def _apply_inline_migrations(engine: Engine) -> None:
             from uuid import uuid4
             conn.execute(
                 text(
-                    "INSERT INTO project (id, slug, name, description, created_at, archived_at) "
-                    "VALUES (:id, :slug, :name, :description, :created_at, NULL)"
+                    "INSERT INTO project (id, tenant_id, slug, name, description, created_at, archived_at) "
+                    "VALUES (:id, :tenant_id, :slug, :name, :description, :created_at, NULL)"
                 ),
                 {
                     "id": uuid4().hex,
+                    "tenant_id": LEGACY_TENANT,
                     "slug": DEFAULT_PROJECT_SLUG,
                     "name": "Default",
                     "description": "Legacy / unscoped traffic. Pre-v1.9 missions and messages live here.",
@@ -489,8 +591,121 @@ def _apply_inline_migrations(engine: Engine) -> None:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE coderheartbeat ADD COLUMN os_hint TEXT"))
 
+    # v2.x: multi-tenancy. ADDITIVE + REVERSIBLE only — add nullable tenant_id
+    # columns and backfill existing rows to LEGACY_TENANT so the legacy shared-key
+    # path keeps seeing exactly today's data. The RISKY part (swapping the global
+    # UNIQUE(slug) to UNIQUE(tenant_id, slug)) is deliberately NOT done here; it is
+    # staged in scripts/migrate_tenancy.py for a supervised production run. On a
+    # fresh DB the composite unique comes from create_all (Project.__table_args__),
+    # so dev/test multi-tenancy works without touching the staged script.
+    v2_inspector = inspect(engine)
+    v2_tables = [
+        "project", "mission", "question", "summary", "message",
+        "coderheartbeat", "oauthclient", "oauthaccesstoken", "oauthauthorizationcode",
+        "oauthrefreshtoken",
+    ]
+    with engine.begin() as conn:
+        for tbl in v2_tables:
+            if tbl not in v2_inspector.get_table_names():
+                continue
+            cols = {c["name"] for c in v2_inspector.get_columns(tbl)}
+            if "tenant_id" not in cols:
+                conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN tenant_id TEXT"))
+    with engine.begin() as conn:
+        for tbl in v2_tables:
+            if tbl not in v2_inspector.get_table_names():
+                continue
+            conn.execute(
+                text(f"UPDATE {tbl} SET tenant_id = :t WHERE tenant_id IS NULL"),
+                {"t": LEGACY_TENANT},
+            )
+        # Resolution + by-id-filter index. Additive and safe on both dialects.
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_project_tenant ON project(tenant_id)"))
+
+    # v2.x companion-webapp: additive nullable columns on message (agent_key,
+    # parent_id) for the web_to_agent / agent_to_web relay. WebAgentPresence table
+    # is created by create_all. Safe + idempotent.
+    v2w_inspector = inspect(engine)
+    if "message" in v2w_inspector.get_table_names():
+        msg_cols = {c["name"] for c in v2w_inspector.get_columns("message")}
+        with engine.begin() as conn:
+            for col in ("agent_key", "parent_id"):
+                if col not in msg_cols:
+                    conn.execute(text(f"ALTER TABLE message ADD COLUMN {col} TEXT"))
+
+    # v2.x foundation mission: additive nullable columns on project (create_all
+    # adds them on fresh DBs; ALTER for existing). Safe + idempotent.
+    v2f_inspector = inspect(engine)
+    if "project" in v2f_inspector.get_table_names():
+        proj_cols = {c["name"] for c in v2f_inspector.get_columns("project")}
+        foundation_cols = {
+            "foundation_name": "TEXT",
+            "foundation_spec": "TEXT",
+            "foundation_set_at": "TIMESTAMP NULL",
+        }
+        with engine.begin() as conn:
+            for col_name, col_def in foundation_cols.items():
+                if col_name not in proj_cols:
+                    conn.execute(text(f"ALTER TABLE project ADD COLUMN {col_name} {col_def}"))
+
 
 def get_engine() -> Engine:
     if _engine is None:
         raise RuntimeError("Engine not initialized — call init_engine(settings) first.")
     return _engine
+
+
+def get_or_create_tenant(session, tenant_id: str, email: Optional[str] = None) -> "Tenant":
+    """Fetch the Tenant row for tenant_id, lazily creating it on first touch.
+
+    The legacy tenant is seeded pro_unlimited so the transitional shared-key path
+    (and our own dogfood coordination) is never trial-gated. Real tenants default
+    to the free plan. Commits if it created/updated a row.
+    """
+    from .tenant import LEGACY_TENANT
+    row = session.get(Tenant, tenant_id)
+    if row is None:
+        row = Tenant(
+            tenant_id=tenant_id,
+            plan=PLAN_PRO_UNLIMITED if tenant_id == LEGACY_TENANT else PLAN_FREE,
+            email=email,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    elif email and not row.email:
+        row.email = email
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return row
+
+
+def is_tenant_banned(tenant_id: str) -> bool:
+    """True if a Tenant row exists for tenant_id and is banned. Cheap by-PK read."""
+    from sqlmodel import Session
+    if not tenant_id:
+        return False
+    with Session(get_engine()) as s:
+        row = s.get(Tenant, tenant_id)
+        return bool(row and row.banned)
+
+
+def tenant_for_oauth_token(raw_token: str) -> Optional[str]:
+    """v2.x: resolve a raw OAuth access token to its tenant_id, or None if the
+    token is unknown/revoked. Used by TenantContextMiddleware to bind the tenant
+    for the Claude-app MCP connector (which presents an OAuth access token, not a
+    Supabase JWT). Validity/expiry is still enforced by the SDK's bearer backend;
+    this is a best-effort tenant lookup only — but we still refuse revoked OR
+    EXPIRED tokens here so a stale token can never bind a tenant context (defense
+    in depth; matches load_access_token's revoked/expired check).
+    """
+    import hashlib
+    import time
+    from sqlmodel import Session
+    h = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    with Session(get_engine()) as s:
+        row = s.get(OAuthAccessToken, h)
+        if row is None or row.revoked or row.expires_at < time.time():
+            return None
+        return row.tenant_id

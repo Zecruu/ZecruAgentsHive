@@ -5,12 +5,14 @@ from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .auth import BearerAuthMiddleware, ProjectContextMiddleware
+from .admin import register_admin_routes
+from .auth import BearerAuthMiddleware, ProjectContextMiddleware, TenantContextMiddleware, WebCorsMiddleware
 from .config import load_settings
 from .dashboard import register_routes as register_dashboard_routes
 from .db import init_engine
 from .oauth import AgentsHiveOAuthProvider
 from .tools import register_tools
+from .web import register_web_routes
 
 
 def build_app():
@@ -27,7 +29,9 @@ def build_app():
         mcp_mount_path="/mcp",
         # Q2 (KEEP LEGACY KEY FOREVER): hand the provider our shared API key so
         # /mcp callers using the v1.0-v1.6 bearer auth keep working.
-        legacy_api_key=settings.api_key,
+        legacy_api_key=settings.api_key if settings.legacy_key_enabled else None,
+        # v2.x: accept JWKS-verified Supabase access tokens on /mcp too.
+        supabase_url=settings.supabase_url,
     )
 
     mcp = FastMCP(
@@ -56,14 +60,28 @@ def build_app():
     # API-key-or-cookie-via-form for /oauth/consent).
     register_dashboard_routes(app, settings, _capture_tool_names(mcp), oauth_provider=oauth_provider)
 
+    # v2.x admin/superuser router (/admin/*). Each handler enforces is_admin();
+    # the paths are in BearerAuthMiddleware.PUBLIC_PATHS so the admin's Supabase
+    # token (not the legacy shared key) reaches the per-handler gate.
+    register_admin_routes(app, settings)
+
+    # v2.x companion-webapp router (/web/*). Supabase-JWT, tenant-scoped; every
+    # handler wrapped in _web_guard. In PUBLIC_PATHS so the user's/desktop's
+    # Supabase token reaches the per-handler gate (not the legacy shared key).
+    register_web_routes(app, settings)
+
     # Middleware order (Starlette wraps in LIFO, so add the innermost LAST):
-    #   1. ProjectContextMiddleware (added first → wraps outermost → runs FIRST
-    #      on every request, so the ContextVar is populated before BearerAuth or
-    #      any downstream handler reads it).
-    #   2. BearerAuthMiddleware (added second → wraps innermost → runs SECOND,
-    #      gates access to non-public paths with the legacy shared key).
-    app.add_middleware(BearerAuthMiddleware, api_key=settings.api_key)
+    #   1. ProjectContextMiddleware + TenantContextMiddleware (added last → wrap
+    #      outermost → run FIRST on every request, so the project + tenant
+    #      ContextVars are populated before BearerAuth or any downstream handler
+    #      / MCP tool reads them).
+    #   2. BearerAuthMiddleware (added first → wraps innermost → runs after the
+    #      context middlewares, gates non-public paths with the legacy shared key).
+    app.add_middleware(BearerAuthMiddleware, api_key=settings.api_key, legacy_key_enabled=settings.legacy_key_enabled)
     app.add_middleware(ProjectContextMiddleware)
+    app.add_middleware(TenantContextMiddleware, api_key=settings.api_key, supabase_url=settings.supabase_url, legacy_key_enabled=settings.legacy_key_enabled)
+    # Outermost: CORS for /web/* (answers OPTIONS preflight before auth runs).
+    app.add_middleware(WebCorsMiddleware)
     return app, settings
 
 

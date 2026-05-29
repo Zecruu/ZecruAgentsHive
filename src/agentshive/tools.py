@@ -12,8 +12,25 @@ from sqlmodel import Session, select
 from . import __version__ as AGENTSHIVE_VERSION
 from . import dashboard_events
 from .config import Settings
-from .db import CoderHeartbeat, Message, Mission, Project, Question, Summary, get_engine
+from .db import (
+    CoderHeartbeat,
+    Message,
+    Mission,
+    PLAN_PRO,
+    PLAN_PRO_UNLIMITED,
+    Project,
+    Question,
+    Summary,
+    get_engine,
+    get_or_create_tenant,
+)
 from .project import current_project, validate_coder_id
+from .tenant import (
+    LEGACY_TENANT,
+    UNAUTHENTICATED_TENANT,
+    current_tenant,
+    is_admin,
+)
 
 
 # v1.13: heartbeat throttle. _touch_coder writes a CoderHeartbeat row at most
@@ -73,9 +90,10 @@ def _resolve_since(since: Optional[str]) -> Optional[datetime]:
         return None
     candidate: Optional[datetime] = None
     if _MESSAGE_ID_REGEX.match(since):
-        # message_id form — look up the row to get its created_at.
+        # message_id form — look up the row to get its created_at. Tenant-scoped:
+        # another tenant's message id is treated as unknown (silent passthrough).
         with Session(get_engine()) as session:
-            row = session.get(Message, since)
+            row = _tenant_get(session, Message, since)
             if row is None:
                 return None  # unknown id — silent passthrough
             candidate = row.created_at
@@ -102,6 +120,17 @@ def _mission_dict(m: Mission) -> dict[str, Any]:
         "created_at": m.created_at.isoformat(),
         "done_at": m.done_at.isoformat() if m.done_at else None,
         "coder_last_seen": m.coder_last_seen.isoformat() if m.coder_last_seen else None,
+    }
+
+
+def _foundation_dict(proj: Optional[Project]) -> Optional[dict[str, Any]]:
+    """v2.x: the project's durable foundation mission (north-star goal), or None."""
+    if proj is None or not proj.foundation_name:
+        return None
+    return {
+        "name": proj.foundation_name,
+        "spec": proj.foundation_spec,
+        "set_at": proj.foundation_set_at.isoformat() if proj.foundation_set_at else None,
     }
 
 
@@ -157,14 +186,80 @@ def _message_dict(m: Message) -> dict[str, Any]:
 
 def _project_id(session: Session, slug: Optional[str] = None) -> Optional[str]:
     """v1.9: resolve the current request's project slug to its row id.
+    v2.x: resolution is the tenancy CHOKEPOINT — it filters on (tenant_id, slug),
+    so a slug under tenant A resolves to a different project_id than the same slug
+    under tenant B, and every child query rooted here is transitively isolated.
 
-    Defaults to the slug from the request-time ContextVar. Returns None if the
-    project doesn't exist (callers treat that as "no active mission" — same as
-    pre-v1.9 behavior when no mission existed).
+    Defaults to the slug from the request-time ContextVar. Returns None if no
+    project matches (tenant + slug), which callers treat as "no active mission".
     """
     s = slug if slug is not None else current_project()
-    row = session.exec(select(Project).where(Project.slug == s)).first()
+    row = session.exec(
+        select(Project).where(Project.slug == s, Project.tenant_id == current_tenant())
+    ).first()
     return row.id if row is not None else None
+
+
+def _tenant_get(session: Session, model_cls, row_id):
+    """v2.x: get a row by its OWN id, but ONLY if it belongs to the current tenant.
+
+    Closes the by-id IDOR gap the resolution chokepoint can't cover: tools that
+    load a child row directly by a global id (answer_question, respond_to_summary,
+    ack_message, is_mission_done, the wait-on-specific-row loops). Returns None if
+    the row is missing OR owned by another tenant — callers already handle None as
+    "no such row", so cross-tenant access is indistinguishable from not-found.
+    """
+    row = session.get(model_cls, row_id)
+    if row is None:
+        return None
+    if getattr(row, "tenant_id", None) != current_tenant():
+        return None
+    return row
+
+
+# v2.x trial/plan gate. The operator's "pro_unlimited" plan (and any future
+# active Stripe subscription) → unlimited. A free tenant gets TRIAL_REPORT_LIMIT
+# progress reports, then mission mutators are blocked with a structured
+# trial_ended error the desktop can detect. The LEGACY tenant is ALWAYS exempt —
+# it's the transitional shared-key path AND our own dogfood coordination channel,
+# which must never be trial-gated. Stripe stays deferred; plans are admin-set.
+TRIAL_REPORT_LIMIT = 2
+
+
+def _check_plan_gate(count_report: bool = False) -> Optional[dict[str, Any]]:
+    """Return a structured trial_ended error dict if the current tenant is blocked,
+    else None. When count_report is True (submit_progress), increments the tenant's
+    trial_reports_used on the allowed path."""
+    tenant = current_tenant()
+    if tenant in (LEGACY_TENANT, UNAUTHENTICATED_TENANT):
+        # legacy = exempt (dogfood/transitional); unauthenticated resolves to no
+        # project anyway and is gated upstream — not this gate's concern.
+        return None
+    # Admins are never trial-gated (tamper-proof: role rides in the verified JWT).
+    # DB Tenant.plan is the single authoritative plan source for everyone else —
+    # we deliberately do NOT honor an app_metadata.plan claim here, so a downgrade
+    # can't lag a stale token.
+    if is_admin():
+        return None
+    with Session(get_engine()) as session:
+        row = get_or_create_tenant(session, tenant)
+        if row.plan in (PLAN_PRO, PLAN_PRO_UNLIMITED) or row.subscription_status == "active":
+            return None
+        if row.trial_reports_used >= TRIAL_REPORT_LIMIT:
+            return {
+                "error": (
+                    f"Free trial ended — you've used your {TRIAL_REPORT_LIMIT} trial "
+                    "progress reports. Upgrade to keep going."
+                ),
+                "trial_ended": True,
+                "plan": row.plan,
+                "trial_reports_used": row.trial_reports_used,
+            }
+        if count_report:
+            row.trial_reports_used += 1
+            session.add(row)
+            session.commit()
+    return None
 
 
 def _active_mission(session: Session, project_slug: Optional[str] = None) -> Optional[Mission]:
@@ -349,6 +444,7 @@ def _touch_coder(
     else:
         session.add(CoderHeartbeat(
             project_id=pid, coder_id=coder_id, last_seen=now, os_hint=os_hint,
+            tenant_id=current_tenant(),
         ))
     session.commit()
 
@@ -397,7 +493,7 @@ def _do_answer_question(question_id: str, answer: str) -> dict[str, Any]:
     if err:
         return err
     with Session(get_engine()) as session:
-        q = session.get(Question, question_id)
+        q = _tenant_get(session, Question, question_id)
         if q is None:
             return {"error": f"no question with id {question_id}"}
         if q.answer is not None:
@@ -418,7 +514,7 @@ def _do_respond_to_summary(summary_id: str, response: str) -> dict[str, Any]:
     if err:
         return err
     with Session(get_engine()) as session:
-        s = session.get(Summary, summary_id)
+        s = _tenant_get(session, Summary, summary_id)
         if s is None:
             return {"error": f"no summary with id {summary_id}"}
         if s.response is not None:
@@ -436,7 +532,7 @@ def _do_respond_to_summary(summary_id: str, response: str) -> dict[str, Any]:
 
 def _do_ack_message(message_id: str) -> dict[str, Any]:
     with Session(get_engine()) as session:
-        m = session.get(Message, message_id)
+        m = _tenant_get(session, Message, message_id)
         if m is None:
             return {"error": f"no message with id {message_id}"}
         if m.delivered_at is not None:
@@ -479,6 +575,7 @@ def _do_send_to_coder(body: str, target_coder_id: Optional[str] = None) -> dict[
             direction="planner_to_coder",
             body=body,
             target_coder_id=target_coder_id,
+            tenant_id=current_tenant(),
         )
         session.add(m)
         session.commit()
@@ -510,6 +607,7 @@ def _do_send_to_user(body: str) -> dict[str, Any]:
             project_id=pid,
             direction="planner_to_user",
             body=body,
+            tenant_id=current_tenant(),
         )
         session.add(m)
         session.commit()
@@ -538,6 +636,7 @@ def _do_send_to_planner_from_user(body: str) -> dict[str, Any]:
             project_id=pid,
             direction="user_to_planner",
             body=body,
+            tenant_id=current_tenant(),
         )
         session.add(m)
         session.commit()
@@ -568,6 +667,9 @@ def _do_create_mission(
     scope_err = validate_project_scope(project_slug)
     if scope_err:
         return scope_err
+    gate_err = _check_plan_gate()
+    if gate_err:
+        return gate_err
     err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
     if err:
         return err
@@ -581,8 +683,18 @@ def _do_create_mission(
                 if current:
                     current.status = "superseded"
                     session.add(current)
-                mission = Mission(name=name, spec=spec, status="active", project_id=pid)
+                mission = Mission(name=name, spec=spec, status="active", project_id=pid, tenant_id=current_tenant())
                 session.add(mission)
+                # v2.x: the FIRST mission on a project seeds the durable foundation
+                # mission (north-star goal). It is never superseded — a fresh-context
+                # Planner can always recover the project's purpose. Refine later via
+                # set_foundation_mission.
+                proj = session.get(Project, pid)
+                if proj is not None and not proj.foundation_name:
+                    proj.foundation_name = name
+                    proj.foundation_spec = spec
+                    proj.foundation_set_at = _utcnow()
+                    session.add(proj)
                 session.commit()
                 session.refresh(mission)
                 result = _mission_dict(mission)
@@ -626,6 +738,9 @@ def _do_ask_planner(
     scope_err = validate_project_scope(project_slug)
     if scope_err:
         return scope_err
+    gate_err = _check_plan_gate()
+    if gate_err:
+        return gate_err
     err = _validate_text(question, "question", MAX_TEXT_LEN)
     if err:
         return err
@@ -639,7 +754,7 @@ def _do_ask_planner(
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot ask"}
-        q = Question(mission_id=mission.id, body=question, coder_id=coder_id)
+        q = Question(mission_id=mission.id, body=question, coder_id=coder_id, tenant_id=current_tenant())
         session.add(q)
         session.commit()
         session.refresh(q)
@@ -663,6 +778,9 @@ def _do_submit_progress(
     scope_err = validate_project_scope(project_slug)
     if scope_err:
         return scope_err
+    gate_err = _check_plan_gate(count_report=True)
+    if gate_err:
+        return gate_err
     err = _validate_text(summary, "summary", MAX_TEXT_LEN)
     if err:
         return err
@@ -676,7 +794,7 @@ def _do_submit_progress(
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot submit progress"}
-        s = Summary(mission_id=mission.id, body=summary, coder_id=coder_id)
+        s = Summary(mission_id=mission.id, body=summary, coder_id=coder_id, tenant_id=current_tenant())
         session.add(s)
         session.commit()
         session.refresh(s)
@@ -684,6 +802,26 @@ def _do_submit_progress(
         slug = current_project()
     dashboard_events.broadcast(slug)
     return result
+
+
+def _do_set_foundation(name: str, spec: str) -> dict[str, Any]:
+    """Designate/refine the current project's foundation mission. Tenant+project
+    scoped via _project_id. Not trial-gated (it's project meta, not mission work)."""
+    err = _validate_text(name, "name", MAX_NAME_LEN) or _validate_text(spec, "spec", MAX_SPEC_LEN)
+    if err:
+        return err
+    with Session(get_engine()) as session:
+        pid = _project_id(session)
+        if pid is None:
+            return {"error": f"project '{current_project()}' does not exist"}
+        proj = session.get(Project, pid)
+        proj.foundation_name = name
+        proj.foundation_spec = spec
+        proj.foundation_set_at = _utcnow()
+        session.add(proj)
+        session.commit()
+        session.refresh(proj)
+        return _foundation_dict(proj)
 
 
 def _do_mark_mission_done() -> dict[str, Any]:
@@ -737,12 +875,12 @@ def register_tools(mcp, settings: Settings) -> None:
         deadline = time.monotonic() + block_timeout
         while True:
             with Session(get_engine()) as session:
-                row = session.get(model_cls, row_id)
+                row = _tenant_get(session, model_cls, row_id)
                 if row is None:
                     return {"error": f"no {id_key.replace('_id', '')} with id {row_id}"}
                 if is_terminal(row):
                     return {"status": terminal_status, **to_dict(row)}
-                mission = session.get(Mission, row.mission_id)
+                mission = _tenant_get(session, Mission, row.mission_id)
                 if mission is not None and mission.status != "active":
                     return {
                         "status": mission.status,
@@ -856,7 +994,13 @@ def register_tools(mcp, settings: Settings) -> None:
             if coder_id is not None:
                 _touch_coder(session, coder_id=coder_id)
             mission = _active_mission(session)
-            return _mission_dict(mission) if mission else {"mission": None}
+            pid = _project_id(session)
+            foundation = _foundation_dict(session.get(Project, pid)) if pid else None
+            if mission:
+                result = _mission_dict(mission)
+                result["foundation"] = foundation
+                return result
+            return {"mission": None, "foundation": foundation}
 
     @mcp.tool
     def list_pending_questions() -> list[dict[str, Any]]:
@@ -1095,6 +1239,7 @@ def register_tools(mcp, settings: Settings) -> None:
                 direction="coder_to_planner",
                 body=body,
                 coder_id=coder_id,
+                tenant_id=current_tenant(),
             )
             session.add(m)
             session.commit()
@@ -1366,6 +1511,39 @@ def register_tools(mcp, settings: Settings) -> None:
         }
 
     @mcp.tool
+    def get_foundation_mission() -> dict[str, Any]:
+        """Return this project's FOUNDATION MISSION — its durable north-star goal.
+
+        The foundation mission is set from the project's first mission (or refined
+        via set_foundation_mission) and is NEVER superseded by the rotating active
+        mission. Use it to re-ground on what the project is ultimately about —
+        especially as a fresh Planner that has lost prior conversation context.
+
+        Returns {name, spec, set_at}, or {foundation: None} if not set yet.
+        """
+        with Session(get_engine()) as session:
+            pid = _project_id(session)
+            if pid is None:
+                return {"foundation": None}
+            fd = _foundation_dict(session.get(Project, pid))
+            return fd if fd is not None else {"foundation": None}
+
+    @mcp.tool
+    def set_foundation_mission(name: str, spec: str, project_slug: Optional[str] = None) -> dict[str, Any]:
+        """Designate or refine this project's FOUNDATION MISSION (north-star goal).
+
+        The first create_mission auto-seeds the foundation; call this to set it
+        explicitly or refine it later. It persists separately from the active
+        mission and is never superseded.
+
+        v1.16: optional project_slug guards against cross-connector misrouting.
+        """
+        scope_err = validate_project_scope(project_slug)
+        if scope_err:
+            return scope_err
+        return _do_set_foundation(name, spec)
+
+    @mcp.tool
     def get_project_info() -> dict[str, Any]:
         """Return metadata about the current request's project context.
 
@@ -1388,7 +1566,9 @@ def register_tools(mcp, settings: Settings) -> None:
         """
         slug = current_project()
         with Session(get_engine()) as session:
-            proj = session.exec(select(Project).where(Project.slug == slug)).first()
+            proj = session.exec(
+                select(Project).where(Project.slug == slug, Project.tenant_id == current_tenant())
+            ).first()
             if proj is None:
                 # Should not happen — ProjectContextMiddleware returns 400 before any
                 # tool sees an unknown slug. Defensive return for direct-invocation
@@ -1420,6 +1600,8 @@ def register_tools(mcp, settings: Settings) -> None:
                 "archived_at": proj.archived_at.isoformat() if proj.archived_at else None,
                 "mission_count": mission_count,
                 "active_mission_id": active.id if active else None,
+                # v2.x: the durable north-star goal, always in reach for a fresh Planner.
+                "foundation": _foundation_dict(proj),
             }
 
     @mcp.tool
@@ -1659,7 +1841,7 @@ def register_tools(mcp, settings: Settings) -> None:
         with Session(get_engine()) as session:
             _touch_coder(session, coder_id=coder_id)
             if mission_id is not None:
-                m = session.get(Mission, mission_id)
+                m = _tenant_get(session, Mission, mission_id)
                 if m is None:
                     return {
                         "done": False,
@@ -1677,7 +1859,9 @@ def register_tools(mcp, settings: Settings) -> None:
             if active is not None:
                 return {"done": False, "status": active.status, "mission": _mission_dict(active)}
             most_recent_done = session.exec(
-                select(Mission).where(Mission.status == "done").order_by(Mission.created_at.desc())
+                select(Mission)
+                .where(Mission.status == "done", Mission.tenant_id == current_tenant())
+                .order_by(Mission.created_at.desc())
             ).first()
             if most_recent_done is not None:
                 return {"done": True, "status": "done", "mission": _mission_dict(most_recent_done)}

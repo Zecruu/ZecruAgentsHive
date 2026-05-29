@@ -31,6 +31,7 @@ from . import dashboard_events
 from .config import Settings
 from .db import CoderHeartbeat, Message, Mission, Project, Question, Summary, get_engine
 from .project import current_project, validate_slug
+from .tenant import current_tenant
 from .tools import (
     AGENTSHIVE_VERSION,
     MAX_TEXT_LEN,
@@ -43,6 +44,7 @@ from .tools import (
     _do_respond_to_summary,
     _do_send_to_coder,
     _do_send_to_planner_from_user,
+    _foundation_dict,
     _message_dict,
     _mission_dict,
     _question_dict,
@@ -472,10 +474,18 @@ def _recent_messages(session: Session, mission_id: str, direction: str, total: i
 
 
 def _recent_messages_global(session: Session, direction: str, total: int = 10, project_id: str | None = None) -> list[dict[str, Any]]:
-    """Last `total` messages of the given direction. v1.9: scoped to project if provided."""
-    stmt = select(Message).where(Message.direction == direction)
-    if project_id is not None:
-        stmt = stmt.where(Message.project_id == project_id)
+    """Last `total` messages of the given direction, scoped to a project.
+
+    v2.x: fail closed — a None project_id returns nothing rather than every
+    tenant's messages. The only caller already resolves a tenant-scoped
+    project_id; this guard makes a future mis-call inert instead of a leak.
+    """
+    if project_id is None:
+        return []
+    stmt = select(Message).where(
+        Message.direction == direction,
+        Message.project_id == project_id,
+    )
     rows = session.exec(stmt.order_by(desc(Message.created_at)).limit(total)).all()
     return [_message_dict(m) for m in reversed(rows)]
 
@@ -485,7 +495,9 @@ def _resolve_project_id(session: Session) -> str | None:
     project doesn't exist (e.g., user mistyped the URL slug).
     """
     slug = current_project()
-    row = session.exec(select(Project).where(Project.slug == slug)).first()
+    row = session.exec(
+        select(Project).where(Project.slug == slug, Project.tenant_id == current_tenant())
+    ).first()
     return row.id if row is not None else None
 
 
@@ -906,13 +918,50 @@ def _project_dict(p: Project) -> dict[str, Any]:
     }
 
 
+def _make_missions_export_handler(settings: Settings):
+    """v2.x: read-only FULL export of every mission for the current project —
+    spec + all summaries (with planner responses) + all questions (with answers)
+    + the foundation. Tenant-scoped via _resolve_project_id. The desktop app uses
+    this to write durable per-mission markdown into <projectFolder>/agentsmissions/.
+    """
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        with Session(get_engine()) as session:
+            pid = _resolve_project_id(session)
+            if pid is None:
+                return JSONResponse({"project": None, "foundation": None, "missions": []})
+            proj = session.get(Project, pid)
+            missions = session.exec(
+                select(Mission).where(Mission.project_id == pid).order_by(Mission.created_at)
+            ).all()
+            out = []
+            for m in missions:
+                summaries = session.exec(
+                    select(Summary).where(Summary.mission_id == m.id).order_by(Summary.created_at)
+                ).all()
+                questions = session.exec(
+                    select(Question).where(Question.mission_id == m.id).order_by(Question.created_at)
+                ).all()
+                rec = _mission_dict(m)
+                rec["summaries"] = [_summary_dict(s) for s in summaries]
+                rec["questions"] = [_question_dict(q) for q in questions]
+                out.append(rec)
+            return JSONResponse({
+                "project": {"slug": proj.slug, "name": proj.name},
+                "foundation": _foundation_dict(proj),
+                "missions": out,
+            })
+    return handler
+
+
 def _make_projects_list_handler(settings: Settings):
     async def handler(request: Request) -> Response:
         if not _require_dashboard_auth(request, settings):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         include_archived = request.query_params.get("include_archived", "").lower() in ("1", "true", "yes")
         with Session(get_engine()) as session:
-            stmt = select(Project)
+            stmt = select(Project).where(Project.tenant_id == current_tenant())
             if not include_archived:
                 stmt = stmt.where(Project.archived_at.is_(None))
             rows = session.exec(stmt.order_by(Project.created_at)).all()
@@ -944,10 +993,12 @@ def _make_projects_create_handler(settings: Settings):
         if slug_err:
             return JSONResponse({"error": slug_err}, status_code=400)
         with Session(get_engine()) as session:
-            existing = session.exec(select(Project).where(Project.slug == slug)).first()
+            existing = session.exec(
+                select(Project).where(Project.slug == slug, Project.tenant_id == current_tenant())
+            ).first()
             if existing is not None:
                 if existing.archived_at is None:
-                    # Active row with this slug — genuine collision.
+                    # Active row with this slug — genuine collision (per tenant).
                     return JSONResponse({"error": f"slug '{slug}' already exists"}, status_code=409)
                 # Revive an archived project on slug match: clear archived_at and
                 # update name/description so the user can effectively "re-create"
@@ -961,7 +1012,7 @@ def _make_projects_create_handler(settings: Settings):
                 session.commit()
                 session.refresh(existing)
                 return JSONResponse({"ok": True, "project": _project_dict(existing), "revived": True}, status_code=200)
-            proj = Project(slug=slug, name=name, description=description if isinstance(description, str) else None)
+            proj = Project(slug=slug, name=name, description=description if isinstance(description, str) else None, tenant_id=current_tenant())
             session.add(proj)
             session.commit()
             session.refresh(proj)
@@ -988,7 +1039,9 @@ def _make_project_archive_handler(settings: Settings):
         if slug == "default":
             return JSONResponse({"error": "the 'default' project cannot be archived"}, status_code=400)
         with Session(get_engine()) as session:
-            proj = session.exec(select(Project).where(Project.slug == slug)).first()
+            proj = session.exec(
+                select(Project).where(Project.slug == slug, Project.tenant_id == current_tenant())
+            ).first()
             if proj is None:
                 return JSONResponse({"error": f"unknown project slug '{slug}'"}, status_code=404)
             if proj.archived_at is None:
@@ -1029,6 +1082,7 @@ def register_routes(app, settings: Settings, tool_names: list[str], oauth_provid
     # v1.6 SSE push channel
     app.router.routes.append(Route("/api/dashboard/events", _make_events_handler(settings), methods=["GET"]))
     # v1.9 Projects CRUD
+    app.router.routes.append(Route("/api/dashboard/missions/export", _make_missions_export_handler(settings), methods=["GET"]))
     app.router.routes.append(Route("/api/dashboard/projects", _make_projects_list_handler(settings), methods=["GET"]))
     app.router.routes.append(Route("/api/dashboard/projects", _make_projects_create_handler(settings), methods=["POST"]))
     app.router.routes.append(Route("/api/dashboard/projects/{slug}/archive", _make_project_archive_handler(settings), methods=["POST"]))

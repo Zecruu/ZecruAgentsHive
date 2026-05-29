@@ -9,6 +9,8 @@ dependencies = [
     "psycopg[binary]>=3.2.0",
     "uvicorn>=0.30.0",
     "itsdangerous>=2.0",
+    # v2.x: verify Supabase access tokens via JWKS (asymmetric, no shared secret).
+    "pyjwt[crypto]>=2.8.0",
 ]
 
 [project.scripts]

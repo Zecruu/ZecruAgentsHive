@@ -16,5 +16,13 @@ build/
 .pytest_cache/
 .mypy_cache/
 
+# Node / Electron build outputs (apps/desktop, apps/web)
+node_modules/
+dist-electron/
+
+# Auto-generated, per-machine operator data (not source)
+agentsmissions/
+.mcp.json
+
 # Zed MCP config holds plaintext bearer tokens — must not be committed
 .zed/settings.json

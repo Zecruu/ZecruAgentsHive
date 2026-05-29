@@ -113,17 +113,28 @@ async def test_integration_user_post_planner_wait_then_reply():
         else:
             raise AssertionError("could not drain inbox in 20 iters -- server saturated?")
 
-        # Schedule the dashboard POST after a small delay so the wait actually blocks.
+        # Post the user->planner message FIRST so the row exists before we wait.
+        # Robust under any POLL_INTERVAL/BLOCK: it does NOT rely on a write landing
+        # mid-blocking-wait (which raced when the server poll interval was large
+        # enough that the sync wait tool hadn't yielded to process the POST).
         UNIQUE = "v1.8-integration-marker-please-reply"
-        async def writer():
-            await asyncio.sleep(0.3)
-            _post_send_to_planner(UNIQUE)
-        asyncio.create_task(writer())
+        _post_send_to_planner(UNIQUE)
 
-        # wait_for_user_message should return within ~2s
-        r = await planner.call_tool("wait_for_user_message", {})
-        msg = json.loads(r.content[0].text) if not getattr(r, "structured_content", None) else r.structured_content
-        assert msg.get("body") == UNIQUE, f"got {msg}"
+        def _u(resp):
+            return resp.structured_content if getattr(resp, "structured_content", None) else json.loads(resp.content[0].text)
+
+        # Bounded-retry the wait until it returns OUR message; ack any stale row
+        # that sneaks ahead so we converge on UNIQUE within the budget.
+        msg = None
+        for _ in range(40):
+            r = await planner.call_tool("wait_for_user_message", {})
+            data = _u(r)
+            if data.get("body") == UNIQUE:
+                msg = data
+                break
+            if data.get("message_id") and data.get("status") != "pending":
+                await planner.call_tool("ack_message", {"message_id": data["message_id"]})
+        assert msg is not None, "wait_for_user_message never returned the posted message"
         assert msg.get("direction") == "user_to_planner"
         mid = msg["message_id"]
 

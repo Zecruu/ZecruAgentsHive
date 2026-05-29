@@ -247,27 +247,43 @@ async def test_integration_coder_unblocks_via_dashboard_answer():
     async with Client(MCP_URL, auth=KEY) as cli:
         await cli.call_tool("create_mission", {"name": "int-unblock", "spec": "int"})
 
-    # Coder asks in background, returns the answer when received
+    # Coder asks in background, returns the answer when received. ask_planner may
+    # legitimately return {status: "pending"} if the answer hasn't arrived within
+    # the server's block window (small TOOL_BLOCK_TIMEOUT) — the DOCUMENTED pattern
+    # is then to poll wait_for_answer(question_id) until "answered". Following that
+    # makes this robust under any block/poll interval (no timing assumption).
     coder_answer = asyncio.Future()
     async def coder():
         async with Client(MCP_URL, auth=KEY) as c2:
-            r = await c2.call_tool("ask_planner", {"question": "is x ok?"})
-            coder_answer.set_result(_c(r))
+            data = _c(await c2.call_tool("ask_planner", {"question": "is x ok?"}))
+            qid = data.get("question_id")
+            for _ in range(40):
+                if data.get("status") == "answered":
+                    break
+                data = _c(await c2.call_tool("wait_for_answer", {"question_id": qid}))
+            coder_answer.set_result(data)
 
     asyncio.create_task(coder())
-    await asyncio.sleep(1.0)  # let the question land
 
-    # Dashboard reads pending questions then answers
-    state = httpx.get(f"{BASE}/api/dashboard/state", headers=BEARER).json()
-    assert state["pending_questions"], "no pending question to answer"
-    qid = state["pending_questions"][0]["question_id"]
+    # Poll until the background coder's question lands (cold MCP session setup can
+    # exceed a fixed 1s on a slow loop). Bounded wait-for-condition, ~8s cap —
+    # robust instead of a single fixed sleep.
+    qid = None
+    for _ in range(40):
+        await asyncio.sleep(0.2)
+        state = httpx.get(f"{BASE}/api/dashboard/state", headers=BEARER).json()
+        if state.get("pending_questions"):
+            qid = state["pending_questions"][0]["question_id"]
+            break
+    assert qid, "no pending question landed within ~8s"
     r = httpx.post(f"{BASE}/api/dashboard/answer",
                    json={"question_id": qid, "answer": "yes from dashboard"},
                    headers=BEARER)
     assert r.status_code == 200 and r.json()["ok"] is True
 
-    # Coder should now unblock
-    result = await asyncio.wait_for(coder_answer, timeout=10)
+    # Coder should now unblock (generous cap; the retry loop above polls in
+    # block-window-sized steps, so allow for a few iterations).
+    result = await asyncio.wait_for(coder_answer, timeout=30)
     assert result.get("status") == "answered", f"coder did not unblock: {result}"
     assert result.get("answer") == "yes from dashboard"
     print(f"  [OK] Coder unblocked with dashboard-supplied answer")

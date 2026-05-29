@@ -1,14 +1,92 @@
 {
   "name": "agentshive-desktop",
-  "version": "2.0.0-alpha.0",
+  "version": "2.0.0-alpha.1",
   "private": true,
-  "description": "AgentsHive — multi-agent control center. Pick a project, pick a role, launch Claude/Codex CLIs pre-wired to AgentsHive MCP.",
+  "description": "AgentsHive — multi-agent control center. React + shadcn + Electron.",
   "main": "electron/main.js",
   "scripts": {
-    "start": "electron .",
-    "dev": "electron . --inspect"
+    "build": "vite build",
+    "dev:vite": "vite",
+    "dev:electron": "cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .",
+    "dev": "concurrently -k -n vite,electron -c blue,magenta \"npm:dev:vite\" \"wait-on http://localhost:5173 && npm:dev:electron\"",
+    "start": "npm run build && electron .",
+    "electron:build": "vite build && electron-builder --win --publish never",
+    "electron:build:mac": "vite build && electron-builder --mac --publish never"
+  },
+  "build": {
+    "appId": "com.zecru.agentshive",
+    "productName": "AgentsHive",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "assets/**",
+      "package.json"
+    ],
+    "publish": {
+      "provider": "github",
+      "owner": "Zecruu",
+      "repo": "ZecruAgentsHive"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icons/agentshive-icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.developer-tools",
+      "icon": "assets/icons/agentshive-icon-512.png"
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}.${ext}"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "assets/icons/agentshive-icon-512.png"
+    }
   },
   "devDependencies": {
-    "electron": "^33.0.0"
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.0.0",
+    "electron-builder": "^26.8.1",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.16",
+    "tailwindcss-animate": "^1.0.7",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "wait-on": "^8.0.1"
+  },
+  "dependencies": {
+    "@homebridge/node-pty-prebuilt-multiarch": "^0.13.1",
+    "@radix-ui/react-checkbox": "^1.1.2",
+    "@radix-ui/react-dialog": "^1.1.2",
+    "@radix-ui/react-label": "^2.1.0",
+    "@radix-ui/react-scroll-area": "^1.2.1",
+    "@radix-ui/react-select": "^2.1.2",
+    "@radix-ui/react-separator": "^1.1.0",
+    "@radix-ui/react-slot": "^1.1.0",
+    "@radix-ui/react-tooltip": "^1.1.4",
+    "@supabase/supabase-js": "^2.106.2",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "electron-updater": "^6.8.3",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^2.5.5"
   }
 }

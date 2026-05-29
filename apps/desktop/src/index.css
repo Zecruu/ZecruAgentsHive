@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root.dark {
+    /* shadcn dark palette + AgentsHive tweaks */
+    --background: 222 47% 5%;
+    --foreground: 210 40% 98%;
+    --card: 222 33% 9%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222 33% 9%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 11%;
+    --secondary: 217 19% 22%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 19% 22%;
+    --muted-foreground: 215 16% 65%;
+    --accent: 38 92% 60%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 72% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 19% 18%;
+    --input: 217 19% 14%;
+    --ring: 217 91% 60%;
+    --success: 142 71% 45%;
+    --warn: 38 92% 60%;
+    --radius: 0.5rem;
+  }
+
+  * { @apply border-border; }
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: 'ss01', 'cv11';
+    overflow: hidden;
+    background:
+      radial-gradient(1200px 800px at -10% -10%, hsl(217 91% 60% / 0.10), transparent 60%),
+      radial-gradient(1000px 700px at 120% 110%, hsl(265 80% 60% / 0.08), transparent 60%),
+      linear-gradient(180deg, hsl(var(--background)) 0%, hsl(222 50% 4%) 100%);
+    background-attachment: fixed;
+  }
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(800px 500px at 50% -10%, hsl(217 91% 60% / 0.06), transparent 70%);
+    mix-blend-mode: screen;
+    z-index: 0;
+  }
+}
+
+@layer utilities {
+  .glass {
+    background-color: hsl(var(--card) / 0.55);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+  }
+  .glass-strong {
+    background-color: hsl(var(--card) / 0.7);
+    backdrop-filter: blur(22px) saturate(160%);
+    -webkit-backdrop-filter: blur(22px) saturate(160%);
+  }
+  .ring-glow-primary {
+    box-shadow: 0 0 0 1px hsl(var(--primary) / 0.35), 0 10px 32px -10px hsl(var(--primary) / 0.5);
+  }
+  .text-glow-accent {
+    filter: drop-shadow(0 0 12px hsl(var(--accent) / 0.4));
+  }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted)); }
+}

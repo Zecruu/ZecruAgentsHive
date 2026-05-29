@@ -1,0 +1,645 @@
+import { useEffect, useRef, useState } from 'react';
+import { Archive, AtSign, ChevronRight, Hexagon, ListPlus, Maximize2, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, Wrench, X as XIcon } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { cn } from '@/lib/utils';
+import { ah, MODEL_OPTIONS, EFFORT_OPTIONS, type AttachmentData, type SkillItem, type ToolCallData } from '@/lib/agentshive';
+import type { AgentRuntime, MessageRuntime } from '@/lib/useActiveProject';
+import { ToolCallCard } from './ToolCallCard';
+
+interface PendingAttachment {
+  name: string;
+  mime: string;
+  dataUrl: string;
+}
+
+interface Props {
+  agent: AgentRuntime;
+  siblings: AgentRuntime[];
+  onSend: (prompt: string, attachments?: AttachmentData[]) => void;
+  onChangeModelEffort: (model: string | null, effort: string) => void;
+  onCancel: () => void;
+  onArchive: () => void;
+  onSwitchAgent: (a: AgentRuntime) => void;
+  projectSlug: string;
+  maximized?: boolean;
+  onToggleMaximize?: () => void;
+  missionsPanelOpen?: boolean;
+  onToggleMissionsPanel?: () => void;
+  onQueue: (text: string) => void;
+  onRemoveQueued: (idx: number) => void;
+}
+
+export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCancel, onArchive, onSwitchAgent, projectSlug, maximized, onToggleMaximize, missionsPanelOpen, onToggleMissionsPanel, onQueue, onRemoveQueued }: Props) {
+  const [draft, setDraft] = useState('');
+  const [pending, setPending] = useState<PendingAttachment[]>([]);
+  const [dragOver, setDragOver] = useState(false);
+  const [busy, setBusy] = useState(false);
+  // Per-agent model/effort tuning popover (changes apply on the next turn).
+  const [tuneOpen, setTuneOpen] = useState(false);
+  // `/` slash-command autocomplete. Skills/commands live under ~/.claude; they
+  // expand in claude's headless --print mode (codex doesn't expand them, but we
+  // still surface the list for reference + quick insert, per the operator).
+  const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [skillMenuOpen, setSkillMenuOpen] = useState(false);
+  const [skillIdx, setSkillIdx] = useState(0);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Load once per project (not gated on cli — a codex agent shouldn't hide the
+  // skill list; the prior cli gate is why `/` showed nothing on codex agents).
+  useEffect(() => {
+    let alive = true;
+    ah().skills.list(projectSlug)
+      .then((s) => { if (alive) setSkills(s || []); })
+      .catch((e) => { console.warn('skills.list failed', e); if (alive) setSkills([]); });
+    return () => { alive = false; };
+  }, [projectSlug]);
+
+  const slashQuery =
+    skillMenuOpen && draft.startsWith('/') && !draft.slice(1).includes(' ')
+      ? draft.slice(1).toLowerCase()
+      : null;
+  const filteredSkills =
+    slashQuery !== null ? skills.filter((s) => s.name.toLowerCase().includes(slashQuery)).slice(0, 8) : [];
+  const showSkillMenu = slashQuery !== null && filteredSkills.length > 0;
+
+  const onDraftChange = (val: string) => {
+    setDraft(val);
+    if (val.startsWith('/') && !val.slice(1).includes(' ')) {
+      setSkillMenuOpen(true);
+      setSkillIdx(0);
+    } else {
+      setSkillMenuOpen(false);
+    }
+  };
+
+  const chooseSkill = (item: SkillItem) => {
+    setDraft('/' + item.name + ' ');
+    setSkillMenuOpen(false);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
+  useEffect(() => {
+    const el = messagesRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [agent.messages.length, agent.messages[agent.messages.length - 1]?.text, agent.id]);
+
+  useEffect(() => { textareaRef.current?.focus(); }, [agent.id]);
+
+  const readAsDataUrl = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result));
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+  };
+
+  const intakeFiles = async (files: FileList | File[]) => {
+    const list = Array.from(files).filter((f) => f.type.startsWith('image/'));
+    if (list.length === 0) return;
+    const added: PendingAttachment[] = [];
+    for (const f of list) {
+      const dataUrl = await readAsDataUrl(f);
+      added.push({ name: f.name || `pasted-${Date.now()}.png`, mime: f.type, dataUrl });
+    }
+    setPending((p) => [...p, ...added]);
+  };
+
+  const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.type.startsWith('image/')) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) {
+      e.preventDefault();
+      await intakeFiles(files);
+    }
+  };
+
+  const onDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (e.dataTransfer?.files?.length) {
+      await intakeFiles(e.dataTransfer.files);
+    }
+  };
+
+  const removePending = (idx: number) => setPending((p) => p.filter((_, i) => i !== idx));
+
+  const send = async () => {
+    const t = draft.trim();
+    if (busy) return;
+    // P4: while a turn is in-flight, Enter/Send QUEUES the follow-up (text only)
+    // instead of being blocked; it auto-sends when the current turn finishes.
+    if (agent.inFlight) {
+      if (t) { onQueue(t); setDraft(''); }
+      return;
+    }
+    if (!t && pending.length === 0) return;
+    setBusy(true);
+    try {
+      const saved: AttachmentData[] = [];
+      for (const p of pending) {
+        const r = await ah().attachments.save({
+          agentId: agent.id,
+          projectSlug,
+          name: p.name,
+          dataUrl: p.dataUrl,
+        });
+        saved.push({ name: p.name, path: r.path, dataUrl: p.dataUrl, mime: p.mime });
+      }
+      setDraft('');
+      setPending([]);
+      onSend(t, saved.length ? saved : undefined);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (showSkillMenu) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setSkillIdx((i) => Math.min(i + 1, filteredSkills.length - 1)); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setSkillIdx((i) => Math.max(i - 1, 0)); return; }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        chooseSkill(filteredSkills[Math.min(skillIdx, filteredSkills.length - 1)]);
+        return;
+      }
+      if (e.key === 'Escape') { e.preventDefault(); setSkillMenuOpen(false); return; }
+    }
+    // Shift+Enter: smart list continuation. If the current line is an ordered
+    // ("3. ") or unordered ("- "/"* ") item, continue the list; an empty item
+    // ends it. Non-list lines fall through to the default newline.
+    if (e.key === 'Enter' && e.shiftKey && continueListOnShiftEnter(e)) {
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  };
+
+  // Returns true if it handled the event (list continuation / end), false to let
+  // the default newline happen.
+  const continueListOnShiftEnter = (e: React.KeyboardEvent<HTMLTextAreaElement>): boolean => {
+    const ta = textareaRef.current;
+    if (!ta || ta.selectionStart !== ta.selectionEnd) return false; // only a plain caret
+    const caret = ta.selectionStart ?? draft.length;
+    const before = draft.slice(0, caret);
+    const after = draft.slice(caret);
+    const lineStart = before.lastIndexOf('\n') + 1;
+    const line = before.slice(lineStart);
+    const ordered = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
+    const unordered = line.match(/^(\s*)([-*])\s+(.*)$/);
+    if (!ordered && !unordered) return false;
+
+    const setAndCaret = (value: string, pos: number) => {
+      setDraft(value);
+      requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(pos, pos); });
+    };
+
+    // Empty item (just the marker) → end the list: clear the marker on this line.
+    const content = (ordered ? ordered[3] : unordered![3]);
+    if (content.trim() === '') {
+      e.preventDefault();
+      setAndCaret(draft.slice(0, lineStart) + after, lineStart);
+      return true;
+    }
+    e.preventDefault();
+    const indent = ordered ? ordered[1] : unordered![1];
+    const marker = ordered ? `${parseInt(ordered[2], 10) + 1}. ` : `${unordered![2]} `;
+    const insert = `\n${indent}${marker}`;
+    setAndCaret(before + insert + after, (before + insert).length);
+    return true;
+  };
+
+  const mention = (s: AgentRuntime) => {
+    const ta = textareaRef.current;
+    const ref = `@${s.coderId || s.label}`;
+    if (!ta) {
+      setDraft((d) => (d ? d + ' ' + ref + ' ' : ref + ' '));
+      return;
+    }
+    const start = ta.selectionStart ?? draft.length;
+    const end = ta.selectionEnd ?? draft.length;
+    const before = draft.slice(0, start);
+    const after = draft.slice(end);
+    const needsSpaceBefore = before && !before.endsWith(' ');
+    const insert = (needsSpaceBefore ? ' ' : '') + ref + ' ';
+    setDraft(before + insert + after);
+    requestAnimationFrame(() => {
+      const pos = (before + insert).length;
+      ta.focus();
+      ta.setSelectionRange(pos, pos);
+    });
+  };
+
+  const empty = agent.messages.length === 0;
+  // Per-agent usage: running total cost (sum of per-turn result costs) + the
+  // number of completed assistant turns.
+  const usageCost = agent.messages.reduce((sum, m) => sum + (typeof m.cost === 'number' ? m.cost : 0), 0);
+  const usageTurns = agent.messages.filter((m) => m.role === 'assistant' && typeof m.cost === 'number').length;
+  const statusBadge =
+    agent.status === 'thinking' ? <Badge variant="warn">thinking…</Badge>
+    : agent.status === 'rate-limited' ? <Badge variant="warn">rate-limited…</Badge>
+    : agent.status === 'err' ? <Badge variant="err">error</Badge>
+    : agent.status === 'idle' ? <Badge variant="muted">idle</Badge>
+    : <Badge variant="ok">ready</Badge>;
+
+  const orderedSiblings = [...siblings].sort((a, b) => {
+    const aMatch = agent.role === 'hivemind' ? a.role === 'coder' : a.role === 'hivemind';
+    const bMatch = agent.role === 'hivemind' ? b.role === 'coder' : b.role === 'hivemind';
+    return Number(bMatch) - Number(aMatch);
+  });
+
+  return (
+    <div
+      className={cn(
+        'flex h-full flex-col glass',
+        // Full-bleed when maximized (fills the window); framed card otherwise.
+        maximized
+          ? 'rounded-none border-0 shadow-none'
+          : 'rounded-lg border border-border/70 shadow-[0_1px_0_hsl(0_0%_100%/0.04)_inset,0_12px_40px_-20px_hsl(222_60%_0%/0.6)]',
+      )}
+      onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={onDrop}
+    >
+      <div className="flex flex-none items-center justify-between border-b border-border/60 px-5 py-3">
+        <div>
+          <h3 className="text-[15px] font-semibold tracking-tight">{agent.label}</h3>
+          <code className="text-[11px] text-muted-foreground">
+            {agent.role} · {agent.cli}{agent.model ? ` · ${agent.model}` : ''}
+            {/* codex always runs --dangerously-bypass-approvals-and-sandbox, so it's
+                unsandboxed regardless of the skip-perms checkbox — surface that. */}
+            {agent.cli === 'codex' ? ' · unsandboxed' : (agent.skipPerms ? ' · skip-perms' : '')}
+          </code>
+        </div>
+        <div className="flex items-center gap-2">
+          {usageTurns > 0 && (
+            <span
+              className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground"
+              title={`Total cost across ${usageTurns} turn${usageTurns > 1 ? 's' : ''} this session`}
+            >
+              ${usageCost.toFixed(4)} · {usageTurns} turn{usageTurns > 1 ? 's' : ''}
+            </span>
+          )}
+          {statusBadge}
+          <div className="relative">
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn('h-8 w-8', tuneOpen && 'text-accent')}
+              onClick={() => setTuneOpen((o) => !o)}
+              title="Change model & effort (applies next turn)"
+            >
+              <SlidersHorizontal className="h-4 w-4" />
+            </Button>
+            {tuneOpen && (
+              <>
+                {/* click-away backdrop */}
+                <button
+                  className="fixed inset-0 z-20 cursor-default"
+                  aria-hidden
+                  onClick={() => setTuneOpen(false)}
+                />
+                <div className="absolute right-0 top-full z-30 mt-1.5 w-60 space-y-3 rounded-lg border border-border bg-popover/95 p-3 shadow-[0_12px_40px_-16px_hsl(222_60%_0%/0.7)] backdrop-blur">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    Model &amp; effort
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-[11px]">Model</Label>
+                    <Select
+                      value={agent.model || '__default'}
+                      onValueChange={(v) => onChangeModelEffort(v === '__default' ? null : v, agent.effort)}
+                    >
+                      <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {MODEL_OPTIONS[agent.cli].map((o) => (
+                          <SelectItem key={o.value || '__default'} value={o.value || '__default'}>{o.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-[11px]">Effort</Label>
+                    <Select
+                      value={agent.effort || '__default'}
+                      onValueChange={(v) => onChangeModelEffort(agent.model, v === '__default' ? '' : v)}
+                    >
+                      <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {EFFORT_OPTIONS[agent.cli].map((o) => (
+                          <SelectItem key={o.value || '__default'} value={o.value || '__default'}>{o.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <p className="text-[10px] leading-snug text-muted-foreground">
+                    {agent.inFlight ? 'Applies to the next turn (current turn keeps its settings).' : 'Applies to the next turn.'}
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
+          {onToggleMissionsPanel && !maximized && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn('h-8 w-8', missionsPanelOpen && 'text-accent')}
+              onClick={onToggleMissionsPanel}
+              title={missionsPanelOpen ? 'Hide missions panel' : 'Show missions panel'}
+            >
+              <PanelRight className="h-4 w-4" />
+            </Button>
+          )}
+          {onToggleMaximize && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              onClick={onToggleMaximize}
+              title={maximized ? 'Exit full-width chat' : 'Maximize chat (hide sidebar)'}
+            >
+              {maximized ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+            </Button>
+          )}
+          <Button variant="ghost" size="sm" onClick={onArchive}>
+            <Archive className="h-3.5 w-3.5" /> Archive
+          </Button>
+        </div>
+      </div>
+
+      <div ref={messagesRef} className="flex-1 overflow-y-auto scrollbar-thin px-5 py-4">
+        {empty ? (
+          <div className="mx-auto max-w-md py-16 text-center">
+            <Hexagon className="mx-auto h-8 w-8 text-accent" style={{ filter: 'drop-shadow(0 0 12px hsl(38 92% 60% / 0.4))' }} />
+            <div className="mt-2 text-sm">Type a prompt, paste an image, or drop a file.</div>
+            <p className="text-[12px] text-muted-foreground">
+              Reasoning, tool calls, and results render as cards — not raw TTY.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-3.5">
+            {agent.messages.map((m, i) => (
+              <MessageBubble key={i} message={m} />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="flex-none border-t border-border/60 px-5 py-3">
+        {orderedSiblings.length > 0 && (
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Mention</span>
+            {orderedSiblings.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => mention(s)}
+                onDoubleClick={() => onSwitchAgent(s)}
+                title="Click to @-mention · double-click to switch to this agent"
+                className={cn(
+                  'group inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-all',
+                  s.role === 'coder'
+                    ? 'border-primary/30 bg-primary/5 text-primary hover:bg-primary/15'
+                    : 'border-accent/30 bg-accent/5 text-accent hover:bg-accent/15',
+                )}
+              >
+                <AtSign className="h-2.5 w-2.5" />
+                {s.coderId || s.label}
+                <span className="text-[9px] text-muted-foreground group-hover:text-current">{s.role}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {pending.length > 0 && (
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            {pending.map((p, i) => (
+              <div key={i} className="relative inline-flex items-center gap-2 rounded-md border border-border bg-input/60 p-1 pr-2">
+                <img src={p.dataUrl} alt={p.name} className="h-10 w-10 rounded object-cover" />
+                <div className="flex flex-col">
+                  <span className="max-w-[180px] truncate text-[11px]">{p.name}</span>
+                  <span className="text-[10px] text-muted-foreground">{p.mime}</span>
+                </div>
+                <button onClick={() => removePending(i)} className="ml-1 rounded-full p-0.5 hover:bg-destructive/20" title="Remove">
+                  <XIcon className="h-3 w-3 text-muted-foreground hover:text-destructive" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {agent.queue.length > 0 && (
+          <div className="mb-2 space-y-1">
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Queued ({agent.queue.length}) — sends after the current turn
+            </span>
+            {agent.queue.map((q, i) => (
+              <div key={i} className="flex items-center gap-2 rounded-md border border-border/60 bg-input/40 px-2 py-1 text-[12px]">
+                <ListPlus className="h-3 w-3 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1 truncate" title={q}>{q}</span>
+                <button
+                  onClick={() => onRemoveQueued(i)}
+                  className="shrink-0 rounded-full p-0.5 hover:bg-destructive/20"
+                  title="Remove from queue"
+                >
+                  <XIcon className="h-3 w-3 text-muted-foreground hover:text-destructive" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="relative">
+        {showSkillMenu && (
+          <div className="absolute bottom-full left-0 right-0 z-20 mb-1.5 max-h-64 overflow-y-auto scrollbar-thin rounded-lg border border-border bg-popover/95 p-1 shadow-[0_12px_40px_-16px_hsl(222_60%_0%/0.7)] backdrop-blur">
+            <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+              Skills &amp; commands · ↑↓ to navigate · Enter to insert
+            </div>
+            {filteredSkills.map((s, i) => (
+              <button
+                key={`${s.source}:${s.name}`}
+                // mousedown (not click) so selection fires before the textarea blurs
+                onMouseDown={(e) => { e.preventDefault(); chooseSkill(s); }}
+                onMouseEnter={() => setSkillIdx(i)}
+                className={cn(
+                  'flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors',
+                  i === Math.min(skillIdx, filteredSkills.length - 1) ? 'bg-primary/15' : 'hover:bg-secondary/60',
+                )}
+              >
+                <span className="mt-0.5 font-mono text-[12px] font-medium text-primary">/{s.name}</span>
+                <span className="flex-1 truncate text-[11px] text-muted-foreground" title={s.description}>
+                  {s.description}
+                </span>
+                <span className="shrink-0 rounded-full border border-border px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-muted-foreground">
+                  {s.kind}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+        <div
+          className={cn(
+            'flex items-end gap-2 rounded-lg border border-input bg-input/70 p-2 transition-all',
+            'focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30',
+            dragOver && 'border-primary ring-2 ring-primary/30',
+          )}
+        >
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className="h-8 w-8 shrink-0"
+            onClick={() => fileInputRef.current?.click()}
+            title="Attach image"
+          >
+            <Paperclip className="h-4 w-4" />
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            hidden
+            onChange={(e) => {
+              if (e.target.files) intakeFiles(e.target.files);
+              if (fileInputRef.current) fileInputRef.current.value = '';
+            }}
+          />
+          <Textarea
+            ref={textareaRef}
+            value={draft}
+            onChange={(e) => onDraftChange(e.target.value)}
+            onKeyDown={handleKey}
+            onPaste={onPaste}
+            placeholder={dragOver ? 'Drop image to attach…' : `Message ${agent.label} — Enter to send, Shift+Enter for newline · paste/drop images`}
+            className="min-h-[64px] max-h-[480px] resize-y border-0 bg-transparent p-1 shadow-none focus-visible:ring-0 focus-visible:border-0"
+            rows={3}
+          />
+          <div className="flex flex-col gap-1.5">
+            <Button
+              size="sm"
+              onClick={send}
+              disabled={busy || (!draft.trim() && (agent.inFlight || pending.length === 0))}
+              title={agent.inFlight ? 'Queue this message — sends when the current turn finishes' : 'Send'}
+            >
+              {agent.inFlight ? <ListPlus className="h-3.5 w-3.5" /> : <Send className="h-3.5 w-3.5" />}
+              {busy ? 'Saving…' : agent.inFlight ? 'Queue' : 'Send'}
+            </Button>
+            {agent.inFlight && (
+              <Button size="sm" variant="ghost" onClick={onCancel}>
+                <StopCircle className="h-3.5 w-3.5" /> Stop
+              </Button>
+            )}
+          </div>
+        </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MessageBubble({ message }: { message: MessageRuntime }) {
+  const roleClasses =
+    message.role === 'user'
+      ? 'text-primary bg-primary/15'
+      : message.role === 'assistant'
+        ? 'text-accent bg-accent/15'
+        : 'text-muted-foreground bg-muted/40';
+  const bodyClasses =
+    message.role === 'user'
+      ? 'border-primary/30 bg-gradient-to-b from-primary/10 to-primary/0'
+      : message.role === 'assistant'
+        ? 'border-accent/20 bg-card/70'
+        : 'border-border/40 bg-muted/20 text-muted-foreground text-[12.5px]';
+
+  return (
+    <div className="animate-fade-up space-y-1.5">
+      <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+        <span className={cn('rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider', roleClasses)}>
+          {message.role}
+        </span>
+        {typeof message.cost === 'number' && (
+          <span className="rounded-full border border-border bg-input/50 px-2 py-0.5 text-[10px] text-muted-foreground">
+            ${message.cost.toFixed(4)}
+          </span>
+        )}
+      </div>
+      <div className={cn('whitespace-pre-wrap break-words rounded-lg border px-3.5 py-2.5 text-[13.5px] leading-relaxed', bodyClasses)}>
+        {message.text || (message.role === 'assistant' && <span className="text-muted-foreground">…</span>)}
+        {message.attachments && message.attachments.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-2">
+            {message.attachments.map((a, i) => (
+              <a
+                key={i}
+                href={a.dataUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="block overflow-hidden rounded-md border border-border/60 transition hover:border-primary"
+                title={a.path}
+              >
+                <img src={a.dataUrl} alt={a.name} className="max-h-48 max-w-xs object-contain" />
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+      {message.toolCalls && message.toolCalls.length > 0 && (
+        <ToolCallGroup calls={message.toolCalls} />
+      )}
+    </div>
+  );
+}
+
+// One collapsible group for a turn's tool calls. Collapsed by default so the
+// conversation reads clean; auto-expands while any call is still running so live
+// progress is visible, then collapses to the summary once the turn completes.
+// A manual toggle overrides the auto behavior.
+function ToolCallGroup({ calls }: { calls: ToolCallData[] }) {
+  const [userToggled, setUserToggled] = useState<boolean | null>(null);
+  const total = calls.length;
+  const running = calls.filter((c) => !c.completed).length;
+  const errored = calls.filter((c) => c.completed && c.isError).length;
+  const anyRunning = running > 0;
+  const open = userToggled !== null ? userToggled : anyRunning;
+
+  const status: { variant: 'ok' | 'err' | 'warn'; label: string } =
+    anyRunning ? { variant: 'warn', label: `${running} running…` }
+    : errored ? { variant: 'err', label: `${errored} error${errored > 1 ? 's' : ''}` }
+    : { variant: 'ok', label: 'done' };
+
+  return (
+    <div className="pt-1">
+      <button
+        type="button"
+        onClick={() => setUserToggled(!open)}
+        className="flex w-full items-center gap-2 rounded-md border border-border/60 bg-input/40 px-3 py-1.5 text-left text-xs transition-colors hover:bg-secondary/40"
+      >
+        <ChevronRight className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', open && 'rotate-90')} />
+        <Wrench className="h-3 w-3 shrink-0 text-muted-foreground" />
+        <span className="font-medium">{total} tool call{total > 1 ? 's' : ''}</span>
+        <Badge variant={status.variant} className="ml-auto">{status.label}</Badge>
+      </button>
+      {open && (
+        <div className="mt-1.5 space-y-1.5">
+          {calls.map((tc) => (
+            <ToolCallCard key={tc.id} call={tc} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

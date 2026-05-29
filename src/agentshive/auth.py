@@ -2,13 +2,106 @@ import hmac
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
+
+
+class WebCorsMiddleware(BaseHTTPMiddleware):
+    """v2.x: CORS for the companion-webapp surface (/web/*) so a browser on a
+    different origin (the user's phone) can call it. The /web API authenticates
+    via the Supabase JWT bearer (NOT cookies), so a permissive Allow-Origin is
+    safe — there are no credentials to leak. Answers OPTIONS preflight directly
+    (before auth) since preflight carries no Authorization header.
+    """
+
+    _HEADERS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, apikey",
+        "Access-Control-Max-Age": "600",
+    }
+
+    async def dispatch(self, request: Request, call_next):
+        if not request.url.path.startswith("/web/"):
+            return await call_next(request)
+        if request.method == "OPTIONS":
+            return Response(status_code=204, headers=dict(self._HEADERS))
+        resp = await call_next(request)
+        for k, v in self._HEADERS.items():
+            resp.headers[k] = v
+        return resp
 
 from .project import (
     DEFAULT_PROJECT_SLUG,
     PROJECT_CONTEXT,
     SLUG_PATTERN,
 )
+from .tenant import (
+    IDENTITY_CONTEXT,
+    LEGACY_TENANT,
+    TENANT_CONTEXT,
+    UNAUTHENTICATED_TENANT,
+    verify_supabase_identity,
+)
+
+
+class TenantContextMiddleware(BaseHTTPMiddleware):
+    """v2.x: read the Authorization bearer on every request and set TENANT_CONTEXT
+    BEFORE downstream middleware / routes / MCP tools run — the same pattern as
+    ProjectContextMiddleware.
+
+    Tenant assignment is coupled to WHICH auth method the bearer satisfies:
+      - bearer == legacy shared key   → tenant = LEGACY_TENANT
+      - bearer is a valid Supabase JWT → tenant = the token's `sub`
+      - bearer is a known OAuth access token (Claude-app connector) → its stored tenant
+      - bearer present but none of the above → UNAUTHENTICATED_TENANT (never matches
+        a real project; the request is 401'd upstream by BearerAuth/the SDK anyway)
+      - NO bearer (cookie-authed dashboard / public health / in-process) → LEGACY_TENANT
+
+    It never rejects — gating stays with BearerAuthMiddleware and the SDK's bearer
+    backend. This only resolves identity so tools can scope by tenant.
+    """
+
+    def __init__(self, app, api_key: str, supabase_url=None, legacy_key_enabled: bool = True):
+        super().__init__(app)
+        self._api_key = api_key
+        self._supabase_url = supabase_url
+        self._legacy_key_enabled = legacy_key_enabled
+
+    async def dispatch(self, request: Request, call_next):
+        tenant = LEGACY_TENANT
+        identity = None
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            token = header[7:].strip()
+            if self._legacy_key_enabled and self._api_key and hmac.compare_digest(
+                token.encode("utf-8"), self._api_key.encode("utf-8")
+            ):
+                tenant = LEGACY_TENANT
+            else:
+                ident = verify_supabase_identity(token, self._supabase_url)
+                if ident:
+                    tenant = ident["sub"]
+                    identity = ident
+                else:
+                    # Maybe a valid OAuth access token (Claude-app connector).
+                    from .db import tenant_for_oauth_token
+                    oauth_tenant = tenant_for_oauth_token(token)
+                    tenant = oauth_tenant or UNAUTHENTICATED_TENANT
+        # Ban enforcement: a banned real tenant is made inert immediately (its
+        # token resolves to no project and is_admin() is false). The legacy and
+        # sentinel tenants are never "banned".
+        if tenant not in (LEGACY_TENANT, UNAUTHENTICATED_TENANT):
+            from .db import is_tenant_banned
+            if is_tenant_banned(tenant):
+                tenant = UNAUTHENTICATED_TENANT
+                identity = None
+        ctx_token = TENANT_CONTEXT.set(tenant)
+        id_token = IDENTITY_CONTEXT.set(identity)
+        try:
+            return await call_next(request)
+        finally:
+            TENANT_CONTEXT.reset(ctx_token)
+            IDENTITY_CONTEXT.reset(id_token)
 
 
 class ProjectContextMiddleware(BaseHTTPMiddleware):
@@ -59,6 +152,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         "/mcp",
         "/dashboard", "/dashboard/login", "/dashboard/logout",
         "/api/dashboard/state",
+        # v2.x read-only mission export (desktop writes agentsmissions/ docs);
+        # enforces cookie-or-bearer auth inside the handler.
+        "/api/dashboard/missions/export",
         # v1.5 write endpoints — dashboard handlers enforce cookie-or-bearer auth
         # themselves; global bearer-only middleware would reject browser POSTs (which
         # carry the session cookie, not Authorization).
@@ -96,9 +192,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         "/oauth/consent",
     }
 
-    def __init__(self, app, api_key: str):
+    def __init__(self, app, api_key: str, legacy_key_enabled: bool = True):
         super().__init__(app)
         self._api_key = api_key
+        self._legacy_key_enabled = legacy_key_enabled
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -106,12 +203,18 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             path in self.PUBLIC_PATHS
             or path.startswith("/.well-known/oauth-")
             or path.startswith("/api/dashboard/projects/")  # /<slug>/archive
+            # v2.x admin router: parameterized paths; each handler enforces
+            # is_admin() on the verified Supabase token (the legacy-key-only
+            # check here would otherwise 401 the admin's token).
+            or path.startswith("/admin/")
+            # v2.x companion-webapp router: Supabase-JWT, _web_guard per handler.
+            or path.startswith("/web/")
         ):
             return await call_next(request)
         header = request.headers.get("authorization", "")
         if not header.lower().startswith("bearer "):
             return JSONResponse({"error": "missing bearer token"}, status_code=401)
         token = header[7:].strip()
-        if not hmac.compare_digest(token.encode("utf-8"), self._api_key.encode("utf-8")):
+        if not self._legacy_key_enabled or not hmac.compare_digest(token.encode("utf-8"), self._api_key.encode("utf-8")):
             return JSONResponse({"error": "invalid bearer token"}, status_code=401)
         return await call_next(request)

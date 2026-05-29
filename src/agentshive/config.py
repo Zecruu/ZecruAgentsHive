@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 
 def _normalize_database_url(url: str) -> str:
@@ -18,6 +19,12 @@ class Settings:
     port: int
     poll_interval_seconds: float
     tool_block_timeout_seconds: float
+    # v2.x: Supabase project base URL (e.g. https://<ref>.supabase.co). When set,
+    # the server verifies Supabase access tokens via that project's JWKS endpoint
+    # and binds them to tenant_id = the token's `sub`. Optional — when unset, only
+    # the legacy shared key authenticates (single-tenant "legacy" mode).
+    supabase_url: Optional[str]
+    legacy_key_enabled: bool = True
 
 
 def load_settings() -> Settings:
@@ -30,6 +37,10 @@ def load_settings() -> Settings:
     database_url = _normalize_database_url(
         os.environ.get("DATABASE_URL", "sqlite:///./agentshive.db").strip()
     )
+    supabase_url = (os.environ.get("SUPABASE_URL", "").strip() or None)
+    legacy_key_enabled = os.environ.get("AGENTSHIVE_LEGACY_KEY_ENABLED", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
     port = int(os.environ.get("PORT", "8000"))
     poll_interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
     # 240s (4 min) by default. Tools long-poll for up to this duration before returning
@@ -43,4 +54,6 @@ def load_settings() -> Settings:
         port=port,
         poll_interval_seconds=poll_interval,
         tool_block_timeout_seconds=tool_block_timeout,
+        supabase_url=supabase_url,
+        legacy_key_enabled=legacy_key_enabled,
     )

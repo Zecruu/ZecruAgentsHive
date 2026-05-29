@@ -52,6 +52,7 @@ from .db import (
     OAuthRefreshToken as DbRefreshToken,
     get_engine,
 )
+from .tenant import current_tenant
 
 ACCESS_TOKEN_TTL_SECONDS = 3600          # 1h — short-lived per RFC 9700 BCP
 REFRESH_TOKEN_TTL_SECONDS = 30 * 86400   # 30 days
@@ -82,7 +83,7 @@ class AgentsHiveOAuthProvider(OAuthProvider):
     native app, which the spec classifies as public.
     """
 
-    def __init__(self, base_url: str, mcp_mount_path: str = "/mcp", legacy_api_key: Optional[str] = None):
+    def __init__(self, base_url: str, mcp_mount_path: str = "/mcp", legacy_api_key: Optional[str] = None, supabase_url: Optional[str] = None):
         super().__init__(
             base_url=base_url,
             resource_base_url=base_url,
@@ -108,6 +109,9 @@ class AgentsHiveOAuthProvider(OAuthProvider):
         # presented, we mint a synthetic AccessToken for client_id "legacy" with
         # the full mcp scope and the canonical audience.
         self._legacy_api_key = legacy_api_key
+        # v2.x: also accept Supabase access tokens (JWKS-verified) as /mcp bearers
+        # so desktop agents authenticated as a tenant can call MCP tools directly.
+        self._supabase_url = supabase_url
 
     # ----------------------------------------------------------------- clients
 
@@ -122,9 +126,11 @@ class AgentsHiveOAuthProvider(OAuthProvider):
         # The SDK has already assigned client_id (and client_secret if applicable)
         # by the time it calls us — we just persist.
         with Session(get_engine()) as s:
-            _evict_lru_if_over_cap(s)
+            tenant_id = current_tenant()
+            _evict_lru_if_over_cap(s, tenant_id)
             row = DbClient(
                 client_id=client_info.client_id,
+                tenant_id=tenant_id,
                 client_secret=client_info.client_secret,
                 client_name=client_info.client_name,
                 redirect_uris=[str(u) for u in (client_info.redirect_uris or [])],
@@ -203,6 +209,8 @@ class AgentsHiveOAuthProvider(OAuthProvider):
                 raise ValueError("authorization code invalid or already used")
             row.used = True
             s.add(row)
+            # v2.x: carry the consenting user's tenant from the code onto the token.
+            code_tenant = getattr(row, "tenant_id", None)
 
             access = _new_token()
             refresh = _new_token()
@@ -212,12 +220,14 @@ class AgentsHiveOAuthProvider(OAuthProvider):
                 scopes=authorization_code.scopes,
                 expires_at=_now_unix() + ACCESS_TOKEN_TTL_SECONDS,
                 resource=authorization_code.resource,
+                tenant_id=code_tenant,
             ))
             s.add(DbRefreshToken(
                 token_hash=_sha256_hex(refresh),
                 client_id=authorization_code.client_id,
                 scopes=authorization_code.scopes,
                 expires_at=_now_unix() + REFRESH_TOKEN_TTL_SECONDS,
+                tenant_id=code_tenant,
             ))
             _touch_client(s, authorization_code.client_id)
             s.commit()
@@ -263,6 +273,9 @@ class AgentsHiveOAuthProvider(OAuthProvider):
                 raise ValueError("refresh token invalid")
             old.revoked = True
             s.add(old)
+            # v2.x: carry tenant through rotation so the refreshed access token
+            # stays bound to the same tenant.
+            tok_tenant = getattr(old, "tenant_id", None)
 
             granted_scopes = scopes or refresh_token.scopes
 
@@ -273,12 +286,14 @@ class AgentsHiveOAuthProvider(OAuthProvider):
                 client_id=refresh_token.client_id,
                 scopes=granted_scopes,
                 expires_at=_now_unix() + ACCESS_TOKEN_TTL_SECONDS,
+                tenant_id=tok_tenant,
             ))
             s.add(DbRefreshToken(
                 token_hash=_sha256_hex(new_refresh),
                 client_id=refresh_token.client_id,
                 scopes=granted_scopes,
                 expires_at=_now_unix() + REFRESH_TOKEN_TTL_SECONDS,
+                tenant_id=tok_tenant,
             ))
             _touch_client(s, refresh_token.client_id)
             s.commit()
@@ -307,9 +322,31 @@ class AgentsHiveOAuthProvider(OAuthProvider):
                 expires_at=None,
                 resource=self._canonical_resource,
             )
+        # v2.x: Supabase JWT (JWKS-verified) — a tenant's desktop agent presenting
+        # its access token directly. verify_supabase_jwt already validated sig +
+        # exp + iss + aud, so a returned sub means a fresh, valid token. The tenant
+        # context for the request is set independently by TenantContextMiddleware.
+        if self._supabase_url:
+            from .tenant import verify_supabase_jwt
+            from .db import is_tenant_banned
+            sub = verify_supabase_jwt(token, self._supabase_url)
+            if sub:
+                if is_tenant_banned(sub):
+                    return None  # banned → reject immediately (401)
+                return AccessToken(
+                    token=token,
+                    client_id=f"supabase:{sub}",
+                    scopes=["mcp"],
+                    expires_at=None,
+                    resource=self._canonical_resource,
+                )
         with Session(get_engine()) as s:
             row = s.get(DbAccessToken, _sha256_hex(token))
             if row is None or row.revoked or row.expires_at < _now_unix():
+                return None
+            # Banned tenant's OAuth token → reject immediately.
+            from .db import is_tenant_banned
+            if row.tenant_id and is_tenant_banned(row.tenant_id):
                 return None
             # RFC 8707 confused-deputy defense: if the token was minted for a
             # different resource, treat it as not-our-token (do NOT just drop
@@ -352,12 +389,19 @@ class AgentsHiveOAuthProvider(OAuthProvider):
         code_challenge: str,
         scopes: list[str],
         resource: Optional[str],
+        tenant_id: Optional[str] = None,
     ) -> str:
         """Called by the consent-page POST handler after user approval.
 
         Returns the raw authorization code value (caller includes it in the
         302 to redirect_uri along with the client's state).
+
+        v2.x: tenant_id is the Supabase identity of the consenting user, carried
+        onto the code and then the minted access token so the resulting MCP
+        connector is tenant-bound. Defaults to LEGACY_TENANT when the consent
+        flow did not capture a Supabase identity (legacy-key/cookie consent).
         """
+        from .tenant import LEGACY_TENANT
         code = _new_token()
         with Session(get_engine()) as s:
             s.add(DbAuthCode(
@@ -369,6 +413,7 @@ class AgentsHiveOAuthProvider(OAuthProvider):
                 redirect_uri=redirect_uri,
                 redirect_uri_provided_explicitly=redirect_uri_provided_explicitly,
                 resource=resource,
+                tenant_id=tenant_id or LEGACY_TENANT,
             ))
             _touch_client(s, client_id)
             s.commit()
@@ -399,8 +444,8 @@ def _touch_client(s: Session, client_id: str) -> None:
         s.add(row)
 
 
-def _evict_lru_if_over_cap(s: Session) -> None:
-    rows = list(s.exec(select(DbClient)).all())
+def _evict_lru_if_over_cap(s: Session, tenant_id: str) -> None:
+    rows = list(s.exec(select(DbClient).where(DbClient.tenant_id == tenant_id)).all())
     if len(rows) < MAX_REGISTERED_CLIENTS:
         return
     rows.sort(key=lambda r: r.last_used_at)

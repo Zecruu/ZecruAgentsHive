@@ -1,0 +1,877 @@
+// useActiveProject — the live runtime for the ONE active project.
+//
+// This is the heart of the desktop app: agent runtime state, IPC streaming
+// subscriptions, the cross-machine dashboard poll loop, and the reactive
+// auto-wake that keeps the Hivemind/Coder protocol loop moving.
+//
+// Invariant (mission decision #1): exactly ONE active project runs at a time.
+// The hook is keyed to `project.slug`; passing a different project tears down
+// the previous project's subscriptions + cancels its in-flight chats before
+// spinning up the new one. Passing `null` runs ZERO subscriptions and ZERO
+// poll loops — the workspace can be open with no project active.
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ah,
+  type AgentData,
+  type AgentStatus,
+  type AttachmentData,
+  type ChatEvent,
+  type Cli,
+  type OsHint,
+  type Project,
+  type Role,
+  type ToolCallData,
+} from '@/lib/agentshive';
+import { getAccessToken, hasSupabaseSession } from '@/lib/supabase';
+import type { LauncherValues } from '@/components/LauncherForm';
+
+// Live agent runtime state (DOM + IPC subscriptions + the persisted shape).
+export interface AgentRuntime {
+  id: string;
+  label: string;
+  role: Role;
+  cli: Cli;
+  model: string | null;
+  effort: string;
+  skipPerms: boolean;
+  coderId: string;
+  osHint: OsHint;
+  sessionId: string | null;
+  status: AgentStatus;
+  inFlight: boolean;
+  createdAt: string;
+  messages: MessageRuntime[];
+  // v2.x: follow-up messages queued while a turn is in-flight; auto-sent in order
+  // when the current turn completes. In-memory (not persisted).
+  queue: string[];
+  // v2.x companion webapp: when a turn was injected by a web message, the
+  // originating web_to_agent message id — so onDone relays the response back
+  // (agent_to_web, correlated). Transient.
+  webParent?: string;
+  // Fix B (rate-limit resilience): retries used in the CURRENT logical turn,
+  // the pending backoff timer (cleared on cancel/archive/unmount), and a flag so
+  // an explicit cancel during a retry-wait wins over the scheduled retry.
+  retryCount: number;
+  retryTimer?: ReturnType<typeof setTimeout>;
+  cancelRequested?: boolean;
+  // Internal — not persisted
+  toolMap: Map<string, ToolCallData>;
+  streamingIdx: number | null; // index in messages of the streaming assistant msg
+  dispose?: () => void;
+}
+
+// Rate-limit retry policy (Fix B): exponential backoff, bounded attempts.
+const RL_MAX_RETRIES = 5;
+const RL_BASE_DELAY_MS = 2000;
+const RL_MAX_DELAY_MS = 60000;
+
+// A turn errored due to rate limiting if its error/stderr/stream text matches
+// any of these. Kept deliberately broad across claude + codex phrasings.
+function isRateLimitText(s: string | null | undefined): boolean {
+  const t = (s || '').toLowerCase();
+  return (
+    t.includes('rate limit') ||
+    t.includes('rate-limit') ||
+    t.includes('rate_limit') ||
+    t.includes('temporarily limiting requests') ||
+    t.includes('too many requests') ||
+    /\b429\b/.test(t)
+  );
+}
+
+// Normalize a coder identifier the SAME way the server slugifies coder_id
+// (lowercase, non-alphanumerics → hyphens, trim hyphens). The Hivemind may pass
+// a target like "SEXI LEXI" while the local agent stores "sexi-lexi"; comparing
+// raw strings misses the match and wakes the wrong (or no) coder. Fix A.
+function normCoderId(s: string | null | undefined): string {
+  return (s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+export interface MessageRuntime {
+  role: 'user' | 'assistant' | 'system';
+  text: string;
+  at?: string;
+  toolCalls?: ToolCallData[];
+  cost?: number;
+  attachments?: AttachmentData[];
+}
+
+// What to select once the active project's agents finish loading. Set
+// imperatively via requestSelect BEFORE switching activeSlug, so activating an
+// inactive project can open a specific agent (or the launcher) without racing
+// the async disk load that otherwise defaults to the last agent.
+export type SelectRequest = { kind: 'agent'; id: string } | { kind: 'launcher' };
+
+export interface ActiveProject {
+  agents: AgentRuntime[];
+  current: AgentRuntime | null;
+  currentId: string | null;
+  setCurrentId: (id: string | null) => void;
+  requestSelect: (req: SelectRequest) => void;
+  showLauncher: boolean;
+  setShowLauncher: (b: boolean) => void;
+  folder: string | null;
+  hostname: string;
+  pickFolder: () => Promise<void>;
+  clearFolder: () => Promise<void>;
+  createAgent: (v: LauncherValues) => void;
+  sendTurn: (prompt: string, attachments?: AttachmentData[]) => void;
+  setAgentModelEffort: (model: string | null, effort: string) => void;
+  queueMessage: (text: string) => void;
+  removeQueued: (idx: number) => void;
+  wakeAgent: (a: AgentRuntime, reason: string) => void;
+  archive: (a: AgentRuntime) => void;
+  cancelTurn: () => void;
+}
+
+export function useActiveProject(project: Project | null): ActiveProject {
+  const slug = project?.slug ?? null;
+  const [agents, setAgents] = useState<AgentRuntime[]>([]);
+  const [currentId, setCurrentId] = useState<string | null>(null);
+  const [showLauncher, setShowLauncher] = useState(true);
+  const [folder, setFolder] = useState<string | null>(null);
+  const [hostname, setHostname] = useState('host');
+  // Tick to force re-renders when agent internals change (messages array
+  // mutated in place during streaming).
+  const [, setTick] = useState(0);
+  const rerender = useCallback(() => setTick((n) => n + 1), []);
+  const agentsRef = useRef<AgentRuntime[]>([]);
+  agentsRef.current = agents;
+  // Selection requested by the caller for the NEXT active-project load.
+  const pendingSelectRef = useRef<SelectRequest | null>(null);
+  const requestSelect = useCallback((req: SelectRequest) => {
+    pendingSelectRef.current = req;
+  }, []);
+
+  const current = agents.find((a) => a.id === currentId) || null;
+
+  // --- load project state on mount / active-slug change ---
+  useEffect(() => {
+    let alive = true;
+    if (!slug) {
+      // No active project: clear state, run nothing.
+      setAgents([]);
+      setCurrentId(null);
+      setShowLauncher(true);
+      setFolder(null);
+      return;
+    }
+    (async () => {
+      const [f, hn, saved] = await Promise.all([
+        ah().paths.get(slug).catch(() => null),
+        ah().app.hostname().catch(() => 'host'),
+        ah().agents.list(slug).catch(() => []),
+      ]);
+      if (!alive) return;
+      setFolder(f);
+      setHostname(hn);
+      const restored: AgentRuntime[] = (saved || []).map((d) => rehydrate(d));
+      setAgents(restored);
+      // Honor a caller-requested selection (set right before activation), else
+      // default to the most recent agent, else show the launcher.
+      const req = pendingSelectRef.current;
+      pendingSelectRef.current = null;
+      if (req?.kind === 'launcher') {
+        setShowLauncher(true);
+        setCurrentId(null);
+      } else if (req?.kind === 'agent' && restored.some((a) => a.id === req.id)) {
+        setShowLauncher(false);
+        setCurrentId(req.id);
+      } else if (restored.length > 0) {
+        setShowLauncher(false);
+        setCurrentId(restored[restored.length - 1].id);
+      } else {
+        setShowLauncher(true);
+        setCurrentId(null);
+      }
+    })();
+    return () => {
+      alive = false;
+      // Tear down ALL subscriptions + cancel in-flight chats for the project
+      // we're leaving. agentsRef still points at the OLD project's agents here
+      // (the new project's setAgents hasn't run yet), so this disposes exactly
+      // the right runtime before the next project spins up.
+      for (const a of agentsRef.current) {
+        if (a.retryTimer) { clearTimeout(a.retryTimer); a.retryTimer = undefined; }
+        if (a.dispose) try { a.dispose(); } catch {}
+        if (a.inFlight) ah().chat.cancel(a.id).catch(() => {});
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  const persist = useCallback(
+    (a: AgentRuntime) => {
+      if (!slug) return;
+      ah().agents.save(slug, serialize(a)).catch(() => {});
+    },
+    [slug],
+  );
+
+  // Cross-machine wake. Poll /api/dashboard/state every 20s. On first poll
+  // we snapshot all known IDs so we don't wake for stuff that pre-dates the
+  // app opening. On subsequent polls, any NEW message/question/summary that
+  // targets a local sibling fires a wake on that sibling. Only ONE loop runs:
+  // it is keyed to the active slug and never starts when slug is null.
+  const seenIdsRef = useRef<Set<string>>(new Set());
+  const seenInitializedRef = useRef(false);
+  useEffect(() => {
+    if (!slug) return;
+    seenIdsRef.current = new Set();
+    seenInitializedRef.current = false;
+
+    const ingest = (state: any) => {
+      const events: Array<{ id: string; kind: 'p2c' | 'c2p' | 'question' | 'summary' | 'mission'; target?: string | null; from?: string | null }> = [];
+      const push = (arr: any[] | undefined, kind: any, getTarget: (x: any) => string | null | undefined, getFrom: (x: any) => string | null | undefined) => {
+        if (!Array.isArray(arr)) return;
+        for (const x of arr) {
+          const id = `${kind}:${x.id ?? x.created_at ?? Math.random()}`;
+          events.push({ id, kind, target: getTarget(x), from: getFrom(x) });
+        }
+      };
+      push(state.p2c, 'p2c', (m) => m.target_coder_id, () => null);
+      push(state.c2p, 'c2p', () => null, (m) => m.coder_id);
+      push(state.pending_q, 'question', () => null, (q) => q.coder_id);
+      push(state.pending_s, 'summary', () => null, (s) => s.coder_id);
+      push(state.inbox, 'p2c', (m) => m.target_coder_id, () => null);
+      // A newly-active mission (e.g. created from a remote Planner like the
+      // Claude app) should wake local Coders. We key the event on the mission
+      // id; the first-tick snapshot absorbs the mission already active at app
+      // open, so only a CHANGE to a new mission id fires a wake.
+      const am = state.active_mission;
+      const missionId = am && (am.mission_id ?? am.id);
+      if (missionId) events.push({ id: `mission:${missionId}`, kind: 'mission' });
+      return events;
+    };
+
+    const tick = async () => {
+      try {
+        const state = await ah().dashboard.state(slug);
+        const events = ingest(state);
+        // v2.x: keep <projectFolder>/agentsmissions/ in sync with server state.
+        // Best-effort + idempotent (write-only-if-changed); no-op if no folder set.
+        ah().missions.syncDocs(slug).catch(() => {});
+        if (!seenInitializedRef.current) {
+          for (const e of events) seenIdsRef.current.add(e.id);
+          seenInitializedRef.current = true;
+          return;
+        }
+        for (const e of events) {
+          if (seenIdsRef.current.has(e.id)) continue;
+          seenIdsRef.current.add(e.id);
+          // A new active mission wakes every idle Coder once (the seenIds guard
+          // above prevents re-waking on later polls; inFlight prevents stomping
+          // a Coder mid-turn).
+          if (e.kind === 'mission') {
+            for (const a of agentsRef.current) {
+              if (a.role === 'coder' && !a.inFlight) wakeAgent(a, 'remote:new-mission');
+            }
+            continue;
+          }
+          // Resolve which local sibling (if any) should wake.
+          let target: AgentRuntime | undefined;
+          if (e.kind === 'p2c' && e.target) {
+            const want = normCoderId(e.target);
+            target = agentsRef.current.find((a) => a.role === 'coder' && normCoderId(a.coderId || a.label) === want);
+          } else if (e.kind === 'c2p' || e.kind === 'question' || e.kind === 'summary') {
+            // Anything from a coder targets the Hivemind.
+            target = agentsRef.current.find((a) => a.role === 'hivemind');
+          }
+          if (target && !target.inFlight) {
+            wakeAgent(target, `remote:${e.kind}`);
+          }
+        }
+      } catch (err) {
+        // Network blip or auth issue — just retry next interval.
+        console.warn('dashboard poll failed', err);
+      }
+    };
+
+    // First tick after 5s (lets initial render settle), then every 20s.
+    const tInitial = setTimeout(tick, 5000);
+    const tInterval = setInterval(tick, 20000);
+    return () => {
+      clearTimeout(tInitial);
+      clearInterval(tInterval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  // W2: companion-webapp relay. Authenticated as the operator's Supabase tenant
+  // (so it shares a tenant with the webapp). Publishes the ACTIVE project's agent
+  // roster + heartbeat, and polls /web/inbound for web→agent messages addressed to
+  // this project's agents — injecting each (when the agent is idle) as a local
+  // turn; the response is relayed back in onDone (correlated via webParent). Only
+  // the active project is reachable from the web at any moment (single-active
+  // runtime invariant). Idle-backoff to avoid hammering when nothing's happening.
+  useEffect(() => {
+    if (!slug) return;
+    let stopped = false;
+    let lastPresence = 0;
+    let idleStreak = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (stopped) return;
+      const token = getAccessToken();
+      let didWork = false;
+      if (token) {
+        const now = Date.now();
+        if (now - lastPresence > 10000) {
+          lastPresence = now;
+          const roster = agentsRef.current.map((a) => ({
+            agent_key: a.id, label: a.label, role: a.role, cli: a.cli, status: a.status,
+          }));
+          ah().web.presence(token, slug, roster).catch(() => {});
+        }
+        try {
+          const r = await ah().web.inbound(token);
+          for (const msg of r.messages || []) {
+            if (msg.project_slug && msg.project_slug !== slug) continue; // different project — leave unacked
+            const target = msg.agent_key
+              ? agentsRef.current.find((a) => a.id === msg.agent_key)
+              : (agentsRef.current.find((a) => a.role === 'hivemind') || agentsRef.current[0]);
+            if (!target) continue;            // no matching local agent — leave for later
+            if (target.inFlight) continue;    // busy — leave unacked, retry next poll
+            await ah().web.ack(token, msg.message_id).catch(() => {});
+            target.webParent = msg.message_id;
+            _startUserTurn(target, msg.body);
+            didWork = true;
+          }
+        } catch {
+          // network blip — retry next tick
+        }
+      }
+      idleStreak = didWork ? 0 : Math.min(idleStreak + 1, 5);
+      // 3s when active; back off toward ~10s when idle.
+      const delay = 3000 + idleStreak * 1500;
+      if (!stopped) timer = setTimeout(tick, delay);
+    };
+
+    timer = setTimeout(tick, 3000);
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  const pickFolder = async () => {
+    if (!slug) return;
+    const picked = await ah().paths.pick(slug);
+    if (picked) setFolder(picked);
+  };
+  const clearFolder = async () => {
+    if (!slug) return;
+    await ah().paths.set(slug, null);
+    setFolder(null);
+  };
+
+  // ------- create + bootstrap an agent ----------------------------------
+  const createAgent = (v: LauncherValues) => {
+    if (!slug) return;
+    const id = 'a-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const seq = agentsRef.current.filter((a) => a.role === v.role).length + 1;
+    const fallbackLabel = v.coderId || `${v.role}-${seq}`;
+    const a: AgentRuntime = {
+      id,
+      label: fallbackLabel,
+      role: v.role,
+      cli: v.cli,
+      model: v.model || null,
+      effort: v.effort || '',
+      skipPerms: v.skipPerms,
+      coderId: v.coderId,
+      osHint: v.osHint,
+      sessionId: null,
+      status: 'ready',
+      inFlight: false,
+      createdAt: new Date().toISOString(),
+      messages: [],
+      queue: [],
+      retryCount: 0,
+      toolMap: new Map(),
+      streamingIdx: null,
+    };
+    setAgents((prev) => [...prev, a]);
+    setCurrentId(id);
+    setShowLauncher(false);
+    persist(a);
+    // Kick off bootstrap turn so the agent verifies scope + greets.
+    setTimeout(() => bootstrapAgent(id), 0);
+  };
+
+  const bootstrapAgent = (id: string) => {
+    const a = agentsRef.current.find((x) => x.id === id);
+    if (!a) return;
+    a.retryCount = 0;
+    a.cancelRequested = false;
+    a.inFlight = true;
+    a.status = 'thinking';
+    a.messages.push({ role: 'system', text: 'Initializing — verifying scope + reading AGENTS.md…' });
+    a.messages.push({ role: 'assistant', text: '', toolCalls: [] });
+    a.streamingIdx = a.messages.length - 1;
+    rerender();
+    startStreamingChatTurn(a, '', /* bootstrap */ true);
+  };
+
+  // ------- send a normal user turn --------------------------------------
+  // Core turn-start for a SPECIFIC agent (no inFlight guard — callers ensure it).
+  // Used by sendTurn (current agent) and the queue drain (the agent whose turn
+  // just finished).
+  const _startUserTurn = (a: AgentRuntime, prompt: string, attachments?: AttachmentData[]) => {
+    // What the user sees in the bubble: original text + thumbnails.
+    a.messages.push({ role: 'user', text: prompt, attachments });
+
+    // What claude actually receives: user text + a paths block. Claude's
+    // vision pipeline picks the images up when it Reads the path.
+    let claudePrompt = prompt;
+    if (attachments && attachments.length > 0) {
+      const lines = attachments.map((x) => `  - ${x.path}`).join('\n');
+      claudePrompt = `${prompt}\n\n[Attached images — read these paths with the Read tool to view them:]\n${lines}`;
+    }
+
+    a.messages.push({ role: 'assistant', text: '', toolCalls: [] });
+    a.streamingIdx = a.messages.length - 1;
+    a.retryCount = 0;
+    a.cancelRequested = false;
+    a.inFlight = true;
+    a.status = 'thinking';
+    rerender();
+    persist(a);
+    startStreamingChatTurn(a, claudePrompt, false);
+  };
+
+  const sendTurn = (prompt: string, attachments?: AttachmentData[]) => {
+    if (!current) return;
+    const a = current;
+    if (a.inFlight || (!prompt.trim() && (!attachments || attachments.length === 0))) return;
+    _startUserTurn(a, prompt, attachments);
+  };
+
+  // Change the current agent's model + reasoning effort after launch. The turn
+  // spawn reads a.model/a.effort at send time (startStreamingChatTurn), so a
+  // mutate-and-persist here applies on the NEXT turn without disrupting any
+  // in-flight one (that turn already spawned with the old values).
+  const setAgentModelEffort = (model: string | null, effort: string) => {
+    if (!current) return;
+    const a = current;
+    a.model = model;
+    a.effort = effort;
+    rerender();
+    persist(a);
+  };
+
+  // P4: queue a follow-up while a turn is in-flight; drained on turn done.
+  const queueMessage = (text: string) => {
+    if (!current || !text.trim()) return;
+    current.queue.push(text);
+    rerender();
+  };
+
+  const removeQueued = (idx: number) => {
+    if (!current) return;
+    current.queue.splice(idx, 1);
+    rerender();
+  };
+
+  const siblingPayload = (selfId: string) =>
+    agentsRef.current
+      .filter((x) => x.id !== selfId)
+      .map((x) => ({ label: x.label, role: x.role, cli: x.cli, coderId: x.coderId, status: x.status }));
+
+  const startStreamingChatTurn = (a: AgentRuntime, prompt: string, bootstrap: boolean) => {
+    if (!slug) return;
+    a.toolMap = new Map();
+    let settled = false;
+    let rateLimitHit = false;
+    const noteRateLimit = (s: string | null | undefined) => { if (isRateLimitText(s)) rateLimitHit = true; };
+
+    const offEvent = ah().chat.onEvent(a.id, (ev) => {
+      // Rate-limit signals surface as raw/system stream text on both CLIs.
+      if (ev && ev.type === 'raw' && typeof ev.text === 'string') noteRateLimit(ev.text);
+      handleEvent(a, ev);
+    });
+    const offStderr = ah().chat.onStderr(a.id, (t) => { noteRateLimit(t); console.warn(`[${a.label}]`, t); });
+
+    const cleanup = () => {
+      try { offEvent(); offStderr(); offDone(); offErr(); } catch {}
+      a.dispose = undefined;
+    };
+
+    // Single settlement path for this turn — guards against onDone + onError both
+    // firing. ok=true is a clean finish; otherwise we either retry (rate limit,
+    // bounded exponential backoff — Fix B) or surface a terminal error.
+    const settle = (ok: boolean, errText?: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+
+      // An explicit cancel (composer Stop / archive) wins over any retry.
+      if (a.cancelRequested) {
+        a.cancelRequested = false;
+        a.retryCount = 0;
+        a.inFlight = false;
+        a.status = 'idle';
+        a.streamingIdx = null;
+        rerender();
+        persist(a);
+        return;
+      }
+
+      // Rate-limited failure → retry the SAME turn after backoff (prompt +
+      // bootstrap are still in scope). Only surface the error once retries are
+      // exhausted.
+      if (!ok && rateLimitHit && a.retryCount < RL_MAX_RETRIES) {
+        a.retryCount += 1;
+        const backoff = Math.min(RL_MAX_DELAY_MS, RL_BASE_DELAY_MS * 2 ** (a.retryCount - 1));
+        a.status = 'rate-limited';
+        a.streamingIdx = null;
+        a.messages.push({
+          role: 'system',
+          text: `rate-limited — retrying in ${Math.ceil(backoff / 1000)}s (attempt ${a.retryCount}/${RL_MAX_RETRIES})…`,
+        });
+        a.inFlight = true; // stay busy: composer disabled + status visible
+        rerender();
+        persist(a);
+        a.retryTimer = setTimeout(() => {
+          a.retryTimer = undefined;
+          if (a.cancelRequested) {
+            a.cancelRequested = false;
+            a.retryCount = 0;
+            a.inFlight = false;
+            a.status = 'idle';
+            rerender();
+            persist(a);
+            return;
+          }
+          a.messages.push({ role: 'assistant', text: '', toolCalls: [] });
+          a.streamingIdx = a.messages.length - 1;
+          a.status = 'thinking';
+          rerender();
+          startStreamingChatTurn(a, prompt, bootstrap);
+        }, backoff);
+        return;
+      }
+
+      // Terminal: clean success, or a non-retryable / exhausted failure.
+      if (!ok && errText) a.messages.push({ role: 'system', text: errText });
+      a.retryCount = 0;
+      a.inFlight = false;
+      a.status = ok ? 'ready' : 'err';
+      a.streamingIdx = null;
+      rerender();
+      persist(a);
+      if (!ok) return;
+
+      // W2: if this turn was injected by a web message, relay the response back
+      // (agent_to_web, correlated to the originating web_to_agent).
+      if (a.webParent && slug) {
+        const parent = a.webParent;
+        a.webParent = undefined;
+        const lastAssist = [...a.messages].reverse().find((m) => m.role === 'assistant');
+        let body = (lastAssist?.text || '').trim();
+        const tc = lastAssist?.toolCalls?.length || 0;
+        if (tc) body += (body ? '\n\n' : '') + `[${tc} tool call${tc > 1 ? 's' : ''}]`;
+        if (!body) body = '(no text response)';
+        const token = getAccessToken();
+        if (token) ah().web.relay(token, parent, slug, a.id, body).catch(() => {});
+      }
+      // P4: drain the next queued follow-up (if any) as the next turn.
+      if (a.queue.length > 0) {
+        const next = a.queue.shift() as string;
+        rerender();
+        setTimeout(() => { if (!a.inFlight) _startUserTurn(a, next); }, 0);
+      }
+    };
+
+    const offDone = ah().chat.onDone(a.id, ({ code }) => settle(code === 0));
+    const offErr = ah().chat.onError(a.id, ({ message }) => {
+      noteRateLimit(message);
+      settle(false, 'process error: ' + message);
+    });
+    a.dispose = cleanup;
+
+    const authToken = getAccessToken();
+    ah().chat
+      .send({
+        chatId: a.id,
+        prompt,
+        sessionId: a.sessionId,
+        projectSlug: slug,
+        coderId: a.coderId,
+        osHint: a.osHint,
+        cli: a.cli,
+        model: a.model,
+        effort: a.effort,
+        skipPerms: a.skipPerms,
+        // v2.x: present the signed-in tenant's Supabase token as the MCP bearer
+        // (re-read each turn so a refreshed token is always current).
+        authToken,
+        requireAuthToken: hasSupabaseSession(),
+        agentLabel: a.label,
+        agentRole: a.role,
+        bootstrap,
+        siblings: siblingPayload(a.id),
+      })
+      .catch((err: any) => {
+        noteRateLimit(String(err?.message || err));
+        settle(false, 'failed to start: ' + (err?.message || err));
+      });
+  };
+
+  // Reactive auto-wake. Inspect every tool call from a local agent; if it
+  // signals "Coder activity expected" or "Hivemind activity expected",
+  // wake the appropriate sibling(s) so the protocol loop actually makes
+  // progress instead of deadlocking on a long-poll against an idle peer.
+  const maybeWakeOnToolUse = (sender: AgentRuntime, toolName: string, toolInput: unknown) => {
+    if (!toolName) return;
+    const input = (toolInput || {}) as Record<string, any>;
+    const shortName = toolName.split('__').pop() || toolName;
+    let targets: AgentRuntime[] = [];
+
+    // 1) Hivemind → specific Coder: direct routing tools. A targeted send must
+    // wake EXACTLY the matched coder, so normalize both sides (the Hivemind may
+    // pass "SEXI LEXI" while the local agent stores "sexi-lexi"). Fix A.
+    if (toolName.endsWith('send_to_coder') || toolName.endsWith('answer_question') || toolName.endsWith('respond_to_summary')) {
+      const tid = input.target_coder_id;
+      if (typeof tid === 'string' && tid) {
+        const want = normCoderId(tid);
+        const target = agentsRef.current.find(
+          (x) => x.id !== sender.id && x.role === 'coder' && normCoderId(x.coderId || x.label) === want,
+        );
+        if (target) targets = [target];
+      }
+    }
+
+    // 2) Hivemind → ALL Coders broadcast wake — ONLY create_mission. A new
+    // mission is the single legitimate "Coders should start now" signal.
+    // wait_for_next_question / wait_for_next_summary are the Planner LONG-POLLING
+    // (it is now ready to listen) — NOT a coder-start signal — so they must wake
+    // no coder (previously they over-broadcast and woke every idle coder). Fix A.
+    if (toolName.endsWith('create_mission')) {
+      targets = agentsRef.current.filter((x) => x.id !== sender.id && x.role === 'coder');
+    }
+
+    // 3) Coder → Hivemind: any tool that hands off a message/question/summary.
+    if (
+      toolName.endsWith('send_to_planner') ||
+      toolName.endsWith('ask_planner') ||
+      toolName.endsWith('submit_progress')
+    ) {
+      const target = agentsRef.current.find((x) => x.id !== sender.id && x.role === 'hivemind');
+      if (target) targets = [target];
+    }
+
+    for (const target of targets) {
+      if (target.inFlight) continue;
+      wakeAgent(target, `${sender.label} → ${shortName}`);
+    }
+  };
+
+  const wakeAgent = (target: AgentRuntime, reason: string) => {
+    const cid = target.coderId || target.label;
+    const wakePrompt =
+      target.role === 'coder'
+        ? `[auto-wake from ${reason}]
+The Hivemind is signalling that Coder activity is expected. Do this in order:
+
+1. Call \`mcp__agentshive__get_active_mission(coder_id="${cid}")\` to fetch the current mission brief.
+2. If there IS an active mission and you haven't reported progress yet, start working on it. As you reach milestones, call \`mcp__agentshive__submit_progress(summary, status, coder_id="${cid}")\`. When stuck, call \`mcp__agentshive__ask_planner(question, coder_id="${cid}")\` and then \`mcp__agentshive__wait_for_answer(question_id, coder_id="${cid}", timeout=240)\`.
+3. If there's NO active mission (or you're mid-mission and want to check for direct messages), call \`mcp__agentshive__wait_for_coder_message(coder_id="${cid}", timeout=5)\` once.
+4. If nothing meaningful is waiting after step 3, acknowledge to the operator that you're standing by — don't keep polling.`
+        : `[auto-wake from ${reason}]
+A new message or question or summary is waiting. Do this in order:
+
+1. Call \`mcp__agentshive__list_pending_questions()\` and \`mcp__agentshive__list_pending_summaries()\` — answer/respond to any pending ones.
+2. Call \`mcp__agentshive__wait_for_planner_message(timeout=5)\` once.
+3. If nothing meaningful was waiting, acknowledge briefly and stand by.`;
+    target.messages.push({ role: 'user', text: wakePrompt });
+    target.messages.push({ role: 'assistant', text: '', toolCalls: [] });
+    target.streamingIdx = target.messages.length - 1;
+    target.inFlight = true;
+    target.status = 'thinking';
+    rerender();
+    persist(target);
+    startStreamingChatTurn(target, wakePrompt, false);
+  };
+
+  const handleEvent = (a: AgentRuntime, ev: ChatEvent) => {
+    if (!ev || !ev.type) return;
+    if (ev.type === 'system' && ev.subtype === 'init') {
+      if (ev.session_id) a.sessionId = ev.session_id;
+      return;
+    }
+    if (ev.type === 'assistant' && ev.message) {
+      const content = ev.message.content || [];
+      const cur = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
+      for (const c of content) {
+        if (c.type === 'text' && cur) {
+          cur.text += c.text;
+        } else if (c.type === 'tool_use' && cur) {
+          const tc: ToolCallData = { id: c.id, name: c.name, input: c.input, completed: false };
+          cur.toolCalls = cur.toolCalls || [];
+          cur.toolCalls.push(tc);
+          a.toolMap.set(c.id, tc);
+          // Auto-wake: when the active agent calls a routing tool aimed at
+          // another sibling, fire a wake turn on the target if it's idle.
+          maybeWakeOnToolUse(a, c.name, c.input);
+        }
+      }
+      rerender();
+      return;
+    }
+    if (ev.type === 'user' && ev.message) {
+      const content = ev.message.content || [];
+      for (const c of content) {
+        if (c.type === 'tool_result') {
+          const tc = a.toolMap.get(c.tool_use_id);
+          if (tc) {
+            tc.result = c.content;
+            tc.isError = Boolean(c.is_error);
+            tc.completed = true;
+          }
+        }
+      }
+      rerender();
+      return;
+    }
+    if (ev.type === 'result') {
+      const cur = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
+      if (cur && typeof ev.total_cost_usd === 'number') {
+        cur.cost = ev.total_cost_usd;
+        rerender();
+      }
+      return;
+    }
+    if (ev.type === 'raw' && typeof ev.text === 'string') {
+      a.messages.push({ role: 'system', text: ev.text });
+      rerender();
+    }
+  };
+
+  // ------- agent actions ------------------------------------------------
+  const archive = (a: AgentRuntime) => {
+    if (!slug) return;
+    // Archiving must TERMINATE the agent's CLI subprocess, not just drop it from
+    // the UI. We ALWAYS issue a cancel (which tree-kills the spawned CLI + its
+    // children in the main process) so a removed agent can never keep running and
+    // editing files. Also clear any pending rate-limit retry so it can't re-spawn.
+    a.cancelRequested = true;
+    if (a.retryTimer) { clearTimeout(a.retryTimer); a.retryTimer = undefined; }
+    ah().chat.cancel(a.id).catch(() => {});
+    if (a.dispose) try { a.dispose(); } catch {}
+    ah().agents.delete(slug, a.id).catch(() => {});
+    setAgents((prev) => {
+      const next = prev.filter((x) => x.id !== a.id);
+      if (currentId === a.id) {
+        if (next.length) setCurrentId(next[next.length - 1].id);
+        else { setCurrentId(null); setShowLauncher(true); }
+      }
+      return next;
+    });
+  };
+
+  const cancelTurn = () => {
+    if (!current) return;
+    const a = current;
+    a.cancelRequested = true;
+    // If we're waiting between rate-limit retries there's no live process to
+    // cancel — clear the timer and reflect the cancellation immediately.
+    if (a.retryTimer) {
+      clearTimeout(a.retryTimer);
+      a.retryTimer = undefined;
+      a.cancelRequested = false;
+      a.retryCount = 0;
+      a.inFlight = false;
+      a.status = 'idle';
+      a.streamingIdx = null;
+      rerender();
+      persist(a);
+      return;
+    }
+    // Live process: tree-kill it; settle() sees cancelRequested and finishes clean.
+    ah().chat.cancel(a.id).catch(() => {});
+  };
+
+  return {
+    agents,
+    current,
+    currentId,
+    setCurrentId,
+    requestSelect,
+    showLauncher,
+    setShowLauncher,
+    folder,
+    hostname,
+    pickFolder,
+    clearFolder,
+    createAgent,
+    sendTurn,
+    setAgentModelEffort,
+    queueMessage,
+    removeQueued,
+    wakeAgent,
+    archive,
+    cancelTurn,
+  };
+}
+
+// --- (de)serialize between persisted AgentData and runtime AgentRuntime ---
+function rehydrate(d: AgentData): AgentRuntime {
+  return {
+    id: d.id,
+    label: d.label,
+    role: d.role,
+    cli: d.cli,
+    model: d.model || null,
+    effort: d.effort || '',
+    skipPerms: Boolean(d.skipPerms),
+    coderId: d.coderId || '',
+    osHint: d.osHint || null,
+    sessionId: d.sessionId || null,
+    status: 'idle',
+    inFlight: false,
+    createdAt: d.createdAt || new Date().toISOString(),
+    messages: (d.messages || []).map((m) => ({
+      role: m.role,
+      text: m.text,
+      at: m.at,
+      toolCalls: m.toolCalls,
+      cost: m.cost,
+      attachments: m.attachments,
+    })),
+    queue: [],
+    retryCount: 0,
+    toolMap: new Map(),
+    streamingIdx: null,
+  };
+}
+
+function serialize(a: AgentRuntime): AgentData {
+  return {
+    id: a.id,
+    label: a.label,
+    role: a.role,
+    cli: a.cli,
+    model: a.model,
+    effort: a.effort,
+    skipPerms: a.skipPerms,
+    coderId: a.coderId,
+    osHint: a.osHint,
+    sessionId: a.sessionId,
+    // Transient busy states never persist as busy.
+    status: a.status === 'thinking' || a.status === 'rate-limited' ? 'idle' : a.status,
+    createdAt: a.createdAt,
+    updatedAt: new Date().toISOString(),
+    messages: a.messages.map((m) => ({
+      role: m.role,
+      text: m.text,
+      at: m.at,
+      toolCalls: m.toolCalls,
+      cost: m.cost,
+      attachments: m.attachments,
+    })),
+  };
+}
