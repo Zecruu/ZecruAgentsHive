@@ -206,7 +206,15 @@ export interface ActiveProject {
   cancelTurn: () => void;
 }
 
-export function useActiveProject(project: Project | null): ActiveProject {
+// `isActive` — true for the ONE project currently displayed. The runtime (agents,
+// chat subscriptions, in-flight subprocesses, settle/persist) runs for EVERY open
+// project so an in-flight turn survives a project switch; but the two side-effects
+// that must stay single-active (the cross-machine dashboard poll and the companion
+// web-relay presence/inbound loop) are gated behind isActive so backgrounded
+// projects never double-run them. Local chat-event-driven auto-wake is NOT gated —
+// it stays subscribed in every project so a backgrounded Planner's create_mission
+// still wakes coders.
+export function useActiveProject(project: Project | null, isActive: boolean): ActiveProject {
   const slug = project?.slug ?? null;
   const [agents, setAgents] = useState<AgentRuntime[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
@@ -346,7 +354,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
   const seenIdsRef = useRef<Set<string>>(new Set());
   const seenInitializedRef = useRef(false);
   useEffect(() => {
-    if (!slug) return;
+    if (!slug || !isActive) return; // single-active: only the displayed project polls
     seenIdsRef.current = new Set();
     seenInitializedRef.current = false;
 
@@ -425,7 +433,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
       clearInterval(tInterval);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slug]);
+  }, [slug, isActive]);
 
   // W2: companion-webapp relay. Authenticated as the operator's Supabase tenant
   // (so it shares a tenant with the webapp). Publishes the ACTIVE project's agent
@@ -435,7 +443,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
   // the active project is reachable from the web at any moment (single-active
   // runtime invariant). Idle-backoff to avoid hammering when nothing's happening.
   useEffect(() => {
-    if (!slug) return;
+    if (!slug || !isActive) return; // single-active web invariant: only the displayed project owns the relay
     let stopped = false;
     let lastPresence = 0;
     let idleStreak = 0;
@@ -484,7 +492,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
       if (timer) clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slug]);
+  }, [slug, isActive]);
 
   // Live-activity ticker. While ANY agent has a turn in-flight, force a
   // re-render every second so the elapsed timers (ChatPane header + sidebar

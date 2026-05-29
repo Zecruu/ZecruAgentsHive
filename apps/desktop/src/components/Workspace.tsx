@@ -1,18 +1,27 @@
 // Workspace — the always-on multi-project shell.
 //
 // Owns the VS-Code-style workspace state: which projects are opened in the
-// sidebar, their collapse state, and which one is active. Exactly ONE project
-// is active at a time; its live runtime comes from useActiveProject(active).
-// The sidebar (ProjectSidebar) renders every opened project read-only and only
-// the active one streams. Switching projects tears down the previous runtime
-// before the next spins up (the hook handles teardown on slug change).
+// sidebar, their collapse state, and which one is active (DISPLAYED).
+//
+// Each OPEN project gets its own persistent runtime via a <ProjectRuntimeHost>
+// (one useActiveProject per open project), so an in-flight turn SURVIVES a
+// project switch — switching only changes which runtime is displayed, it does
+// NOT tear down the others' agents/subprocesses. A project's runtime is torn
+// down only when the project is CLOSED (the host unmounts). Hosts render nothing;
+// they publish their live runtime into a registry, and the chrome (sidebar +
+// main + missions panel) is rendered here from the ACTIVE project's runtime.
+// Exactly one host is isActive at a time (the single-active web invariant).
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ah, unwrapProjects, type Project } from '@/lib/agentshive';
-import { useActiveProject } from '@/lib/useActiveProject';
+import { useActiveProject, type ActiveProject, type AgentRuntime } from '@/lib/useActiveProject';
 import { ProjectSidebar } from './ProjectSidebar';
 import { ProjectView } from './ProjectView';
 import { MissionsPanel } from './MissionsPanel';
+
+// Stable empty roster so the sidebar gets a referentially-stable array when no
+// project is active (avoids a new [] each render).
+const EMPTY_AGENTS: AgentRuntime[] = [];
 
 export function Workspace() {
   const [loaded, setLoaded] = useState(false);
@@ -61,8 +70,21 @@ export function Workspace() {
     [activeSlug, openedProjects],
   );
 
-  // The single live runtime — keyed to the active project inside the hook.
-  const rt = useActiveProject(activeProject);
+  // Registry of every OPEN project's live runtime, published by its
+  // <ProjectRuntimeHost>. The chrome below renders from the ACTIVE project's
+  // entry. A host re-renders this Workspace (via onActiveRender) whenever the
+  // active runtime changes, so streaming + sidebar live-status stay current
+  // without re-rendering the (memoized) background hosts.
+  const rtRegistry = useRef<Map<string, ActiveProject>>(new Map());
+  const [, forceRender] = useReducer((n: number) => n + 1, 0);
+  const registerRt = useCallback((slug: string, rt: ActiveProject) => {
+    rtRegistry.current.set(slug, rt);
+  }, []);
+  const unregisterRt = useCallback((slug: string) => {
+    rtRegistry.current.delete(slug);
+  }, []);
+  const onActiveRender = useCallback(() => forceRender(), []);
+  const activeRt = activeSlug ? rtRegistry.current.get(activeSlug) ?? null : null;
 
   // --- initial load: workspace state + server project list ---
   useEffect(() => {
@@ -107,34 +129,38 @@ export function Workspace() {
 
   const handleSelectAgent = (slug: string, agentId: string) => {
     expand(slug);
-    if (slug === activeSlug) {
-      rt.setCurrentId(agentId);
-      rt.setShowLauncher(false);
-    } else {
-      rt.requestSelect({ kind: 'agent', id: agentId });
-      setActiveSlug(slug);
+    // Every open project's host is already mounted with its agents loaded, so we
+    // set the target runtime's selection directly (no requestSelect-on-load dance).
+    // The sidebar only renders agent rows for mounted projects, so the target is
+    // always registered here.
+    const target = rtRegistry.current.get(slug);
+    if (target) {
+      target.setCurrentId(agentId);
+      target.setShowLauncher(false);
     }
+    if (slug !== activeSlug) setActiveSlug(slug);
   };
 
   const handleNewAgent = (slug: string) => {
     expand(slug);
-    if (slug === activeSlug) {
-      rt.setShowLauncher(true);
-      rt.setCurrentId(null);
-    } else {
-      rt.requestSelect({ kind: 'launcher' });
-      setActiveSlug(slug);
+    const target = rtRegistry.current.get(slug);
+    if (target) {
+      target.setShowLauncher(true);
+      target.setCurrentId(null);
     }
+    if (slug !== activeSlug) setActiveSlug(slug);
   };
 
   const handleWakeActive = (agentId: string) => {
-    const a = rt.agents.find((x) => x.id === agentId);
-    if (a) rt.wakeAgent(a, 'manual');
+    if (!activeRt) return;
+    const a = activeRt.agents.find((x) => x.id === agentId);
+    if (a) activeRt.wakeAgent(a, 'manual');
   };
 
   const handleArchiveActive = (agentId: string) => {
-    const a = rt.agents.find((x) => x.id === agentId);
-    if (a) rt.archive(a);
+    if (!activeRt) return;
+    const a = activeRt.agents.find((x) => x.id === agentId);
+    if (a) activeRt.archive(a);
   };
 
   const handleOpenProject = (slug: string) => {
@@ -179,18 +205,32 @@ export function Workspace() {
 
   // Hide the sidebar only while actively focused on a chat in full-width mode —
   // so navigation is always available when not in a chat.
-  const sidebarHidden = chatMaximized && !!activeProject && !!rt.current && !rt.showLauncher;
+  const sidebarHidden = chatMaximized && !!activeProject && !!activeRt?.current && !activeRt?.showLauncher;
 
   return (
     <div className="flex h-full">
+      {/* Persistent per-project runtimes. Each stays mounted while its project is
+          open (so an in-flight turn survives switching away); they render nothing
+          and publish into rtRegistry. Exactly one is isActive. */}
+      {openedProjects.map((p) => (
+        <ProjectRuntimeHost
+          key={p.slug}
+          project={p}
+          isActive={p.slug === activeSlug}
+          registerRt={registerRt}
+          unregisterRt={unregisterRt}
+          onActiveRender={onActiveRender}
+        />
+      ))}
+
       {!sidebarHidden && (
       <ProjectSidebar
         projects={openedProjects}
         activeSlug={activeSlug}
-        activeCurrentId={rt.currentId}
+        activeCurrentId={activeRt?.currentId ?? null}
         collapsed={collapsed}
-        activeAgents={rt.agents}
-        activeFolder={rt.folder}
+        activeAgents={activeRt?.agents ?? EMPTY_AGENTS}
+        activeFolder={activeRt?.folder ?? null}
         serverProjects={serverProjects}
         refreshKey={refreshKey}
         onToggleCollapse={handleToggleCollapse}
@@ -203,17 +243,17 @@ export function Workspace() {
         onCreateProject={handleCreateProject}
         onCloseProject={handleCloseProject}
         onOpenDashboard={(slug) => ah().dashboard.open(slug)}
-        onPickFolder={rt.pickFolder}
-        onClearFolder={rt.clearFolder}
+        onPickFolder={() => activeRt?.pickFolder()}
+        onClearFolder={() => activeRt?.clearFolder()}
         onRefreshServerProjects={refreshServerProjects}
       />
       )}
 
       <main className="relative flex-1 overflow-hidden">
-        {activeProject ? (
+        {activeProject && activeRt ? (
           <ProjectView
             project={activeProject}
-            rt={rt}
+            rt={activeRt}
             maximized={chatMaximized}
             onToggleMaximize={toggleMaximize}
             missionsPanelOpen={missionsPanelOpen}
@@ -225,7 +265,7 @@ export function Workspace() {
       </main>
 
       {/* Right-side missions panel — hidden in full-width chat mode (P3). */}
-      {activeProject && missionsPanelOpen && !chatMaximized && (
+      {activeProject && activeRt && missionsPanelOpen && !chatMaximized && (
         <MissionsPanel
           projectSlug={activeProject.slug}
           refreshKey={refreshKey}
@@ -235,6 +275,42 @@ export function Workspace() {
     </div>
   );
 }
+
+// Persistent runtime for ONE open project. Renders nothing — it just runs the
+// project's useActiveProject hook (kept alive while the project is open) and
+// publishes the live runtime into the Workspace registry. memo'd so a Workspace
+// re-render (e.g. the active host's onActiveRender bump) does NOT re-render the
+// other hosts: only this host's OWN streaming state or an isActive/project change
+// re-renders it. That memo is what breaks the bump → re-render loop.
+const ProjectRuntimeHost = memo(function ProjectRuntimeHost({
+  project,
+  isActive,
+  registerRt,
+  unregisterRt,
+  onActiveRender,
+}: {
+  project: Project;
+  isActive: boolean;
+  registerRt: (slug: string, rt: ActiveProject) => void;
+  unregisterRt: (slug: string) => void;
+  onActiveRender: () => void;
+}) {
+  const rt = useActiveProject(project, isActive);
+  // Publish on every render so the chrome reads the latest. When this is the
+  // active project, nudge Workspace to re-render (the hook re-renders THIS host
+  // on each stream event; this propagates that up to the displayed chrome).
+  useEffect(() => {
+    registerRt(project.slug, rt);
+    if (isActive) onActiveRender();
+  });
+  // Drop from the registry on unmount (project closed). The hook's own
+  // [slug]-effect cleanup tree-kills any in-flight subprocess on the same unmount.
+  useEffect(() => {
+    const slug = project.slug;
+    return () => unregisterRt(slug);
+  }, [project.slug, unregisterRt]);
+  return null;
+});
 
 function EmptyState({ hasProjects }: { hasProjects: boolean }) {
   return (

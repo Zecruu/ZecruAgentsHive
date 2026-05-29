@@ -1627,6 +1627,17 @@ app.whenReady().then(() => {
   setupAutoUpdater();
 });
 
+// On quit, tree-kill every still-running CLI turn so none are orphaned. With
+// per-project runtimes now persisting in the background (in-flight turns survive
+// project switches), several chats can be live at once — a single active one is
+// no longer the only subprocess. Same teardown path as chat:cancel.
+app.on('before-quit', () => {
+  for (const [, entry] of activeChats) {
+    if (entry && entry.child) { try { killChildTree(entry.child); } catch { /* already gone */ } }
+  }
+  activeChats.clear();
+});
+
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
