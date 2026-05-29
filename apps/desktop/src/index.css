@@ -3,55 +3,57 @@
 @tailwind utilities;
 
 @layer base {
-  /* LIGHT palette (default — applies when <html> has NO .dark class). */
+  /* LIGHT palette (default — applies when <html> has NO .dark class). Soft
+     off-white neutral surfaces (not blinding pure-white); accents stay colored. */
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222 47% 11%;
-    --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222 47% 11%;
+    --background: 0 0% 97%;
+    --foreground: 0 0% 13%;
+    --card: 0 0% 99%;
+    --card-foreground: 0 0% 13%;
+    --popover: 0 0% 99%;
+    --popover-foreground: 0 0% 13%;
     --primary: 217 91% 52%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 214 32% 95%;
-    --secondary-foreground: 222 47% 11%;
-    --muted: 214 32% 95%;
-    --muted-foreground: 215 16% 42%;
-    --accent: 38 92% 45%;
+    --secondary: 0 0% 93%;
+    --secondary-foreground: 0 0% 13%;
+    --muted: 0 0% 93%;
+    --muted-foreground: 0 0% 40%;
+    --accent: 38 92% 42%;
     --accent-foreground: 0 0% 100%;
-    --destructive: 0 72% 51%;
+    --destructive: 0 72% 48%;
     --destructive-foreground: 0 0% 100%;
-    --border: 214 32% 88%;
-    --input: 214 32% 92%;
+    --border: 0 0% 87%;
+    --input: 0 0% 91%;
     --ring: 217 91% 52%;
-    --success: 142 71% 38%;
-    --warn: 38 92% 42%;
+    --success: 142 60% 35%;
+    --warn: 38 92% 40%;
     --radius: 0.5rem;
   }
 
-  /* DARK palette (shadcn dark + AgentsHive tweaks) — overrides light when .dark. */
+  /* DARK palette — NEUTRAL black/grey surfaces (near-zero saturation, no blue/
+     cyan cast). Functional accents stay colored (primary blue, amber, etc.). */
   :root.dark {
-    --background: 222 47% 5%;
-    --foreground: 210 40% 98%;
-    --card: 222 33% 9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222 33% 9%;
-    --popover-foreground: 210 40% 98%;
+    --background: 0 0% 7%;
+    --foreground: 0 0% 96%;
+    --card: 0 0% 10%;
+    --card-foreground: 0 0% 96%;
+    --popover: 0 0% 11%;
+    --popover-foreground: 0 0% 96%;
     --primary: 217 91% 60%;
-    --primary-foreground: 222 47% 11%;
-    --secondary: 217 19% 22%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217 19% 22%;
-    --muted-foreground: 215 16% 65%;
-    --accent: 38 92% 60%;
-    --accent-foreground: 222 47% 11%;
-    --destructive: 0 72% 60%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217 19% 18%;
-    --input: 217 19% 14%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 0 0% 17%;
+    --secondary-foreground: 0 0% 96%;
+    --muted: 0 0% 17%;
+    --muted-foreground: 0 0% 62%;
+    --accent: 38 92% 58%;
+    --accent-foreground: 0 0% 8%;
+    --destructive: 0 72% 58%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 18%;
+    --input: 0 0% 15%;
     --ring: 217 91% 60%;
-    --success: 142 71% 45%;
-    --warn: 38 92% 60%;
+    --success: 142 60% 45%;
+    --warn: 38 92% 58%;
     --radius: 0.5rem;
   }
 
@@ -61,29 +63,13 @@
     @apply bg-background text-foreground antialiased;
     font-feature-settings: 'ss01', 'cv11';
     overflow: hidden;
-    /* Light: a soft, clean wash. Dark overrides below. */
-    background:
-      radial-gradient(1100px 750px at -10% -10%, hsl(217 91% 60% / 0.06), transparent 60%),
-      linear-gradient(180deg, hsl(var(--background)) 0%, hsl(214 32% 96%) 100%);
+    /* Neutral surfaces — no colored washes. Light: a soft grey gradient. */
+    background: linear-gradient(180deg, hsl(var(--background)) 0%, hsl(0 0% 94%) 100%);
     background-attachment: fixed;
   }
+  /* Dark: a flat neutral near-black gradient (no blue/cyan cast). */
   html.dark body {
-    background:
-      radial-gradient(1200px 800px at -10% -10%, hsl(217 91% 60% / 0.10), transparent 60%),
-      radial-gradient(1000px 700px at 120% 110%, hsl(265 80% 60% / 0.08), transparent 60%),
-      linear-gradient(180deg, hsl(var(--background)) 0%, hsl(222 50% 4%) 100%);
-  }
-  body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: 0;
-  }
-  /* The blue screen-glow is a dark-mode effect only. */
-  html.dark body::before {
-    background: radial-gradient(800px 500px at 50% -10%, hsl(217 91% 60% / 0.06), transparent 70%);
-    mix-blend-mode: screen;
+    background: linear-gradient(180deg, hsl(0 0% 8%) 0%, hsl(0 0% 5%) 100%);
   }
 }
 
