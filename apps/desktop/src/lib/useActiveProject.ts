@@ -353,6 +353,10 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
   // it is keyed to the active slug and never starts when slug is null.
   const seenIdsRef = useRef<Set<string>>(new Set());
   const seenInitializedRef = useRef(false);
+  // Holds the latest "check this project's hivemind for pending work and wake it"
+  // fn, so the hivemind's settle() can trigger an immediate re-check (defined in
+  // the Planner-wake reliability effect below). Default no-op until assigned.
+  const checkPendingRef = useRef<(reason: string) => void>(() => {});
   useEffect(() => {
     if (!slug || !isActive) return; // single-active: only the displayed project polls
     seenIdsRef.current = new Set();
@@ -434,6 +438,59 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug, isActive]);
+
+  // Planner-wake reliability fallback (belt-and-suspenders over the push wake in
+  // maybeWakeOnToolUse). The push wake misses when the hivemind is in-flight at
+  // report time or a stream tool_use drops; the dashboard poll above is active-only
+  // and snapshots pre-existing pending items as "seen". So independently — for THIS
+  // project's hivemind, on EVERY open project (NOT isActive-gated, so the
+  // coordination loop progresses even when another project is displayed) — read the
+  // server's UNANSWERED pending questions + summaries (the work that BLOCKS coders)
+  // and wake the IDLE hivemind. State-based, not event-id dedup: a "pending
+  // signature" = the set of pending question+summary ids; wake when it's non-empty
+  // and either CHANGED since the last wake (new/cleared work) OR it's been idle past
+  // the re-arm window (a dropped/ignored wake can't cause permanent silence). Empty
+  // pending resets the signature. The hivemind's settle() also calls this for instant
+  // recovery from the in-flight-skip miss.
+  useEffect(() => {
+    if (!slug) return;
+    const REARM_MS = 75000;
+    let lastWake: { sig: string; at: number } | null = null;
+    let stopped = false;
+
+    const doCheck = async (reason: string) => {
+      if (stopped) return;
+      const hive = agentsRef.current.find((a) => a.role === 'hivemind');
+      if (!hive || hive.inFlight) return;
+      let state: any;
+      try { state = await ah().dashboard.state(slug); } catch { return; }
+      if (stopped) return;
+      const ids: string[] = [];
+      if (Array.isArray(state.pending_q)) for (const q of state.pending_q) ids.push('q:' + (q.id ?? q.created_at ?? ''));
+      if (Array.isArray(state.pending_s)) for (const s of state.pending_s) ids.push('s:' + (s.id ?? s.created_at ?? ''));
+      const sig = ids.sort().join('|');
+      if (!sig) { lastWake = null; return; } // no pending work — re-arm immediately on the next item
+      const changed = !lastWake || lastWake.sig !== sig;
+      const stale = !!lastWake && Date.now() - lastWake.at > REARM_MS;
+      if (!changed && !stale) return;
+      // Re-resolve the hivemind AFTER the await — the push wake may have started it.
+      const h = agentsRef.current.find((a) => a.role === 'hivemind');
+      if (!h || h.inFlight) return;
+      lastWake = { sig, at: Date.now() };
+      wakeAgent(h, `pending:${reason}`);
+    };
+    checkPendingRef.current = (reason: string) => { void doCheck(reason); };
+
+    const tInit = setTimeout(() => doCheck('init'), 8000);
+    const tPoll = setInterval(() => doCheck('poll'), 15000);
+    return () => {
+      stopped = true;
+      clearTimeout(tInit);
+      clearInterval(tPoll);
+      checkPendingRef.current = () => {};
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
 
   // W2: companion-webapp relay. Authenticated as the operator's Supabase tenant
   // (so it shares a tenant with the webapp). Publishes the ACTIVE project's agent
@@ -769,6 +826,13 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
       a.streamingIdx = null;
       rerender();
       persist(a);
+      // Planner-wake reliability: once a hivemind turn settles (success OR error),
+      // immediately re-check for pending coder questions/summaries it didn't reach
+      // (the classic miss: a report arrived while it was mid-turn) and re-wake if
+      // still work — instant recovery without waiting for the ~15s poll. The
+      // signature dedup in checkPendingRef prevents an error-loop (an errored turn
+      // doesn't clear pending → same signature → no immediate re-wake).
+      if (a.role === 'hivemind') setTimeout(() => checkPendingRef.current('settle'), 1500);
       if (!ok) return;
 
       // Cloud Sync (opt-in): push the finalized transcript after a clean settle.
