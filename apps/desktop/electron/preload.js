@@ -114,6 +114,9 @@ contextBridge.exposeInMainWorld('agentshive', {
     inbound: (token) => ipcRenderer.invoke('web:inbound', { token }),
     ack: (token, messageId) => ipcRenderer.invoke('web:ack', { token, messageId }),
     relay: (token, parentId, project, agentKey, body) => ipcRenderer.invoke('web:relay', { token, parentId, project, agentKey, body }),
+    me: (token) => ipcRenderer.invoke('web:me', { token }),
+    syncPush: (token, payload) => ipcRenderer.invoke('web:syncPush', { token, payload }),
+    syncPull: (token, project, since) => ipcRenderer.invoke('web:syncPull', { token, project, since }),
   },
   tools: {
     status: () => ipcRenderer.invoke('tools:status'),

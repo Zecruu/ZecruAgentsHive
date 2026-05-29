@@ -1215,6 +1215,18 @@ ipcMain.handle('web:ack', (_e, { token, messageId }) =>
 ipcMain.handle('web:relay', (_e, { token, parentId, project, agentKey, body }) =>
   adminApiFetch('POST', '/web/relay', token, { parent_id: parentId, project, agent_key: agentKey, body }));
 
+// v2.x Cloud Sync (opt-in). Same operator-Supabase-tenant auth as the other
+// /web/* relays. me = entitlements; syncPush/syncPull = tenant transcript sync.
+ipcMain.handle('web:me', (_e, { token }) => adminApiFetch('GET', '/web/me', token));
+ipcMain.handle('web:syncPush', (_e, { token, payload }) =>
+  adminApiFetch('POST', '/web/sync/push', token, payload));
+ipcMain.handle('web:syncPull', (_e, { token, project, since }) =>
+  adminApiFetch(
+    'GET',
+    `/web/sync/pull?project=${encodeURIComponent(project || '')}` + (since ? `&since=${encodeURIComponent(since)}` : ''),
+    token,
+  ));
+
 ipcMain.handle('admin:listUsers', (_e, { token }) => adminApiFetch('GET', '/admin/users', token));
 ipcMain.handle('admin:setBanned', (_e, { token, sub, banned }) =>
   adminApiFetch('POST', `/admin/users/${encodeURIComponent(sub)}/${banned ? 'ban' : 'unban'}`, token));

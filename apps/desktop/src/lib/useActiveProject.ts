@@ -25,6 +25,7 @@ import {
   type TokenUsage,
 } from '@/lib/agentshive';
 import { getAccessToken, hasSupabaseSession } from '@/lib/supabase';
+import { resolveCloudSync, pushTranscript, pullTranscripts, getCursor, setCursor } from '@/lib/cloudSync';
 import type { LauncherValues } from '@/components/LauncherForm';
 
 // Live agent runtime state (DOM + IPC subscriptions + the persisted shape).
@@ -102,6 +103,17 @@ export interface MessageRuntime {
   toolCalls?: ToolCallData[];
   tokens?: TokenUsage;
   attachments?: AttachmentData[];
+  // v2.x Cloud Sync: stable client id (assigned lazily at first persist, then
+  // reused) — the dedupe key for transcript push/pull.
+  uuid?: string;
+}
+
+// Stable per-message id for Cloud Sync. crypto.randomUUID in the Electron
+// renderer; falls back to a time+random id if unavailable.
+function genMsgId(): string {
+  const c = (globalThis as any).crypto;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  return 'm-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
 }
 
 // Live activity snapshot for the "is this agent alive or frozen?" indicator.
@@ -241,6 +253,53 @@ export function useActiveProject(project: Project | null): ActiveProject {
         setShowLauncher(true);
         setCurrentId(null);
       }
+
+      // Cloud Sync pull-on-open (opt-in). After the local roster renders, pull the
+      // tenant's newer transcripts and materialize any conversation this device
+      // doesn't have locally as a read-only agent (the cross-device case — agent
+      // ids are per-device, so a pulled id we don't know == another device's). We
+      // never overwrite local agents here (same-device pull is a cursor-advancing
+      // no-op; the deep two-devices-edited-the-same-agent merge is a later slice).
+      const { active, ent } = await resolveCloudSync();
+      if (!alive || !active || !ent) return;
+      const since = await getCursor(ent.sub, slug);
+      const res = await pullTranscripts(slug, since);
+      if (!alive || !res || !res.conversations || res.conversations.length === 0) {
+        if (res && res.cursor) await setCursor(ent.sub, slug, res.cursor);
+        return;
+      }
+      const knownIds = new Set(restored.map((a) => a.id));
+      const created: AgentRuntime[] = [];
+      for (const conv of res.conversations) {
+        if (knownIds.has(conv.agent_id)) continue; // same device — already local + authoritative
+        const sorted = [...conv.messages].sort((x, y) => (x.idx ?? 0) - (y.idx ?? 0));
+        const d: AgentData = {
+          id: conv.agent_id,
+          label: conv.label || conv.agent_id,
+          role: (conv.role as Role) || 'coder',
+          cli: (conv.cli as Cli) || 'claude',
+          model: null,
+          effort: '',
+          skipPerms: false,
+          coderId: '',
+          osHint: null,
+          sessionId: null,
+          status: 'idle',
+          createdAt: new Date().toISOString(),
+          messages: sorted.map((m) => ({
+            role: m.role,
+            text: m.text,
+            toolCalls: m.tool_calls || undefined,
+            tokens: m.tokens || undefined,
+            uuid: m.uuid,
+          })),
+        };
+        const a = rehydrate(d);
+        created.push(a);
+        persist(a);
+      }
+      if (alive && created.length > 0) setAgents((prev) => [...prev, ...created]);
+      if (res.cursor) await setCursor(ent.sub, slug, res.cursor);
     })();
     return () => {
       alive = false;
@@ -532,6 +591,31 @@ export function useActiveProject(project: Project | null): ActiveProject {
     _startUserTurn(a, next);
   };
 
+  // Cloud Sync push (opt-in). Fire-and-forget AFTER a turn settles — so it never
+  // disrupts an in-flight turn — and only when sync is active (signed in +
+  // entitled + opted in). Pushes the agent's FULL transcript; the server upserts
+  // by per-message uuid (LWW), so re-pushing the whole thing is cheap + idempotent.
+  const maybeSyncPush = (a: AgentRuntime) => {
+    if (!slug) return;
+    const project = slug;
+    resolveCloudSync().then(({ active }) => {
+      if (!active) return;
+      const messages = a.messages.map((m, i) => {
+        if (!m.uuid) m.uuid = genMsgId();
+        return {
+          uuid: m.uuid,
+          idx: i,
+          role: m.role,
+          text: m.text,
+          tool_calls: m.toolCalls ?? null,
+          tokens: m.tokens ?? null,
+          created_at: m.at,
+        };
+      });
+      void pushTranscript({ project, agent_id: a.id, label: a.label, role: a.role, cli: a.cli, messages });
+    }).catch(() => {});
+  };
+
   const sendTurn = (prompt: string, attachments?: AttachmentData[]) => {
     if (!current) return;
     const a = current;
@@ -663,6 +747,9 @@ export function useActiveProject(project: Project | null): ActiveProject {
       rerender();
       persist(a);
       if (!ok) return;
+
+      // Cloud Sync (opt-in): push the finalized transcript after a clean settle.
+      maybeSyncPush(a);
 
       // W2: if this turn was injected by a web message, relay the response back
       // (agent_to_web, correlated to the originating web_to_agent).
@@ -951,6 +1038,7 @@ function rehydrate(d: AgentData): AgentRuntime {
       toolCalls: m.toolCalls,
       tokens: m.tokens,
       attachments: m.attachments,
+      uuid: m.uuid,
     })),
     queue: [],
     retryCount: 0,
@@ -975,13 +1063,20 @@ function serialize(a: AgentRuntime): AgentData {
     status: a.status === 'thinking' || a.status === 'rate-limited' ? 'idle' : a.status,
     createdAt: a.createdAt,
     updatedAt: new Date().toISOString(),
-    messages: a.messages.map((m) => ({
-      role: m.role,
-      text: m.text,
-      at: m.at,
-      toolCalls: m.toolCalls,
-      tokens: m.tokens,
-      attachments: m.attachments,
-    })),
+    messages: a.messages.map((m) => {
+      // Assign a stable uuid at first persist (≈ creation) and reuse it forever —
+      // mutating the live object so the streaming assistant message keeps ONE id
+      // from first render through settle (required for Cloud Sync LWW dedupe).
+      if (!m.uuid) m.uuid = genMsgId();
+      return {
+        role: m.role,
+        text: m.text,
+        at: m.at,
+        toolCalls: m.toolCalls,
+        tokens: m.tokens,
+        attachments: m.attachments,
+        uuid: m.uuid,
+      };
+    }),
   };
 }

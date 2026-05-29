@@ -103,6 +103,9 @@ export interface MessageData {
   toolCalls?: ToolCallData[];
   tokens?: TokenUsage;
   attachments?: AttachmentData[];
+  // v2.x Cloud Sync: stable client-generated id, assigned at first persist and
+  // reused on every re-push — the LWW dedupe key for transcript sync.
+  uuid?: string;
 }
 
 export interface AgentData {
@@ -257,6 +260,10 @@ declare global {
         inbound: (token: string) => Promise<{ messages: WebInboundMessage[] }>;
         ack: (token: string, messageId: string) => Promise<{ ok?: boolean; error?: string }>;
         relay: (token: string, parentId: string | null, project: string, agentKey: string | null, body: string) => Promise<unknown>;
+        // v2.x Cloud Sync (opt-in).
+        me: (token: string) => Promise<Entitlements>;
+        syncPush: (token: string, payload: SyncPushPayload) => Promise<{ ok?: boolean; synced?: number; gated?: boolean; error?: string }>;
+        syncPull: (token: string, project: string, since: string | null) => Promise<SyncPullResult>;
       };
       tools: {
         status: () => Promise<{
@@ -317,6 +324,46 @@ export interface WebInboundMessage {
   agent_key: string | null;
   project_slug: string | null;
   created_at: string;
+}
+
+// v2.x Cloud Sync (opt-in) shapes.
+export interface Entitlements {
+  sub: string;
+  email: string | null;
+  plan: string;
+  cloud_sync: boolean; // resolved entitlement (flag OR pro_unlimited)
+}
+export interface SyncMessagePayload {
+  uuid: string;
+  idx: number;
+  role: 'user' | 'assistant' | 'system';
+  text: string;
+  tool_calls?: ToolCallData[] | null;
+  tokens?: TokenUsage | null;
+  created_at?: string;
+}
+export interface SyncPushPayload {
+  project: string;
+  agent_id: string;
+  label?: string | null;
+  role?: string | null;
+  cli?: string | null;
+  messages: SyncMessagePayload[];
+}
+export interface SyncedConversationDTO {
+  agent_id: string;
+  project_slug: string;
+  label: string | null;
+  role: string | null;
+  cli: string | null;
+  updated_at: string;
+  messages: Array<SyncMessagePayload & { updated_at?: string }>;
+}
+export interface SyncPullResult {
+  conversations?: SyncedConversationDTO[];
+  cursor?: string | null;
+  gated?: boolean;
+  error?: string;
 }
 
 // Full mission export (read-only) backing the right-side missions panel + docs.

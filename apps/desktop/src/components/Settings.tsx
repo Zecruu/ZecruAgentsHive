@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, Github, RefreshCw, Train, Triangle, XCircle } from 'lucide-react';
-import { ah, type ConfigState, type ToolStatus } from '@/lib/agentshive';
+import { CheckCircle2, CloudOff, Cloud, Github, RefreshCw, Train, Triangle, XCircle } from 'lucide-react';
+import { ah, type ConfigState, type Entitlements, type ToolStatus } from '@/lib/agentshive';
+import { getEntitlements, getOptIn, setOptIn } from '@/lib/cloudSync';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Separator } from '@/components/ui/separator';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 
@@ -103,9 +105,76 @@ export function Settings({ config, firstRun, onSaved, onCancel }: Props) {
 
           <Separator className="my-2" />
 
+          <CloudSyncSection />
+
+          <Separator className="my-2" />
+
           <ToolsSection />
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+// Opt-in Cloud Sync toggle. Enabled only when the signed-in tenant is entitled
+// (cloud_sync resolved server-side). Default OFF even when entitled — explicit
+// opt-in. The choice persists per-tenant in the durable userData store.
+function CloudSyncSection() {
+  const [ent, setEnt] = useState<Entitlements | null | undefined>(undefined); // undefined = loading
+  const [optIn, setOptInState] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const e = await getEntitlements();
+      if (!alive) return;
+      setEnt(e);
+      if (e) setOptInState(await getOptIn(e.sub));
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const toggle = async (v: boolean) => {
+    if (!ent || !ent.cloud_sync) return;
+    setSaving(true);
+    await setOptIn(ent.sub, v);
+    setOptInState(v);
+    setSaving(false);
+  };
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <Label className="flex items-center gap-1.5">
+          {optIn && ent?.cloud_sync ? <Cloud className="h-3.5 w-3.5 text-accent" /> : <CloudOff className="h-3.5 w-3.5" />}
+          Cloud Sync
+        </Label>
+        <p className="mt-1 text-xs text-muted-foreground normal-case tracking-normal">
+          Off: conversations stay on this device. On: conversations sync to your account for cross-device + webapp access.
+        </p>
+      </div>
+
+      {ent === undefined ? (
+        <div className="text-[12px] text-muted-foreground">Checking your account…</div>
+      ) : ent === null ? (
+        <div className="rounded-md border border-border/60 bg-card/40 px-3 py-2.5 text-[12px] text-muted-foreground">
+          Sign in with Supabase to enable Cloud Sync.
+        </div>
+      ) : (
+        <label className={`flex items-center gap-2 text-sm ${ent.cloud_sync ? 'cursor-pointer' : 'cursor-not-allowed opacity-70'}`}>
+          <Checkbox checked={optIn && ent.cloud_sync} disabled={!ent.cloud_sync || saving} onCheckedChange={(v) => toggle(Boolean(v))} />
+          <span>Sync this account's conversations to the cloud</span>
+          {!ent.cloud_sync && (
+            <Badge variant="muted" className="ml-1 normal-case">paid add-on</Badge>
+          )}
+        </label>
+      )}
+      {ent && !ent.cloud_sync && (
+        <p className="text-[11px] text-muted-foreground">
+          Cloud Sync is a paid add-on for your account. Conversations stay on this device until it's enabled.
+        </p>
+      )}
     </div>
   );
 }
