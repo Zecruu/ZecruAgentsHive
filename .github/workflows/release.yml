@@ -1,0 +1,79 @@
+name: Release
+
+# Cross-platform desktop release. Pushing a tag like `v2.0.1` (or running this
+# manually) builds the Windows NSIS installer AND the macOS .dmg and publishes
+# both — plus the auto-update feeds latest.yml / latest-mac.yml — to the GitHub
+# Release for that tag. We can't build macOS from the operator's Windows box, so
+# the macOS .dmg only exists via this CI.
+#
+# This REPLACES the manual local `electron-builder` release flow.
+#
+# Signing: builds are UNSIGNED for now.
+#   - macOS: no Apple Developer cert → Gatekeeper shows "unidentified developer"
+#     (install via right-click → Open). To notarize later, add repo secrets
+#     APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID (and CSC_LINK /
+#     CSC_KEY_PASSWORD for the signing cert), then drop the
+#     CSC_IDENTITY_AUTO_DISCOVERY=false override on the macOS job.
+#   - Windows: unsigned → SmartScreen warning until a code-signing cert is added.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# electron-builder needs to create/upload assets on the GitHub Release using the
+# Actions-provided GITHUB_TOKEN.
+permissions:
+  contents: write
+
+# One release run per tag/ref; cancel a superseded in-progress run.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build & publish (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't let a failing macOS build abort the Windows build (or vice versa) —
+      # publish whatever succeeds.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: win
+    defaults:
+      run:
+        # Monorepo: the desktop app lives in apps/desktop.
+        working-directory: apps/desktop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build renderer (vite)
+        # electron-builder packages dist/** (the vite output); it does NOT run
+        # vite itself, so build the renderer first or the app ships empty.
+        run: npm run build
+
+      - name: Package + publish (electron-builder)
+        run: npx --no-install electron-builder --${{ matrix.platform }} --publish always
+        env:
+          # electron-builder publishes to the GitHub Release for this tag.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No Apple cert on CI — don't let electron-builder hunt the keychain
+          # and fail/hang trying to sign; build unsigned. (Harmless on Windows.)
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
