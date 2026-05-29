@@ -261,6 +261,12 @@ declare global {
         isGitRepo: (projectSlug: string) => Promise<boolean>;
         undoEdits: (projectSlug: string, paths: string[]) => Promise<UndoEditsResult>;
       };
+      codex: {
+        // The codex CLI's configured default model (~/.codex/config.toml). null
+        // when codex isn't configured / no model line. Used to label the
+        // effective model for ChatGPT-account codex agents (no -m is passed).
+        defaultModel: () => Promise<string | null>;
+      };
       skills: {
         list: (projectSlug: string) => Promise<SkillItem[]>;
       };
@@ -562,20 +568,23 @@ export const MODEL_OPTIONS: Record<Cli, Array<{ value: string; label: string }>>
     { value: 'sonnet', label: 'Sonnet 4.6' },
     { value: 'haiku', label: 'Haiku 4.5' },
   ],
-  // ChatGPT-account codex logins must NOT pass an explicit -m (both gpt-5 and
-  // gpt-5-codex are rejected with a 400 by ChatGPT-account auth) — the empty
-  // default sends no -m so codex uses the account's allowed model. gpt-5-codex
-  // only works with an OpenAI API-key login (codex login with an API key).
+  // ChatGPT-account codex has NO selectable model — only the account's default
+  // works (verified on codex 0.124: gpt-5, gpt-5.1, gpt-5-codex, gpt-5.5-codex
+  // all 400 with "not supported when using Codex with a ChatGPT account"). We
+  // pass no -m and let codex use the account default; the UI shows it as a
+  // read-only label (sourced from ~/.codex/config.toml via ah().codex.defaultModel),
+  // not a dropdown. The single empty-value entry keeps callers that read
+  // MODEL_OPTIONS.codex[0].value defaulting to "" (no -m).
   codex: [
-    { value: '', label: 'default (ChatGPT account)' },
-    { value: 'gpt-5-codex', label: 'gpt-5-codex (needs OpenAI API key)' },
+    { value: '', label: 'ChatGPT account default' },
   ],
 };
 
 // Effort/reasoning levels per CLI. Claude exposes the full set via `--effort`.
-// Codex only honors reasoning effort with an OpenAI API-key login (and only the
-// standard low/medium/high values), so its options carry that caveat in-label
-// and are no-ops on the ChatGPT-account default (no model selected).
+// Codex reasoning effort DOES apply on a ChatGPT-account login (verified on
+// codex 0.124 — this overrides the old "needs API key" caveat): low/medium/high/
+// xhigh all work via `-c model_reasoning_effort`, even with no -m. `minimal` is
+// excluded (codex 400s it when the image_gen/web_search tools are enabled).
 export const EFFORT_OPTIONS: Record<Cli, Array<{ value: string; label: string }>> = {
   claude: [
     { value: '', label: 'default' },
@@ -587,9 +596,10 @@ export const EFFORT_OPTIONS: Record<Cli, Array<{ value: string; label: string }>
   ],
   codex: [
     { value: '', label: 'default' },
-    { value: 'low', label: 'Low (needs OpenAI API key)' },
-    { value: 'medium', label: 'Medium (needs OpenAI API key)' },
-    { value: 'high', label: 'High (needs OpenAI API key)' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'Xhigh' },
   ],
 };
 
@@ -608,9 +618,9 @@ export function buildCmd(
     if (skipPerms) parts.push('--dangerously-skip-permissions');
   } else if (cli === 'codex') {
     if (model) parts.push('-m', model);
-    // Reasoning effort only applies with an explicit model (OpenAI API-key
-    // login); a ChatGPT-account login (no -m) rejects model/effort overrides.
-    if (model && effort) parts.push('-c', `model_reasoning_effort="${effort}"`);
+    // Reasoning effort applies on a ChatGPT-account login too (verified codex
+    // 0.124), even with no -m — codex applies it to the account's default model.
+    if (effort) parts.push('-c', `model_reasoning_effort="${effort}"`);
     if (skipPerms) parts.push('--dangerously-bypass-approvals-and-sandbox');
     if (resume) return 'codex resume';
   }

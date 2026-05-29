@@ -548,21 +548,21 @@ function buildCodexExecArgs({ sessionId, model, effort, skipPerms, projectSlug, 
   void skipPerms;
   const sandbox = '--dangerously-bypass-approvals-and-sandbox';
   const common = ['--json', '--skip-git-repo-check', sandbox, ...mcp];
+  // Reasoning effort works on a ChatGPT-account login too (verified codex 0.124),
+  // even with NO -m — codex applies it to the account's default model, and it's
+  // honored on `resume` as well (exec-level -c precedes the subcommand). This is
+  // the only configurable knob for ChatGPT-account codex (model is fixed to the
+  // account default; explicit -m other than that 400s).
+  const effortFlags = effort ? ['-c', `model_reasoning_effort=${effort}`] : [];
   if (sessionId) {
     // exec-level options must precede the `resume` subcommand; `-` makes resume
-    // read the follow-up prompt from stdin.
-    return ['exec', ...common, 'resume', String(sessionId), '-'];
+    // read the follow-up prompt from stdin. Pass effort so a live per-agent
+    // effort change takes effect on the next (resumed) turn.
+    return ['exec', ...common, ...effortFlags, 'resume', String(sessionId), '-'];
   }
-  const modelFlags = [];
-  if (model) {
-    modelFlags.push('-m', String(model));
-    // Reasoning effort only applies under an OpenAI API-key login (an explicit
-    // model). A ChatGPT-account login (no -m) rejects effort overrides, so we
-    // only pass it alongside a model.
-    if (effort) modelFlags.push('-c', `model_reasoning_effort=${effort}`);
-  }
+  const modelFlags = model ? ['-m', String(model)] : [];
   // `-` → read the prompt from stdin (sidesteps argv quoting for the prompt).
-  return ['exec', ...common, ...modelFlags, '-'];
+  return ['exec', ...common, ...modelFlags, ...effortFlags, '-'];
 }
 
 // Normalize codex `exec --json` lines into claude-shaped ChatEvents. Verified
@@ -820,6 +820,20 @@ function killChildTree(child) {
 ipcMain.handle('chat:cancel', (_e, { chatId }) => {
   const entry = activeChats.get(chatId);
   if (entry && entry.child) killChildTree(entry.child);
+});
+
+// The codex CLI's configured default model from ~/.codex/config.toml. We pass no
+// -m for codex (ChatGPT-account auth only allows the account default; explicit
+// models 400), so this is the effective model — surfaced read-only in the UI.
+// Returns null when codex isn't configured or has no model line.
+ipcMain.handle('codex:defaultModel', () => {
+  try {
+    const txt = fs.readFileSync(path.join(os.homedir(), '.codex', 'config.toml'), 'utf8');
+    const m = txt.match(/^\s*model\s*=\s*"?([^"\r\n]+)"?/m);
+    return m ? m[1].trim() : null;
+  } catch {
+    return null;
+  }
 });
 
 // One-call embedded agent launcher: writes .mcp.json, spawns PTY with full

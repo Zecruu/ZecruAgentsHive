@@ -45,6 +45,9 @@ export function LauncherForm({ project, folder, hostname, onLaunch, onPickFolder
   const [coderId, setCoderId] = useState('');
   const [skipPerms, setSkipPerms] = useState(false);
   const [resume, setResume] = useState(false);
+  // codex's effective model (from ~/.codex/config.toml). ChatGPT-account codex
+  // has no selectable model — we show this read-only instead of a dropdown.
+  const [codexModel, setCodexModel] = useState<string | null>(null);
 
   const idPlaceholder = `${(hostname || 'host').toLowerCase().replace(/[^a-z0-9-]+/g, '-')}-${role}`;
   const suggestedCmd = useMemo(() => buildCmd(cli, model || null, effort || null, skipPerms, resume), [cli, model, effort, skipPerms, resume]);
@@ -73,11 +76,22 @@ export function LauncherForm({ project, folder, hostname, onLaunch, onPickFolder
     ah().prefs.set(project.slug, { role, cli, model, effort, osHint, skipPerms, resume }).catch(() => {});
   }, [project.slug, role, cli, model, effort, osHint, skipPerms, resume]);
 
+  // Fetch codex's configured default model so the (read-only) model field can
+  // show what a ChatGPT-account codex agent will actually run.
+  useEffect(() => {
+    if (cli !== 'codex') return;
+    let alive = true;
+    ah().codex.defaultModel().then((m) => { if (alive) setCodexModel(m); }).catch(() => {});
+    return () => { alive = false; };
+  }, [cli]);
+
   const launch = () => {
     onLaunch({
       role,
       cli,
-      model,
+      // codex: never pass a model — ChatGPT-account auth only allows the account
+      // default (explicit -m 400s); let codex use it.
+      model: cli === 'codex' ? '' : model,
       effort,
       osHint,
       coderId: coderId.trim() || idPlaceholder,
@@ -118,14 +132,25 @@ export function LauncherForm({ project, folder, hostname, onLaunch, onPickFolder
           </div>
           <div className="space-y-1.5">
             <Label>Model</Label>
-            <Select value={model || '__default'} onValueChange={(v) => setModel(v === '__default' ? '' : v)}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {MODEL_OPTIONS[cli].map((o) => (
-                  <SelectItem key={o.value || '__default'} value={o.value || '__default'}>{o.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {cli === 'codex' ? (
+              // ChatGPT-account codex has no selectable model — show the effective
+              // one read-only (the account default codex will use).
+              <div
+                className="flex h-9 items-center truncate rounded-md border border-input bg-input/40 px-3 text-[13px] text-muted-foreground"
+                title="ChatGPT-account codex uses the account's default model — it isn't selectable. Reasoning effort is the configurable knob."
+              >
+                {codexModel ? `${codexModel} · ChatGPT account` : 'ChatGPT account default'}
+              </div>
+            ) : (
+              <Select value={model || '__default'} onValueChange={(v) => setModel(v === '__default' ? '' : v)}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {MODEL_OPTIONS[cli].map((o) => (
+                    <SelectItem key={o.value || '__default'} value={o.value || '__default'}>{o.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
           </div>
           <div className="space-y-1.5">
             <Label>Effort</Label>

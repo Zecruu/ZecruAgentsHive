@@ -105,6 +105,9 @@ contextBridge.exposeInMainWorld('agentshive', {
     isGitRepo: (projectSlug) => ipcRenderer.invoke('files:isGitRepo', { projectSlug }),
     undoEdits: (projectSlug, paths) => ipcRenderer.invoke('files:undoEdits', { projectSlug, paths }),
   },
+  codex: {
+    defaultModel: () => ipcRenderer.invoke('codex:defaultModel'),
+  },
   skills: {
     list: (projectSlug) => ipcRenderer.invoke('skills:list', { projectSlug }),
   },

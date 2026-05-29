@@ -43,6 +43,9 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
   const [tuneOpen, setTuneOpen] = useState(false);
   // Whether this project's folder is a git repo — gates the per-turn Undo action.
   const [gitRepo, setGitRepo] = useState(false);
+  // codex's effective model (from ~/.codex/config.toml). ChatGPT-account codex
+  // has no selectable model, so we show this read-only instead of a picker.
+  const [codexModel, setCodexModel] = useState<string | null>(null);
   // `/` slash-command autocomplete. Skills/commands live under ~/.claude; they
   // expand in claude's headless --print mode (codex doesn't expand them, but we
   // still surface the list for reference + quick insert, per the operator).
@@ -69,6 +72,15 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
     ah().files.isGitRepo(projectSlug).then((r) => { if (alive) setGitRepo(Boolean(r)); }).catch(() => {});
     return () => { alive = false; };
   }, [projectSlug]);
+
+  // codex's configured default model — the effective model for a ChatGPT-account
+  // codex agent (we pass no -m). Shown read-only in the header + tune popover.
+  useEffect(() => {
+    if (agent.cli !== 'codex') return;
+    let alive = true;
+    ah().codex.defaultModel().then((m) => { if (alive) setCodexModel(m); }).catch(() => {});
+    return () => { alive = false; };
+  }, [agent.cli]);
 
   const slashQuery =
     skillMenuOpen && draft.startsWith('/') && !draft.slice(1).includes(' ')
@@ -345,7 +357,7 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
             <h3 className="truncate text-[16px] font-semibold tracking-tight">{agent.label}</h3>
           </div>
           <div className="mt-1 font-mono text-[11px] text-muted-foreground">
-            {agent.role} · {agent.cli}{agent.model ? ` · ${agent.model}` : ''}
+            {agent.role} · {agent.cli}{agent.model ? ` · ${agent.model}` : agent.cli === 'codex' ? ` · ${codexModel || 'ChatGPT account'}` : ''}
             {/* codex always runs --dangerously-bypass-approvals-and-sandbox, so it's
                 unsandboxed regardless of the skip-perms checkbox — surface that. */}
             {agent.cli === 'codex' ? ' · unsandboxed' : (agent.skipPerms ? ' · skip-perms' : '')}
@@ -388,17 +400,27 @@ export function ChatPane({ agent, siblings, onSend, onChangeModelEffort, onCance
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-[11px]">Model</Label>
-                    <Select
-                      value={agent.model || '__default'}
-                      onValueChange={(v) => onChangeModelEffort(v === '__default' ? null : v, agent.effort)}
-                    >
-                      <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {MODEL_OPTIONS[agent.cli].map((o) => (
-                          <SelectItem key={o.value || '__default'} value={o.value || '__default'}>{o.label}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                    {agent.cli === 'codex' ? (
+                      // ChatGPT-account codex has no selectable model — read-only.
+                      <div
+                        className="flex h-8 items-center truncate rounded-md border border-input bg-input/40 px-2.5 text-[12px] text-muted-foreground"
+                        title="ChatGPT-account codex uses the account's default model — not selectable. Effort below is the configurable knob."
+                      >
+                        {codexModel ? `${codexModel} · ChatGPT account` : 'ChatGPT account default'}
+                      </div>
+                    ) : (
+                      <Select
+                        value={agent.model || '__default'}
+                        onValueChange={(v) => onChangeModelEffort(v === '__default' ? null : v, agent.effort)}
+                      >
+                        <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          {MODEL_OPTIONS[agent.cli].map((o) => (
+                            <SelectItem key={o.value || '__default'} value={o.value || '__default'}>{o.label}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-[11px]">Effort</Label>
