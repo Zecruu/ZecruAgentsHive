@@ -110,6 +110,9 @@ export interface MessageData {
   // v2.x Cloud Sync: stable client-generated id, assigned at first persist and
   // reused on every re-push — the LWW dedupe key for transcript sync.
   uuid?: string;
+  // True for an assistant THINKING/reasoning entry (extended-thinking content
+  // blocks) — rendered as a collapsed "Thinking" disclosure.
+  thinking?: boolean;
 }
 
 export interface AgentData {
@@ -181,6 +184,7 @@ export interface ChatEvent {
   message?: {
     content?: Array<
       | { type: 'text'; text: string }
+      | { type: 'thinking'; thinking: string }
       | { type: 'tool_use'; id: string; name: string; input: unknown }
       | { type: 'tool_result'; tool_use_id: string; content: unknown; is_error?: boolean }
     >;

@@ -117,6 +117,8 @@ export interface MessageRuntime {
   // v2.x Cloud Sync: stable client id (assigned lazily at first persist, then
   // reused) — the dedupe key for transcript push/pull.
   uuid?: string;
+  // True for an assistant THINKING/reasoning entry (rendered collapsed).
+  thinking?: boolean;
 }
 
 // Stable per-message id for Cloud Sync. crypto.randomUUID in the Electron
@@ -772,7 +774,7 @@ export function useActiveProject(project: Project | null): ActiveProject {
         // FIX 2: entries are now split — the response text is the last assistant
         // entry WITH text; count tool calls across this turn's entries (back to
         // the last user message).
-        const lastAssist = [...a.messages].reverse().find((m) => m.role === 'assistant' && !!m.text);
+        const lastAssist = [...a.messages].reverse().find((m) => m.role === 'assistant' && !!m.text && !m.thinking);
         let body = (lastAssist?.text || '').trim();
         let tc = 0;
         for (let i = a.messages.length - 1; i >= 0; i--) {
@@ -912,13 +914,25 @@ A new message or question or summary is waiting. Do this in order:
     if (ev.type === 'assistant' && ev.message) {
       const content = ev.message.content || [];
       for (const c of content) {
-        if (c.type === 'text') {
-          // FIX 2: text lives in its own bubble. Append to the current OPEN text
-          // entry; if the open entry is a tool group (or nothing's open yet),
-          // start a NEW text entry — so text AFTER a tool call begins a fresh
-          // bubble, interleaved in order.
+        if (c.type === 'thinking') {
+          // Extended-thinking/reasoning: its OWN collapsed entry. Append to the
+          // open thinking entry, else start a new one. (Real reasoning text — only
+          // present when the model actually emits thinking; never fabricated.)
           const open = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
-          const openIsText = !!open && open.role === 'assistant' && !(open.toolCalls && open.toolCalls.length > 0);
+          const openIsThinking = !!open && open.role === 'assistant' && !!open.thinking;
+          if (openIsThinking && open) {
+            open.text += (c as any).thinking || '';
+          } else {
+            a.messages.push({ role: 'assistant', text: (c as any).thinking || '', toolCalls: [], thinking: true });
+            a.streamingIdx = a.messages.length - 1;
+          }
+        } else if (c.type === 'text') {
+          // FIX 2: text lives in its own bubble. Append to the current OPEN text
+          // entry; if the open entry is a tool group / thinking entry (or nothing's
+          // open yet), start a NEW text entry — so text AFTER a tool/thinking
+          // begins a fresh bubble, interleaved in order.
+          const open = a.streamingIdx != null ? a.messages[a.streamingIdx] : null;
+          const openIsText = !!open && open.role === 'assistant' && !open.thinking && !(open.toolCalls && open.toolCalls.length > 0);
           if (openIsText && open) {
             open.text += c.text;
           } else {
@@ -1083,6 +1097,7 @@ function rehydrate(d: AgentData): AgentRuntime {
       tokens: m.tokens,
       attachments: m.attachments,
       uuid: m.uuid,
+      thinking: m.thinking,
     })),
     queue: [],
     retryCount: 0,
@@ -1121,6 +1136,7 @@ function serialize(a: AgentRuntime): AgentData {
         tokens: m.tokens,
         attachments: m.attachments,
         uuid: m.uuid,
+        thinking: m.thinking,
       };
     }),
   };

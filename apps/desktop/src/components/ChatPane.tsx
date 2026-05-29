@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
-import { Archive, AtSign, ChevronRight, FilePen, FileText, Hexagon, ImageIcon, ListPlus, Loader2, Maximize2, MessageSquare, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, TerminalSquare, Wrench, X as XIcon } from 'lucide-react';
+import { Archive, AtSign, Brain, ChevronRight, FilePen, FileText, Hexagon, ImageIcon, ListPlus, Loader2, Maximize2, MessageSquare, Minimize2, PanelRight, Paperclip, Send, SlidersHorizontal, StopCircle, TerminalSquare, Wrench, X as XIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -659,6 +659,30 @@ function contextWindowFor(model: string | null): number | null {
   return null;
 }
 
+// P4: collapsed "Thinking" disclosure showing the model's real extended-thinking
+// text (only rendered when the stream actually emits thinking blocks — not faked).
+function ThinkingEntry({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mx-auto w-full max-w-4xl animate-fade-up">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 rounded-md border border-border/50 bg-input/20 px-3 py-1.5 text-left text-[11px] text-muted-foreground transition-colors hover:bg-secondary/30"
+      >
+        <Brain className="h-3 w-3 shrink-0" />
+        <span className="font-medium">Thinking</span>
+        <ChevronRight className={cn('ml-auto h-3 w-3 shrink-0 transition-transform', open && 'rotate-90')} />
+      </button>
+      {open && (
+        <div className="mt-1 whitespace-pre-wrap break-words rounded-md border border-border/40 bg-input/15 px-3 py-2 text-[12px] italic leading-relaxed text-muted-foreground">
+          {text || '…'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Compact token count: 850 → "850", 4200 → "4.2k", 1_500_000 → "1.5M".
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + 'M';
@@ -676,6 +700,11 @@ function EmptyChip({ icon, label }: { icon: React.ReactNode; label: string }) {
 }
 
 function MessageBubble({ message }: { message: MessageRuntime }) {
+  // P4: a thinking/reasoning entry renders as a collapsed "Thinking" disclosure.
+  if (message.role === 'assistant' && message.thinking) {
+    return <ThinkingEntry text={message.text} />;
+  }
+
   // FIX 2: a tool-group entry (tool calls + no text) renders as JUST the group —
   // no empty assistant bubble. OLD persisted/Cloud-Sync-pulled messages that
   // carry BOTH text and tool calls still render both (the normal path below), so
