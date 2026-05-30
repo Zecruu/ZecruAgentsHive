@@ -19,6 +19,7 @@ import {
   type ChatEvent,
   type Cli,
   type OsHint,
+  type AgentPresenceLite,
   type Project,
   type Role,
   type ToolCallData,
@@ -52,6 +53,11 @@ export interface AgentRuntime {
   // v2.x Cloud Sync: a conversation materialized from another device's pulled
   // transcript is view-only (no local session) — the composer is disabled.
   readOnly?: boolean;
+  // Mission A: server-side declared/promoted state of this agent (planner or
+  // coder). Populated by the dashboard-state ticks; the sidebar renders a badge
+  // below the avatar. null/undefined = no presence row yet (server hasn't seen
+  // this agent in any state-bearing tool call).
+  presence?: AgentPresenceLite | null;
   messages: MessageRuntime[];
   // v2.x: follow-up messages queued while a turn is in-flight; auto-sent in order
   // when the current turn completes. In-memory (not persisted). Each carries its
@@ -98,6 +104,26 @@ function isRateLimitText(s: string | null | undefined): boolean {
 // raw strings misses the match and wakes the wrong (or no) coder. Fix A.
 function normCoderId(s: string | null | undefined): string {
   return (s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+// Mission A: mutate `agents` in place so each gets its matching AgentPresenceLite
+// (or null if no row). agent_key matching: hivemind → "planner"; coder →
+// normCoderId(coder.coderId || coder.label) — same normalization the server enforces.
+// Called from every dashboard-state tick (the existing dashboard poll + both
+// wake-reliability fallbacks already fetch state.agent_presence) so the sidebar
+// stays fresh without a new endpoint or poll.
+function attachPresence(agents: AgentRuntime[], presenceList: AgentPresenceLite[] | undefined): void {
+  if (!Array.isArray(presenceList)) return;
+  const byKey = new Map<string, AgentPresenceLite>();
+  for (const p of presenceList) {
+    if (!p || !p.agent_key) continue;
+    const k = p.agent_key === 'planner' ? 'planner' : normCoderId(p.agent_key);
+    if (k) byKey.set(k, p);
+  }
+  for (const a of agents) {
+    const key = a.role === 'hivemind' ? 'planner' : normCoderId(a.coderId || a.label);
+    a.presence = byKey.get(key) ?? null;
+  }
 }
 
 // A follow-up queued while a turn is in-flight — text + any attachments, so an
@@ -397,6 +423,10 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
     const tick = async () => {
       try {
         const state = await ah().dashboard.state(slug);
+        // Mission A: merge server-side AgentPresence into local agents so the
+        // sidebar badges stay fresh on the existing 20s tick (no new poll).
+        attachPresence(agentsRef.current, state.agent_presence);
+        rerender();
         const events = ingest(state);
         // v2.x: keep <projectFolder>/agentsmissions/ in sync with server state.
         // Best-effort + idempotent (write-only-if-changed); no-op if no folder set.
@@ -473,6 +503,9 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
       let state: any;
       try { state = await ah().dashboard.state(slug); } catch { return; }
       if (stopped) return;
+      // Mission A: refresh per-agent presence on the same fetch — no new poll.
+      attachPresence(agentsRef.current, state.agent_presence);
+      rerender();
       const ids: string[] = [];
       // Match the server JSON keys (dashboard.py:331-332). The earlier
       // pending_q/pending_s names were undefined → the signature was always empty
@@ -530,6 +563,9 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
       let state: any;
       try { state = await ah().dashboard.state(slug); } catch { return; }
       if (stopped) return;
+      // Mission A: refresh per-agent presence on the same fetch — no new poll.
+      attachPresence(agentsRef.current, state.agent_presence);
+      rerender();
       const msgs = Array.isArray(state.pending_from_planner) ? state.pending_from_planner : [];
       if (msgs.length === 0) {
         // No pending planner→coder anywhere — clear all per-coder signatures so

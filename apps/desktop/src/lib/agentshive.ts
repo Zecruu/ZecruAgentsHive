@@ -39,6 +39,24 @@ export interface PendingSummaryLite {
   status?: string;
 }
 
+// Mission A: AgentPresence row as surfaced in /api/dashboard/state.agent_presence.
+// state is the EFFECTIVE state (server-side lazy promotion applied — stale at 5
+// min of heartbeat silence on non-idle, dead at 30 min). declared_state is what
+// the agent actually claimed via set_my_state. agent_key = "planner" for the
+// hivemind or the slug-normalized coder_id for coders.
+export interface AgentPresenceLite {
+  agent_key: string;
+  role: 'planner' | 'coder' | string;
+  state: 'idle' | 'working' | 'waiting_on_planner' | 'waiting_on_coder' | 'waiting_on_user' | 'blocked' | 'stale' | 'dead' | string;
+  declared_state?: string;
+  detail?: string | null;
+  expected_done_at?: string | null;
+  transitioned_at?: string | null;
+  last_heartbeat_at?: string | null;
+  seconds_since_heartbeat?: number | null;
+  source?: string;
+}
+
 // v2.x long-lived agent token row as returned by GET /web/agent-tokens. Never
 // includes the secret value; the operator sees it once via the mint response.
 export interface AgentTokenLite {
@@ -62,6 +80,8 @@ export interface DashboardState {
   // Undelivered planner_to_coder messages for the active mission — drives the
   // desktop's per-coder wake fallback (2.0.21). target_coder_id NULL = broadcast.
   pending_from_planner?: Array<{ id?: string | number; target_coder_id?: string | null; created_at?: string }>;
+  // Mission A: per-agent declared/promoted state for this project.
+  agent_presence?: AgentPresenceLite[];
   messages?: {
     coder_to_planner?: InboxMessageLite[];
     planner_to_coder?: InboxMessageLite[];

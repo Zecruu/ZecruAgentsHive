@@ -33,6 +33,7 @@ import {
   slugify,
   validateSlug,
   type AgentData,
+  type AgentPresenceLite,
   type AgentStatus,
   type Project,
   type Role,
@@ -59,6 +60,8 @@ interface RowAgent {
   // True when this row is backed by a live runtime (status dot reflects real
   // state); false for the on-disk dormant fallback.
   live: boolean;
+  // Mission A: server-side declared/promoted state of this agent.
+  presence?: AgentPresenceLite | null;
 }
 
 interface Props {
@@ -141,6 +144,7 @@ export function ProjectSidebar(props: Props) {
         status: a.status,
         activity: agentActivity(a, now),
         live: true,
+        presence: a.presence ?? null,
       }));
     }
     return (inactiveAgents[slug] || []).map((d) => ({
@@ -309,6 +313,9 @@ export function ProjectSidebar(props: Props) {
                                 {a.role} · {a.cli}{a.model ? ` · ${a.model}` : ''}
                               </div>
                             )}
+                            {/* Mission A: server-side declared/promoted state. Functional
+                                badge — Sarah polishes the visuals in a follow-up. */}
+                            <PresenceBadge presence={a.presence} />
                           </div>
                           {canWake && (
                             <Zap
@@ -384,6 +391,70 @@ export function ProjectSidebar(props: Props) {
       </div>
     </aside>
   );
+}
+
+// Mission A: small inline badge under each agent row carrying the server-side
+// declared/promoted state. Functional defaults only — Sarah picks up the visual
+// design in a follow-up. Hidden when state=idle or no presence row exists yet.
+function PresenceBadge({ presence }: { presence: AgentPresenceLite | null | undefined }) {
+  if (!presence) return null;
+  const state = presence.state || '';
+  if (state === 'idle') return null;  // explicit "nothing to do" — stay quiet
+  const stateLabel =
+    state === 'working' ? 'Working'
+    : state === 'waiting_on_planner' ? 'Waiting on planner'
+    : state === 'waiting_on_coder' ? 'Waiting on coder'
+    : state === 'waiting_on_user' ? 'Waiting on user'
+    : state === 'blocked' ? 'Blocked'
+    : state === 'stale' ? 'Stale'
+    : state === 'dead' ? 'Dead'
+    : state;
+  // Tone classes — explicit branches so Tailwind picks them up at build time.
+  const toneClass =
+    state === 'working' ? 'text-success'
+    : state.startsWith('waiting_') ? 'text-warn'
+    : state === 'blocked' ? 'text-destructive'
+    : state === 'stale' ? 'text-warn opacity-80'
+    : state === 'dead' ? 'text-muted-foreground opacity-70'
+    : 'text-muted-foreground';
+  const detail = (presence.detail || '').trim();
+  const wasDeclared = state === 'stale' && presence.declared_state && presence.declared_state !== 'stale'
+    ? ` (was: ${presence.declared_state})`
+    : '';
+  const now = Date.now();
+  let timeHint = '';
+  if (state === 'stale' || state === 'dead') {
+    const since = presence.seconds_since_heartbeat;
+    if (typeof since === 'number') timeHint = ` · last heard ${formatPresenceDuration(since)}`;
+  } else if (presence.expected_done_at) {
+    const due = Date.parse(presence.expected_done_at);
+    if (!Number.isNaN(due)) {
+      const remaining = Math.round((due - now) / 1000);
+      timeHint = remaining >= 0
+        ? ` · ~${formatPresenceDuration(remaining)} left`
+        : ` · over by ${formatPresenceDuration(-remaining)}`;
+    }
+  } else if (presence.transitioned_at) {
+    const t = Date.parse(presence.transitioned_at);
+    if (!Number.isNaN(t)) {
+      const elapsed = Math.round((now - t) / 1000);
+      if (elapsed >= 5) timeHint = ` · ${formatPresenceDuration(elapsed)}`;
+    }
+  }
+  const text = `${stateLabel}${wasDeclared}${detail ? ': ' + detail : ''}${timeHint}`;
+  return (
+    <div className={cn('truncate text-[10px]', toneClass)} title={text}>{text}</div>
+  );
+}
+
+function formatPresenceDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m < 60) return s > 0 ? `${m}m${s}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm > 0 ? `${h}h${mm}m` : `${h}h`;
 }
 
 function StatusDot({ status, live }: { status: AgentStatus; live: boolean }) {
