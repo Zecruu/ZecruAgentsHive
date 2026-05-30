@@ -322,6 +322,25 @@ class AgentsHiveOAuthProvider(OAuthProvider):
                 expires_at=None,
                 resource=self._canonical_resource,
             )
+        # v2.x long-lived agent token (`ahat_...`) — never expires, tenant-bound.
+        # Replaces the 1h Supabase JWT path on Coder MCP subprocesses (the source
+        # of the recurring "Auth required" break). The `ahat_` prefix check makes
+        # this zero-overhead for OAuth bearers + Supabase JWTs. Synthetic
+        # AccessToken with no expiry, canonical resource so the audience check
+        # downstream trivially passes; TenantContextMiddleware independently
+        # resolves the tenant from the same prefix.
+        if token.startswith("ahat_"):
+            from .db import tenant_for_agent_token
+            agent_tenant = tenant_for_agent_token(token)
+            if agent_tenant is not None:
+                return AccessToken(
+                    token=token,
+                    client_id=f"ahat:{agent_tenant}",
+                    scopes=["mcp"],
+                    expires_at=None,
+                    resource=self._canonical_resource,
+                )
+            return None  # malformed/revoked ahat_ — 401 immediately
         # v2.x: Supabase JWT (JWKS-verified) — a tenant's desktop agent presenting
         # its access token directly. verify_supabase_jwt already validated sig +
         # exp + iss + aud, so a returned sub means a fresh, valid token. The tenant

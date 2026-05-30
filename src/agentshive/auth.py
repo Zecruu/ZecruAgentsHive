@@ -77,6 +77,16 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
                 token.encode("utf-8"), self._api_key.encode("utf-8")
             ):
                 tenant = LEGACY_TENANT
+            elif token.startswith("ahat_"):
+                # v2.x long-lived agent token — tenant-bound, no identity claim
+                # (just tenant scope). The `ahat_` prefix check makes this
+                # zero-overhead for non-agent-token requests. A malformed or
+                # revoked ahat_ token resolves to UNAUTHENTICATED_TENANT (never
+                # matches a real project; BearerAuth / the SDK rejects upstream).
+                from .db import tenant_for_agent_token
+                agent_tenant = tenant_for_agent_token(token)
+                tenant = agent_tenant or UNAUTHENTICATED_TENANT
+                identity = None
             else:
                 ident = verify_supabase_identity(token, self._supabase_url)
                 if ident:

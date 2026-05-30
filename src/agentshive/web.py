@@ -22,7 +22,11 @@ a crash-before-ack re-delivers.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
+import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -33,6 +37,7 @@ from starlette.routing import Route
 
 from .config import Settings
 from .db import (
+    AgentToken,
     Message,
     Project,
     SyncedConversation,
@@ -304,6 +309,123 @@ def do_web_me() -> dict[str, Any]:
         }
 
 
+# ---------- v2.x long-lived agent tokens (`ahat_...`) ----------
+# Operator-minted, tenant-bound, never expires. Replaces the 1h Supabase JWT path
+# on Coder MCP subprocesses (the source of the recurring "Auth required" break).
+# See db.AgentToken for the model + format.
+
+# Defensive cap on operator-supplied label. /^[\w \-.@]+$/ explicitly excludes
+# shell metas + most punctuation so a label can never feed into anything dangerous.
+_AGENT_TOKEN_LABEL_MAX = 80
+_AGENT_TOKEN_LABEL_RE = re.compile(r"^[\w \-.@]+$")
+# Defensive rate-limit: legitimate use is one-per-machine. A tenant minting 10 in
+# an hour is either testing or compromised — either way, hard-stop.
+_AGENT_TOKEN_MAX_PER_HOUR = 10
+
+
+def _mint_agent_token_secret() -> tuple[str, str, str]:
+    """Generate a fresh (full_token, prefix, secret_hash) tuple.
+
+    Format: `ahat_` + 40 chars url-safe base64 (no padding) of secrets.token_bytes(30).
+    30 bytes ⇒ 240 bits of entropy — well above any brute-force concern; the sha256
+    storage means a DB leak surrenders the hash, not the live bearer. prefix = first
+    8 chars of the base64 body so the UI can render "ahat_abc12345…" for revoke UX
+    without ever revealing the secret half.
+    """
+    raw = secrets.token_bytes(30)
+    body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")  # 40 chars
+    full = "ahat_" + body
+    prefix = body[:8]
+    secret_hash = hashlib.sha256(full.encode("utf-8")).hexdigest()
+    return full, prefix, secret_hash
+
+
+def do_create_agent_token(label: str) -> tuple[dict[str, Any], int]:
+    """POST /web/agent-tokens. Validates label, rate-limits, mints + stores hash,
+    returns the FULL plaintext exactly ONCE. Returns (body, status_code)."""
+    label = (label or "").strip()
+    if not label:
+        return {"error": "label is required"}, 400
+    if len(label) > _AGENT_TOKEN_LABEL_MAX:
+        return {"error": f"label exceeds {_AGENT_TOKEN_LABEL_MAX} chars"}, 400
+    if not _AGENT_TOKEN_LABEL_RE.match(label):
+        return {"error": "label contains forbidden characters"}, 400
+    tenant = current_tenant()
+    with Session(get_engine()) as session:
+        # Ensure the Tenant row exists (banned check + admin UX cache key).
+        get_or_create_tenant(session, tenant)
+        recent_cutoff = _utcnow() - timedelta(hours=1)
+        recent = session.exec(
+            select(AgentToken).where(
+                AgentToken.tenant_id == tenant,
+                AgentToken.created_at > recent_cutoff,
+            )
+        ).all()
+        if len(recent) >= _AGENT_TOKEN_MAX_PER_HOUR:
+            return {"error": "rate limit: 10 agent tokens per hour per tenant"}, 429
+        full, prefix, secret_hash = _mint_agent_token_secret()
+        row = AgentToken(
+            tenant_id=tenant, label=label, secret_hash=secret_hash, prefix=prefix,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return ({
+            "id": row.id,
+            "label": row.label,
+            "prefix": row.prefix,
+            "token": full,  # ONLY time the plaintext is ever returned
+            "created_at": row.created_at.isoformat(),
+        }, 200)
+
+
+def do_list_agent_tokens() -> dict[str, Any]:
+    """GET /web/agent-tokens. Returns the tenant's tokens; NEVER returns the secret."""
+    tenant = current_tenant()
+    with Session(get_engine()) as session:
+        rows = session.exec(
+            select(AgentToken)
+            .where(AgentToken.tenant_id == tenant)
+            .order_by(AgentToken.created_at)
+        ).all()
+        return {
+            "tokens": [
+                {
+                    "id": r.id,
+                    "label": r.label,
+                    "prefix": r.prefix,
+                    "created_at": r.created_at.isoformat(),
+                    "last_used_at": r.last_used_at.isoformat() if r.last_used_at else None,
+                    "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,
+                    "revoked": r.revoked_at is not None,
+                }
+                for r in rows
+            ]
+        }
+
+
+def do_revoke_agent_token(token_id: str) -> tuple[dict[str, Any], int]:
+    """DELETE /web/agent-tokens/{id}. 404 cross-tenant (don't leak existence).
+    Soft-delete: sets revoked_at. Idempotent — revoking an already-revoked row is OK."""
+    if not token_id:
+        return {"error": "not found"}, 404
+    tenant = current_tenant()
+    with Session(get_engine()) as session:
+        row = session.exec(
+            select(AgentToken).where(
+                AgentToken.id == token_id,
+                AgentToken.tenant_id == tenant,
+            )
+        ).first()
+        if row is None:
+            return {"error": "not found"}, 404
+        if row.revoked_at is None:
+            row.revoked_at = _utcnow()
+            session.add(row)
+            session.commit()
+        return ({"ok": True, "id": row.id, "revoked_at": row.revoked_at.isoformat()}, 200)
+
+
 def do_sync_push(slug: str, agent_id: str, label: Optional[str], role: Optional[str],
                  cli: Optional[str], messages: list[dict[str, Any]]) -> dict[str, Any]:
     """Desktop → cloud: idempotent upsert of one agent's transcript. ENTITLEMENT-
@@ -517,6 +639,28 @@ def _make_me(_s: Settings):
     return h
 
 
+def _make_create_agent_token(_s: Settings):
+    async def h(request: Request) -> Response:
+        body = await _read_json(request)
+        payload, status = do_create_agent_token((body.get("label") or "").strip() if isinstance(body, dict) else "")
+        return JSONResponse(payload, status_code=status)
+    return h
+
+
+def _make_list_agent_tokens(_s: Settings):
+    async def h(_request: Request) -> Response:
+        return JSONResponse(do_list_agent_tokens())
+    return h
+
+
+def _make_revoke_agent_token(_s: Settings):
+    async def h(request: Request) -> Response:
+        token_id = (request.path_params.get("id") or "").strip()
+        payload, status = do_revoke_agent_token(token_id)
+        return JSONResponse(payload, status_code=status)
+    return h
+
+
 def _make_sync_push(_s: Settings):
     async def h(request: Request) -> Response:
         body = await _read_json(request)
@@ -596,6 +740,12 @@ def register_web_routes(app, settings: Settings) -> None:
         ("/web/me", _make_me(settings), ["GET"]),
         ("/web/sync/push", _make_sync_push(settings), ["POST"]),
         ("/web/sync/pull", _make_sync_pull(settings), ["GET"]),
+        # v2.x long-lived agent tokens — Supabase-JWT-guarded by _web_guard so the
+        # tenant is always the operator's sub. POST mints + returns plaintext once;
+        # GET lists (no secret); DELETE soft-revokes (404 cross-tenant — never leak).
+        ("/web/agent-tokens", _make_create_agent_token(settings), ["POST"]),
+        ("/web/agent-tokens", _make_list_agent_tokens(settings), ["GET"]),
+        ("/web/agent-tokens/{id}", _make_revoke_agent_token(settings), ["DELETE"]),
     ]
     for path, handler, methods in routes:
         app.router.routes.append(Route(path, _web_guard(handler), methods=methods))

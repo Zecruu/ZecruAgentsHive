@@ -274,6 +274,39 @@ class SyncedMessage(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
+# v2.x long-lived agent tokens — kill the 1h Supabase JWT-expiry MCP auth break.
+#
+# Operator signs in once with Supabase, the desktop mints one of these per machine,
+# then hands the same bearer to every spawned Coder MCP subprocess for the lifetime
+# of the sign-in. Tenant-bound, never expires. Replaces the 1h JWT path that was
+# silently dying every hour and triggering "Auth required" loops the operator had
+# to manually fix.
+#
+# FORMAT: `ahat_` + 40 chars url-safe base64 of secrets.token_bytes(30). Total
+# length 45. secret_hash = sha256 hex of the FULL token (NEVER store plaintext —
+# a DB leak surrenders the hash, not the live bearer). prefix = first 8 chars
+# after `ahat_` (plaintext) so the UI can show `ahat_abc12345…` for revoke UX
+# without revealing the secret half.
+class AgentToken(SQLModel, table=True):
+    id: str = Field(default_factory=_uuid, primary_key=True)  # uuid4 hex
+    # Owning tenant — Supabase sub. Indexed for list-by-tenant queries.
+    tenant_id: str = Field(index=True)
+    # Operator-supplied — e.g. "desktop-MIKES-PC". Validated at the route.
+    label: str
+    # sha256 hex of the full token; unique-indexed for O(1) auth lookup.
+    secret_hash: str = Field(index=True, unique=True)
+    # First 8 chars after `ahat_` (plaintext). Identifies a token in the UI for
+    # revocation without ever revealing the secret half.
+    prefix: str
+    created_at: datetime = Field(default_factory=_utcnow)
+    # Bumped on every successful auth, rate-limited to once per 60s per token so
+    # a chatty MCP path doesn't write hot.
+    last_used_at: Optional[datetime] = None
+    # Soft-delete: revocation flips this rather than deleting the row, so the
+    # operator (and an admin audit) can see WHEN a token was revoked.
+    revoked_at: Optional[datetime] = None
+
+
 # v2.x companion-webapp presence: the desktop upserts one row per local agent so
 # the webapp can list a tenant's agents and show desktop online/offline (via
 # last_seen freshness). Tenant-scoped; agent_key = the desktop agent.id.
@@ -767,6 +800,39 @@ def is_tenant_banned(tenant_id: str) -> bool:
     with Session(get_engine()) as s:
         row = s.get(Tenant, tenant_id)
         return bool(row and row.banned)
+
+
+def tenant_for_agent_token(raw_token: str) -> Optional[str]:
+    """v2.x: resolve a raw long-lived agent token (`ahat_...`) to its tenant_id,
+    or None if the token is unknown / revoked / belongs to a banned tenant. Bumps
+    last_used_at but rate-limits the write to once per 60s per token so a chatty
+    MCP path doesn't hot-write.
+
+    Called by TenantContextMiddleware on `ahat_`-prefixed bearers + by
+    AgentsHiveOAuthProvider.load_access_token so /mcp + every gated route accept
+    agent tokens without ever expiring (the whole point of the design).
+    """
+    import hashlib
+    from sqlmodel import Session, select
+    if not raw_token or not raw_token.startswith("ahat_"):
+        return None
+    h = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    with Session(get_engine()) as s:
+        row = s.exec(select(AgentToken).where(AgentToken.secret_hash == h)).first()
+        if row is None or row.revoked_at is not None:
+            return None
+        # Banned tenant → reject (defense in depth — same as tenant_for_oauth_token).
+        if is_tenant_banned(row.tenant_id):
+            return None
+        # Rate-limited last_used_at bump (once per 60s per token).
+        now = _utcnow()
+        last = row.last_used_at
+        last_aware = last if (last is None or last.tzinfo is not None) else last.replace(tzinfo=timezone.utc)
+        if last_aware is None or (now - last_aware).total_seconds() > 60:
+            row.last_used_at = now
+            s.add(row)
+            s.commit()
+        return row.tenant_id
 
 
 def tenant_for_oauth_token(raw_token: str) -> Optional[str]:
