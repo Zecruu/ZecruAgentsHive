@@ -50,6 +50,13 @@ let _hasSession = false;
 // every change. Keeps main's cache in sync with the renderer's live session.
 function _pushTokenToMain(token: string | null) {
   try { (window as any).agentshive?.auth?.setToken(token); } catch { /* ignore */ }
+  // 2.0.22: after pushing the latest Supabase JWT to main, fire-and-forget an
+  // agent-token ensure so cfg.agentToken is fresh for the next spawn — mint on
+  // first sign-in, re-mint if revoked elsewhere. Main wraps the network in
+  // try/catch so a failure just leaves the JWT path as the bearer (graceful).
+  if (token) {
+    try { void (window as any).agentshive?.agentTokens?.ensure(); } catch { /* ignore */ }
+  }
 }
 
 if (supabase) {

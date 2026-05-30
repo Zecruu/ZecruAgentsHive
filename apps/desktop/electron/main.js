@@ -144,7 +144,16 @@ function agentEnv({ projectSlug, coderId, osHint, authToken, requireAuthToken })
   // and codex (bearer_token_env_var=AGENTSHIVE_API_KEY). We keep the env var NAME
   // so neither CLI's MCP wiring changes — only the value. Falls back to the legacy
   // shared key when no token is supplied (transitional, pre-cutover).
-  const bearer = authToken && String(authToken).trim();
+  //
+  // 2.0.22: PREFER a long-lived agent token (`ahat_`) over the 1h Supabase JWT.
+  // The JWT was silently expiring every hour, breaking MCP comms ("Auth required")
+  // until the operator manually restarted the coder. Agent tokens are minted once
+  // (via the agent-token:ensure IPC on sign-in) and live in cfg; the spawned MCP
+  // subprocess uses the same bearer for the lifetime of the sign-in. Order of
+  // preference: agent token > Supabase JWT > legacy shared key.
+  const agentToken = (cfg.agentToken && cfg.agentToken.value) || null;
+  const supabaseJwt = authToken && String(authToken).trim();
+  const bearer = agentToken || supabaseJwt;
   if (requireAuthToken && !bearer) {
     throw new Error('Supabase session is active but no access token is available. Sign in again before launching agents.');
   }
@@ -1398,6 +1407,137 @@ ipcMain.handle('app:version', () => app.getVersion());
 ipcMain.handle('auth:setToken', (_e, { token }) => {
   _supabaseToken = (token && String(token)) || null;
   return { ok: true };
+});
+
+// --- v2.x long-lived agent tokens (`ahat_`) ---------------------------------
+// Mint once on sign-in, store in cfg.agentToken, hand to every spawned Coder MCP
+// subprocess for the lifetime of the sign-in. Tenant-bound + never expires →
+// kills the 1h Supabase JWT expiry "Auth required" loop the operator kept hitting.
+// agentEnv reads cfg.agentToken synchronously and prefers it over the JWT.
+
+async function _fetchJson(url, init) {
+  const res = await fetch(url, init);
+  const text = await res.text();
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}: ${typeof parsed === 'string' ? parsed.slice(0, 200) : JSON.stringify(parsed).slice(0, 200)}`);
+    err.status = res.status;
+    err.body = parsed;
+    throw err;
+  }
+  return parsed;
+}
+
+// Mint a fresh agent token + persist it in cfg. Returns the new cfg.agentToken
+// shape on success, throws on failure. Caller wraps in try/catch.
+async function _mintAgentToken(baseUrl, supabaseJwt, label) {
+  const minted = await _fetchJson(baseUrl.replace(/\/$/, '') + '/web/agent-tokens', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${supabaseJwt}`, 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({ label }),
+  });
+  if (!minted || !minted.token) throw new Error('mint: no token in response');
+  const stored = {
+    id: minted.id,
+    value: minted.token,
+    prefix: minted.prefix,
+    label: minted.label,
+    mintedAt: new Date().toISOString(),
+  };
+  writeConfig({ agentToken: stored });
+  return stored;
+}
+
+// Mint-if-missing + validate-against-list. Called by the renderer (auth-change
+// hook) before any spawn so cfg.agentToken is ready. On any failure (no JWT,
+// network, etc.) returns null — agentEnv then gracefully falls back to the
+// Supabase JWT path so the spawn still works in degraded mode.
+async function _ensureAgentToken(supabaseJwt) {
+  const cfg = readConfig();
+  if (!cfg.baseUrl || !supabaseJwt) return null;
+  const baseUrl = cfg.baseUrl;
+  const labelDefault = `desktop-${(os.hostname() || 'machine').slice(0, 64)}`;
+  try {
+    if (cfg.agentToken && cfg.agentToken.value && cfg.agentToken.id) {
+      // Validate the cached id is still on the server (not revoked elsewhere).
+      const listing = await _fetchJson(baseUrl.replace(/\/$/, '') + '/web/agent-tokens', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${supabaseJwt}`, Origin: baseUrl },
+      });
+      const tokens = Array.isArray(listing && listing.tokens) ? listing.tokens : [];
+      const match = tokens.find((t) => t && t.id === cfg.agentToken.id);
+      if (match && !match.revoked) return cfg.agentToken;
+      // Revoked elsewhere (or vanished) → re-mint a fresh one.
+    }
+    return await _mintAgentToken(baseUrl, supabaseJwt, labelDefault);
+  } catch (e) {
+    console.warn('agent-token:ensure failed (falling back to JWT):', e && e.message ? e.message : e);
+    return null;
+  }
+}
+
+ipcMain.handle('agent-token:ensure', async () => {
+  const t = await _ensureAgentToken(_supabaseToken);
+  // NEVER return the raw token value to the renderer — only the safe metadata.
+  // The plaintext lives in cfg (userData) and is used by the main process for
+  // spawn env injection; the renderer doesn't need it for any UI purpose.
+  if (!t) return { ok: false };
+  return { ok: true, id: t.id, label: t.label, prefix: t.prefix, mintedAt: t.mintedAt };
+});
+
+ipcMain.handle('agent-token:list', async () => {
+  if (!_supabaseToken) return { tokens: [], error: 'not signed in' };
+  try {
+    const cfg = readConfig();
+    if (!cfg.baseUrl) return { tokens: [], error: 'baseUrl not configured' };
+    const listing = await _fetchJson(cfg.baseUrl.replace(/\/$/, '') + '/web/agent-tokens', {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${_supabaseToken}`, Origin: cfg.baseUrl },
+    });
+    return { tokens: Array.isArray(listing && listing.tokens) ? listing.tokens : [] };
+  } catch (e) {
+    return { tokens: [], error: (e && e.message) || String(e) };
+  }
+});
+
+ipcMain.handle('agent-token:revoke', async (_e, { id }) => {
+  if (!_supabaseToken) return { ok: false, error: 'not signed in' };
+  if (!id || typeof id !== 'string') return { ok: false, error: 'id required' };
+  try {
+    const cfg = readConfig();
+    if (!cfg.baseUrl) return { ok: false, error: 'baseUrl not configured' };
+    await _fetchJson(cfg.baseUrl.replace(/\/$/, '') + '/web/agent-tokens/' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${_supabaseToken}`, Origin: cfg.baseUrl },
+    });
+    // If we revoked OUR cached token, wipe it from cfg so the next spawn falls
+    // back (or the renderer re-mints via agent-token:ensure).
+    if (cfg.agentToken && cfg.agentToken.id === id) {
+      writeConfig({ agentToken: null });
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// Renderer can mint a brand-new token without nuking the cached one — used by
+// the Settings "Mint new token" button so the operator gets the plaintext ONCE
+// (returned here; never persisted in the renderer). The plaintext IS still
+// stored server-hashed + locally in cfg so spawns keep working.
+ipcMain.handle('agent-token:mint', async (_e, { label }) => {
+  if (!_supabaseToken) return { ok: false, error: 'not signed in' };
+  try {
+    const cfg = readConfig();
+    if (!cfg.baseUrl) return { ok: false, error: 'baseUrl not configured' };
+    const cleanLabel = (label || '').trim() || `desktop-${(os.hostname() || 'machine').slice(0, 64)}`;
+    const stored = await _mintAgentToken(cfg.baseUrl, _supabaseToken, cleanLabel);
+    // Returns the plaintext ONCE so the UI can show a copy-to-clipboard modal.
+    return { ok: true, id: stored.id, label: stored.label, prefix: stored.prefix, token: stored.value };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
 });
 
 // --- durable auth store (Supabase session persistence across updates) -------

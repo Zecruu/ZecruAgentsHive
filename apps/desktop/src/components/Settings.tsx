@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, CloudOff, Cloud, Github, RefreshCw, Train, Triangle, XCircle } from 'lucide-react';
-import { ah, type ConfigState, type Entitlements, type ToolStatus } from '@/lib/agentshive';
+import { CheckCircle2, CloudOff, Cloud, Copy, Github, KeyRound, RefreshCw, Train, Triangle, XCircle } from 'lucide-react';
+import { ah, type AgentTokenLite, type ConfigState, type Entitlements, type ToolStatus } from '@/lib/agentshive';
 import { getEntitlements, getOptIn, setOptIn } from '@/lib/cloudSync';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -109,9 +109,154 @@ export function Settings({ config, firstRun, onSaved, onCancel }: Props) {
 
           <Separator className="my-2" />
 
+          <AgentTokensSection />
+
+          <Separator className="my-2" />
+
           <ToolsSection />
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+// v2.x long-lived agent tokens (`ahat_`). The spawned Coder MCP subprocess uses
+// the operator's agent token instead of the 1h Supabase JWT (which was silently
+// dying every hour). Renderer never sees the secret EXCEPT in the mint response
+// — copy-once modal, then the plaintext is gone (only metadata stays in the list).
+function AgentTokensSection() {
+  const [tokens, setTokens] = useState<AgentTokenLite[] | null>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [minted, setMinted] = useState<{ label: string; token: string; prefix: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const refresh = async () => {
+    setBusy(true);
+    setLoadErr(null);
+    try {
+      const res = await ah().agentTokens.list();
+      setTokens(res.tokens || []);
+      if (res.error) setLoadErr(res.error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => { refresh(); }, []);
+
+  const mint = async () => {
+    setBusy(true);
+    try {
+      const res = await ah().agentTokens.mint();
+      if (res.ok && res.token) {
+        setMinted({ label: res.label || 'token', token: res.token, prefix: res.prefix || '' });
+        await refresh();
+      } else {
+        setLoadErr(res.error || 'mint failed');
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revoke = async (id: string) => {
+    setBusy(true);
+    try {
+      const res = await ah().agentTokens.revoke(id);
+      if (!res.ok) setLoadErr(res.error || 'revoke failed');
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyToken = async () => {
+    if (!minted) return;
+    try {
+      await navigator.clipboard.writeText(minted.token);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard unavailable */ }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <Label className="flex items-center gap-1.5">
+            <KeyRound className="h-3.5 w-3.5" />
+            Agent tokens
+          </Label>
+          <p className="mt-1 text-xs text-muted-foreground normal-case tracking-normal">
+            Long-lived bearers for coder agents — replace the 1h Supabase token so coders don't time out. Tenant-bound, never expires. Auto-minted on sign-in.
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <Button size="sm" variant="ghost" onClick={refresh} disabled={busy}>
+            <RefreshCw className={busy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+          </Button>
+          <Button size="sm" onClick={mint} disabled={busy}>
+            <KeyRound className="h-3.5 w-3.5" /> Mint new
+          </Button>
+        </div>
+      </div>
+
+      {loadErr && <p className="text-[11px] text-destructive">{loadErr}</p>}
+
+      {tokens === null ? (
+        <div className="text-[12px] text-muted-foreground">Loading…</div>
+      ) : tokens.length === 0 ? (
+        <div className="rounded-md border border-border/60 bg-card/40 px-3 py-2.5 text-[12px] text-muted-foreground">
+          No tokens yet. Sign in with Supabase and one mints automatically.
+        </div>
+      ) : (
+        <ul className="space-y-1.5">
+          {tokens.map((t) => (
+            <li key={t.id} className="flex items-center gap-3 rounded-md border border-border/60 bg-card/40 px-3 py-2.5 text-sm">
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="truncate font-medium">{t.label}</span>
+                  <code className="shrink-0 rounded bg-input/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">ahat_{t.prefix}…</code>
+                  {t.revoked && <Badge variant="muted" className="normal-case">revoked</Badge>}
+                </div>
+                <div className="truncate text-[11px] text-muted-foreground">
+                  {t.last_used_at ? `last used ${new Date(t.last_used_at).toLocaleString()}` : 'never used'}
+                  {t.created_at ? ` · created ${new Date(t.created_at).toLocaleDateString()}` : ''}
+                </div>
+              </div>
+              {!t.revoked && (
+                <Button size="sm" variant="ghost" onClick={() => revoke(t.id)} disabled={busy}>
+                  Revoke
+                </Button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {minted && (
+        <div className="rounded-md border border-accent/40 bg-accent/5 p-3 text-sm">
+          <div className="mb-2 flex items-center gap-2">
+            <KeyRound className="h-3.5 w-3.5 text-accent" />
+            <span className="font-medium">New token: {minted.label}</span>
+          </div>
+          <p className="mb-2 text-[11px] text-muted-foreground">
+            Copy this now — you won't see the full value again. It's already stored on this machine and your coders will use it; this is for backups + other machines.
+          </p>
+          <div className="flex items-center gap-2 rounded border border-border bg-input/60 p-2">
+            <code className="min-w-0 flex-1 select-all break-all font-mono text-[11px]">{minted.token}</code>
+            <Button size="sm" variant="ghost" onClick={copyToken}>
+              <Copy className="h-3.5 w-3.5" /> {copied ? 'Copied' : 'Copy'}
+            </Button>
+          </div>
+          <div className="mt-2 flex justify-end">
+            <Button size="sm" variant="ghost" onClick={() => setMinted(null)}>
+              Done
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

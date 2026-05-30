@@ -39,6 +39,18 @@ export interface PendingSummaryLite {
   status?: string;
 }
 
+// v2.x long-lived agent token row as returned by GET /web/agent-tokens. Never
+// includes the secret value; the operator sees it once via the mint response.
+export interface AgentTokenLite {
+  id: string;
+  label: string;
+  prefix: string;
+  created_at?: string | null;
+  last_used_at?: string | null;
+  revoked_at?: string | null;
+  revoked?: boolean;
+}
+
 export interface DashboardState {
   active_mission?: unknown;
   // Field names match the server JSON keys (dashboard.py:_build_state_payload).
@@ -275,6 +287,17 @@ declare global {
         // when codex isn't configured / no model line. Used to label the
         // effective model for ChatGPT-account codex agents (no -m is passed).
         defaultModel: () => Promise<string | null>;
+      };
+      // v2.x long-lived agent tokens (`ahat_`). Operator-minted per machine,
+      // tenant-bound, never expires — replaces the 1h Supabase-JWT spawn bearer.
+      // The plaintext value lives in cfg (userData) and is used by main for
+      // spawn env injection; the renderer NEVER sees the secret value EXCEPT in
+      // the `mint` response (so the UI can show a copy-once modal).
+      agentTokens: {
+        ensure: () => Promise<{ ok: boolean; id?: string; label?: string; prefix?: string; mintedAt?: string }>;
+        list: () => Promise<{ tokens: AgentTokenLite[]; error?: string }>;
+        revoke: (id: string) => Promise<{ ok: boolean; error?: string }>;
+        mint: (label?: string) => Promise<{ ok: boolean; id?: string; label?: string; prefix?: string; token?: string; error?: string }>;
       };
       skills: {
         list: (projectSlug: string) => Promise<SkillItem[]>;

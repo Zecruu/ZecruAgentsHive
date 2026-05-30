@@ -108,6 +108,12 @@ contextBridge.exposeInMainWorld('agentshive', {
   codex: {
     defaultModel: () => ipcRenderer.invoke('codex:defaultModel'),
   },
+  agentTokens: {
+    ensure: () => ipcRenderer.invoke('agent-token:ensure'),
+    list: () => ipcRenderer.invoke('agent-token:list'),
+    revoke: (id) => ipcRenderer.invoke('agent-token:revoke', { id }),
+    mint: (label) => ipcRenderer.invoke('agent-token:mint', { label }),
+  },
   skills: {
     list: (projectSlug) => ipcRenderer.invoke('skills:list', { projectSlug }),
   },
