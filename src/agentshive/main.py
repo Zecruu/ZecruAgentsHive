@@ -73,14 +73,17 @@ def build_app():
             "and AI Coders (Claude Code, Codex CLI). Planners create missions and answer the "
             "Coder's questions. Coders fetch missions, ask the Planner instead of the human, "
             "and submit progress summaries. There is one active mission at a time. "
-            # Mission A nudge — guidance, not enforcement. Cuts the "fire send_to_coder into a void" failure mode.
-            "MUTUAL STATE AWARENESS: Before send_to_coder or answer_question, you SHOULD call "
-            "list_agent_states() to see if the target coder is alive. If state in (stale, dead) "
-            "for the target, prefer notifying the user via send_to_user instead of firing the "
-            "message into a void. Before any long wait (deploy, install, tag), call "
-            "set_my_state('working', detail, expected_seconds=N) so the operator + peers can "
-            "see what you're doing; call set_my_state('idle') when the work lands. Coders MUST "
-            "pass their normalized coder_id as agent_key; the planner defaults to 'planner'."
+            # Mission A + B nudge — guidance, not enforcement. Cuts the "fire send_to_coder into a void" failure mode.
+            "MUTUAL STATE AWARENESS: Before send_to_coder / answer_question / respond_to_summary, "
+            "ALWAYS call list_agent_states() and check the target. If state is (stale, dead), "
+            "send_to_user describing the situation INSTEAD — don't fire into a void. The 'observed' "
+            "source is ground truth (the operator's desktop watching the actual PTY); 'declared' is "
+            "what an agent claimed. Treat observed as authoritative when both are present. "
+            "PLANNER STATUS: the cloud Hivemind has no PTY for the desktop to observe — call "
+            "set_planner_status(text='deploying server', expected_seconds=180) before long waits so "
+            "the operator sees what you're doing; set_planner_status() (no args) clears to idle. "
+            "CODERS: use set_my_state(agent_key=<your coder_id>) if needed, but the desktop now "
+            "publishes your observed state automatically; manual declaration is rarely necessary."
         ),
         auth=oauth_provider,
     )

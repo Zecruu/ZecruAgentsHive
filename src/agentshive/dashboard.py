@@ -41,6 +41,7 @@ from .tools import (
     _do_ack_message,
     _do_answer_question,
     _do_mark_mission_done,
+    _do_publish_observed_presence,
     _do_respond_to_summary,
     _do_send_to_coder,
     _do_send_to_planner_from_user,
@@ -153,6 +154,17 @@ def _require_dashboard_auth(request: Request, settings: Settings) -> bool:
     # Supabase-JWT path — the middleware verified it + bound tenant=sub already.
     if current_identity() is not None:
         return True
+
+    # v2.x long-lived agent token (`ahat_`) — TenantContextMiddleware resolved
+    # the tenant from the bearer (identity is None for agent tokens, just tenant
+    # scope). Accept it for dashboard surfaces that are inherently tenant-scoped:
+    # the desktop's per-machine MCP subprocess pushes observed presence here.
+    if header.lower().startswith("bearer ") and header[7:].strip().startswith("ahat_"):
+        # tenant_for_agent_token returns None for revoked/banned/malformed,
+        # in which case TenantContextMiddleware bound UNAUTHENTICATED_TENANT.
+        from .tenant import UNAUTHENTICATED_TENANT
+        from .tenant import current_tenant as _ct
+        return _ct() != UNAUTHENTICATED_TENANT
 
     # Cookie path.
     raw = request.cookies.get(COOKIE_NAME)
@@ -956,6 +968,29 @@ def _make_mark_done_handler(settings: Settings):
     return handler
 
 
+def _make_publish_presence_handler(settings: Settings):
+    """POST /api/dashboard/presence — Mission B. The desktop publishes its
+    observed-state batch for every spawned local agent here. tenant + project
+    resolved from the standard middleware path (legacy / Supabase JWT / agent
+    token). Per-entry validation runs in _do_publish_observed_presence — bad
+    entries are skipped + counted, valid ones upsert with source='observed'.
+    """
+    async def handler(request: Request) -> Response:
+        if not _require_dashboard_auth(request, settings):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _require_same_origin(request):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+        body, err_resp = await _read_json_body(request)
+        if err_resp is not None:
+            return err_resp
+        agents = body.get("agents") if isinstance(body, dict) else None
+        result = _do_publish_observed_presence(agents if isinstance(agents, list) else [])
+        if "error" in result and "applied" not in result:
+            return JSONResponse({"ok": False, **result}, status_code=400)
+        return JSONResponse(result, status_code=200)
+    return handler
+
+
 # ---------- v1.9 Projects CRUD ----------
 # Multi-project support: dashboard switcher reads from GET /projects, creates via
 # POST, soft-archives via POST /<slug>/archive. The "default" project is reserved
@@ -1134,6 +1169,8 @@ def register_routes(app, settings: Settings, tool_names: list[str], oauth_provid
     # from /api/dashboard/send (which is planner→coder during a mission).
     app.router.routes.append(Route("/api/dashboard/send-to-planner", _make_send_to_planner_handler(settings), methods=["POST"]))
     app.router.routes.append(Route("/api/dashboard/mark-done", _make_mark_done_handler(settings), methods=["POST"]))
+    # Mission B: desktop publishes its observed-state batch here every ~3s.
+    app.router.routes.append(Route("/api/dashboard/presence", _make_publish_presence_handler(settings), methods=["POST"]))
     # v1.6 SSE push channel
     app.router.routes.append(Route("/api/dashboard/events", _make_events_handler(settings), methods=["GET"]))
     # v1.9 Projects CRUD

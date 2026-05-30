@@ -688,6 +688,124 @@ def _do_set_my_state(
         }
 
 
+# Mission B: source='observed' bucket. Desktop reports what it ACTUALLY sees
+# (PTY alive + in_flight + stdout age) so cloud-side agents see the ground truth
+# without any agent declaring. set_my_state stays untouched — its writes are
+# source='declared'. _presence_dict applies the standard lazy promotion to BOTH
+# sources uniformly; an observed row that goes silent ages into stale/dead the
+# same way as any other (auto-recovery if the desktop dies / loses network).
+OBSERVED_BUCKET_STATES = frozenset({"idle", "working", "dead"})
+OBSERVED_REPLAY_WINDOW_SECONDS = 60  # observed_at must be within ±this of now
+
+
+def _do_publish_observed_presence(agents_payload: list[Any]) -> dict[str, Any]:
+    """Batch-upsert AgentPresence rows from desktop observation. tenant + project
+    come from the request context (set by the existing middleware on the route's
+    bearer). Each entry: {agent_key, state, detail, observed_at}. Per entry:
+    validate; upsert with source='observed', last_heartbeat_at=server-now (NOT
+    observed_at — the observation is fresh, but heartbeat is server-anchored),
+    transitioned_at bumped only when state changes. Continues past per-entry
+    errors (collected + returned alongside the applied count).
+    """
+    if not isinstance(agents_payload, list):
+        return {"error": "agents must be a list"}
+    now = _utcnow()
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    BATCH_CAP = 500
+    for entry in agents_payload[:BATCH_CAP]:
+        if not isinstance(entry, dict):
+            errors.append("agent entry must be an object")
+            continue
+        agent_key = (entry.get("agent_key") or "").strip()
+        state = (entry.get("state") or "").strip()
+        detail = entry.get("detail")
+        observed_at_str = entry.get("observed_at")
+        key_err = _validate_agent_key(agent_key)
+        if key_err:
+            errors.append(f"agent_key={agent_key!r}: {key_err}")
+            continue
+        if state not in OBSERVED_BUCKET_STATES:
+            errors.append(
+                f"agent_key={agent_key!r}: observed state must be one of "
+                f"{sorted(OBSERVED_BUCKET_STATES)} (got {state!r})"
+            )
+            continue
+        # Replay defense: observed_at within ±60s of server-now. Tolerate missing
+        # (treat as now) so a desktop with bad clock can still publish.
+        if observed_at_str:
+            try:
+                ts = datetime.fromisoformat(str(observed_at_str).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if abs((now - ts).total_seconds()) > OBSERVED_REPLAY_WINDOW_SECONDS:
+                    errors.append(f"agent_key={agent_key!r}: observed_at outside ±{OBSERVED_REPLAY_WINDOW_SECONDS}s")
+                    continue
+            except (ValueError, AttributeError, TypeError):
+                errors.append(f"agent_key={agent_key!r}: invalid observed_at")
+                continue
+        results.append({
+            "agent_key": agent_key,
+            "state": state,
+            "detail": _sanitize_presence_detail(detail),
+            "role": "planner" if agent_key == PLANNER_AGENT_KEY else "coder",
+        })
+    if not results:
+        return {"ok": False, "applied": 0, "errors": errors}
+    with Session(get_engine()) as session:
+        pid = _project_id(session)
+        if pid is None:
+            return {"error": f"project '{current_project()}' does not exist"}
+        applied = 0
+        for r in results:
+            row = session.exec(
+                select(AgentPresence).where(
+                    AgentPresence.project_id == pid,
+                    AgentPresence.agent_key == r["agent_key"],
+                )
+            ).first()
+            if row is None:
+                row = AgentPresence(
+                    tenant_id=current_tenant(),
+                    project_id=pid,
+                    agent_key=r["agent_key"],
+                    role=r["role"],
+                    state=r["state"],
+                    detail=r["detail"],
+                    transitioned_at=now,
+                    last_heartbeat_at=now,
+                    source="observed",
+                )
+            else:
+                if row.state != r["state"]:
+                    row.transitioned_at = now
+                    row.state = r["state"]
+                row.detail = r["detail"]
+                row.last_heartbeat_at = now
+                row.role = r["role"]
+                row.source = "observed"
+                # expected_done_at: observation doesn't carry a deadline. PRESERVE
+                # any existing value (a still-relevant declared deadline survives).
+            session.add(row)
+            applied += 1
+        session.commit()
+    return {"ok": True, "applied": applied, "errors": errors}
+
+
+def _do_set_planner_status(text: Optional[str], expected_seconds: Optional[int] = None) -> dict[str, Any]:
+    """Cloud-side Hivemind status banner. Thin alias on _do_set_my_state with
+    state inferred from text presence: non-empty → working+detail; empty/None →
+    idle+clear-detail. Same shape return as set_my_state."""
+    cleaned = (text or "").strip()
+    if cleaned:
+        return _do_set_my_state("working", detail=cleaned,
+                                expected_seconds=expected_seconds,
+                                agent_key=PLANNER_AGENT_KEY)
+    return _do_set_my_state("idle", detail=None,
+                            expected_seconds=expected_seconds,
+                            agent_key=PLANNER_AGENT_KEY)
+
+
 def _do_list_agent_states(project_slug: Optional[str] = None) -> dict[str, Any]:
     """Return every AgentPresence row for (tenant, project). Applies the lazy
     state promotion at read time. NO heartbeat side-effect on this call — same
@@ -1264,6 +1382,24 @@ def register_tools(mcp, settings: Settings) -> None:
         other MCP call you make.
         """
         return _do_set_my_state(state, detail=detail, expected_seconds=expected_seconds, agent_key=agent_key)
+
+    @mcp.tool
+    def set_planner_status(text: Optional[str] = None, expected_seconds: Optional[int] = None) -> dict[str, Any]:
+        """Cloud-side Hivemind status banner — for the planner connector that has
+        no PTY for the desktop to observe. Thin alias on set_my_state:
+          - text non-empty → state="working", detail=text
+          - text empty/None → state="idle", clear detail
+          - expected_seconds works the same as set_my_state
+
+        Use this when you (the Planner) commit to a long action where the operator's
+        desktop can't observe you (deploys, tag pushes, manual review). CODERS should
+        use set_my_state(agent_key=<your coder_id>) instead — Mission B's desktop
+        observer publishes their state automatically.
+
+        Source for this write is "declared" — it surfaces under the planner's avatar
+        when no fresher observation exists for agent_key="planner" (cloud planner
+        has no observer, so this is the canonical signal for that agent)."""
+        return _do_set_planner_status(text, expected_seconds=expected_seconds)
 
     @mcp.tool
     def list_agent_states(project_slug: Optional[str] = None) -> dict[str, Any]:

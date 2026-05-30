@@ -176,6 +176,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # enforced inside the dashboard handler.
         "/api/dashboard/send-to-planner",
         "/api/dashboard/mark-done",
+        # Mission B: desktop publishes observed presence here every ~3s. Per-route
+        # auth (legacy / Supabase JWT / agent-token) is enforced inside the handler.
+        "/api/dashboard/presence",
         # v1.6 SSE push channel — dashboard handler enforces cookie-or-bearer auth.
         "/api/dashboard/events",
         # v1.9 Projects CRUD — dashboard handlers enforce cookie-or-bearer auth
