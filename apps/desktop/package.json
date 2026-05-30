@@ -30,7 +30,8 @@
     "publish": {
       "provider": "github",
       "owner": "Zecruu",
-      "repo": "ZecruAgentsHive"
+      "repo": "ZecruAgentsHive",
+      "releaseType": "release"
     },
     "win": {
       "target": "nsis",
