@@ -114,6 +114,9 @@ contextBridge.exposeInMainWorld('agentshive', {
     revoke: (id) => ipcRenderer.invoke('agent-token:revoke', { id }),
     mint: (label) => ipcRenderer.invoke('agent-token:mint', { label }),
   },
+  presence: {
+    publish: (project, agents) => ipcRenderer.invoke('presence:publish', { project, agents }),
+  },
   skills: {
     list: (projectSlug) => ipcRenderer.invoke('skills:list', { projectSlug }),
   },

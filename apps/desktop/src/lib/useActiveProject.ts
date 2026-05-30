@@ -106,6 +106,33 @@ function normCoderId(s: string | null | undefined): string {
   return (s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
+// Mission B P1: derive what the desktop ACTUALLY observes for a single agent,
+// per the spec's bucket rules. Returns null when the agent shouldn't be
+// published (readOnly = materialized from another device → not ours; missing
+// agent_key = no slug-able identity).
+function deriveObserved(a: AgentRuntime, now: number): {
+  agent_key: string;
+  state: 'idle' | 'working' | 'dead';
+  detail: string | null;
+} | null {
+  if (a.readOnly) return null;
+  const agent_key = a.role === 'hivemind' ? 'planner' : normCoderId(a.coderId || a.label);
+  if (!agent_key) return null;
+  const last = a.lastEventAt ?? a.turnStartedAt ?? null;
+  const ageSec = last != null ? Math.floor((now - last) / 1000) : null;
+  if (a.inFlight) {
+    if (ageSec == null || ageSec < 5) return { agent_key, state: 'working', detail: 'streaming response' };
+    if (ageSec < 30) return { agent_key, state: 'working', detail: 'awaiting tool result' };
+    return { agent_key, state: 'working', detail: 'tool call in progress (>30s)' };
+  }
+  if (a.status === 'err') return { agent_key, state: 'dead', detail: 'process exited' };
+  if (ageSec == null) return { agent_key, state: 'idle', detail: null };
+  if (ageSec < 10) return { agent_key, state: 'idle', detail: 'just finished' };
+  if (ageSec < 5 * 60) return { agent_key, state: 'idle', detail: null };
+  if (ageSec < 30 * 60) return { agent_key, state: 'idle', detail: 'quiet' };
+  return { agent_key, state: 'idle', detail: null };
+}
+
 // Mission A: mutate `agents` in place so each gets its matching AgentPresenceLite
 // (or null if no row). agent_key matching: hivemind → "planner"; coder →
 // normCoderId(coder.coderId || coder.label) — same normalization the server enforces.
@@ -625,6 +652,73 @@ export function useActiveProject(project: Project | null, isActive: boolean): Ac
       clearTimeout(tInit);
       clearInterval(tPoll);
       checkCoderPendingRef.current = () => {};
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  // Mission B P1: 3s observation publisher. For each agent we spawned locally,
+  // derive what we ACTUALLY see (PTY alive / in_flight / last stdout age) and
+  // POST to /api/dashboard/presence so cloud-side agents see ground truth
+  // (source='observed' on the server row). Per-agent change-only filter — we
+  // only POST entries where state OR detail differs from the last successful
+  // publish, so a fully-idle steady state is one POST then silence. Runs in EVERY
+  // ProjectRuntimeHost (NOT isActive-gated) so backgrounded projects' agents
+  // still publish. The server merge already flows back through the existing
+  // dashboard.state ticks — no consumer code change needed on the client.
+  useEffect(() => {
+    if (!slug) return;
+    const lastPublished = new Map<string, { state: string; detail: string }>();
+    let stopped = false;
+
+    const tick = async () => {
+      if (stopped) return;
+      const now = Date.now();
+      const observations: Array<{ id: string; agent_key: string; state: 'idle' | 'working' | 'dead'; detail: string | null }> = [];
+      for (const a of agentsRef.current) {
+        const obs = deriveObserved(a, now);
+        if (obs) observations.push({ id: a.id, ...obs });
+      }
+      const changed = observations.filter((o) => {
+        const prev = lastPublished.get(o.id);
+        return !prev || prev.state !== o.state || prev.detail !== (o.detail ?? '');
+      });
+      if (changed.length === 0) {
+        // Drop cache entries for archived agents even when nothing changed, so
+        // the map stays bounded across long sessions.
+        const liveIds = new Set(agentsRef.current.map((a) => a.id));
+        for (const id of Array.from(lastPublished.keys())) {
+          if (!liveIds.has(id)) lastPublished.delete(id);
+        }
+        return;
+      }
+      const observedAt = new Date(now).toISOString();
+      const payload = changed.map((o) => ({
+        agent_key: o.agent_key,
+        state: o.state,
+        detail: o.detail,
+        observed_at: observedAt,
+      }));
+      try {
+        const res = await ah().presence.publish(slug, payload);
+        if (res && res.ok) {
+          // Cache only on success so a failed POST is retried next tick.
+          for (const o of changed) {
+            lastPublished.set(o.id, { state: o.state, detail: o.detail ?? '' });
+          }
+        }
+      } catch { /* silent — best-effort 3s ticker */ }
+      const liveIds = new Set(agentsRef.current.map((a) => a.id));
+      for (const id of Array.from(lastPublished.keys())) {
+        if (!liveIds.has(id)) lastPublished.delete(id);
+      }
+    };
+
+    const tInit = setTimeout(tick, 2000);  // small delay so agents load from disk first
+    const tPoll = setInterval(tick, 3000);
+    return () => {
+      stopped = true;
+      clearTimeout(tInit);
+      clearInterval(tPoll);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);

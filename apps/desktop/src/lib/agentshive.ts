@@ -319,6 +319,18 @@ declare global {
         revoke: (id: string) => Promise<{ ok: boolean; error?: string }>;
         mint: (label?: string) => Promise<{ ok: boolean; id?: string; label?: string; prefix?: string; token?: string; error?: string }>;
       };
+      // Mission B P1: forward the renderer's batched observed-presence to
+      // /api/dashboard/presence with the operator's agent token. Empty/missing
+      // agents array no-ops cleanly. Failure (no bearer, network) returns
+      // {ok:false} but never throws.
+      presence: {
+        publish: (project: string, agents: Array<{
+          agent_key: string;
+          state: 'idle' | 'working' | 'dead';
+          detail?: string | null;
+          observed_at: string;
+        }>) => Promise<{ ok: boolean; status?: number; skipped?: boolean; error?: string }>;
+      };
       skills: {
         list: (projectSlug: string) => Promise<SkillItem[]>;
       };

@@ -1522,6 +1522,33 @@ ipcMain.handle('agent-token:revoke', async (_e, { id }) => {
   }
 });
 
+// Mission B P1: forward the renderer's batched observed-presence to
+// /api/dashboard/presence with the operator's agent token (preferred over the
+// 1h Supabase JWT). Resolution order matches the spawn path: agent token >
+// JWT > legacy. Returns {ok, status} so the renderer can log a one-time
+// warning on persistent failure but otherwise stays silent (3s ticker).
+ipcMain.handle('presence:publish', async (_e, { project, agents }) => {
+  if (!project || !Array.isArray(agents) || agents.length === 0) {
+    return { ok: true, status: 0, skipped: true };  // nothing to publish
+  }
+  const cfg = readConfig();
+  if (!cfg.baseUrl) return { ok: false, error: 'baseUrl not configured' };
+  const agentToken = (cfg.agentToken && cfg.agentToken.value) || null;
+  const bearer = agentToken || _supabaseToken || (legacyKeyEnabled() ? cfg.apiKey : null);
+  if (!bearer) return { ok: false, error: 'no bearer available' };
+  try {
+    const url = cfg.baseUrl.replace(/\/$/, '') + '/api/dashboard/presence?project=' + encodeURIComponent(project);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json', Origin: cfg.baseUrl },
+      body: JSON.stringify({ agents }),
+    });
+    return { ok: res.ok, status: res.status };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
 // Renderer can mint a brand-new token without nuking the cached one — used by
 // the Settings "Mint new token" button so the operator gets the plaintext ONCE
 // (returned here; never persisted in the renderer). The plaintext IS still
