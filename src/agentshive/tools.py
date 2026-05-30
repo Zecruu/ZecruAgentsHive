@@ -13,6 +13,7 @@ from . import __version__ as AGENTSHIVE_VERSION
 from . import dashboard_events
 from .config import Settings
 from .db import (
+    AgentPresence,
     CoderHeartbeat,
     Message,
     Mission,
@@ -24,7 +25,7 @@ from .db import (
     get_engine,
     get_or_create_tenant,
 )
-from .project import current_project, validate_coder_id
+from .project import current_project, validate_coder_id, SLUG_PATTERN
 from .tenant import (
     LEGACY_TENANT,
     UNAUTHENTICATED_TENANT,
@@ -436,6 +437,9 @@ def _touch_coder(
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
         if (now - last).total_seconds() < HEARTBEAT_MIN_INTERVAL_SECONDS:
+            # CoderHeartbeat throttled — but AgentPresence still bumps per call
+            # (its own table, lazy-promotion semantics). See _touch_presence below.
+            _touch_presence(session, agent_key=coder_id, role="coder", project_id=pid)
             return
         existing.last_seen = now
         if os_hint is not None:
@@ -447,6 +451,258 @@ def _touch_coder(
             tenant_id=current_tenant(),
         ))
     session.commit()
+    # Mission A: keep AgentPresence's heartbeat fresh on every coder tool call.
+    # Default state="working" if no row exists yet (the coder is calling a tool,
+    # ergo alive + acting). Existing rows keep whatever state was last declared.
+    _touch_presence(session, agent_key=coder_id, role="coder", project_id=pid)
+
+
+# ---------- AgentPresence helpers (Mission A) ----------
+#
+# State semantics:
+#   declared by set_my_state: idle / working / waiting_on_planner /
+#                             waiting_on_coder / waiting_on_user / blocked
+#   promoted by read-time helper: stale (heartbeat >5 min on a non-idle active
+#                                 state), dead (heartbeat >30 min)
+#
+# _touch_presence: per-tool-call heartbeat bump. Inserts a row with
+# default_state when missing; otherwise bumps last_heartbeat_at only. This
+# function does NOT change `state` or `detail` — those only update via
+# set_my_state. Safe to call inside the existing session.
+
+VALID_DECLARED_STATES = frozenset({
+    "idle", "working", "waiting_on_planner", "waiting_on_coder",
+    "waiting_on_user", "blocked",
+})
+AGENT_PRESENCE_DETAIL_MAX = 200
+AGENT_PRESENCE_EXPECTED_SECONDS_MAX = 86400  # 24h cap on declared deadlines
+AGENT_PRESENCE_STALE_SECONDS = 5 * 60   # 5 min → stale
+AGENT_PRESENCE_DEAD_SECONDS = 30 * 60   # 30 min → dead
+
+PLANNER_AGENT_KEY = "planner"
+
+
+def _validate_agent_key(value: str) -> Optional[str]:
+    """Return None if `value` is a legal agent_key, else an error string. "planner"
+    plus any SLUG_PATTERN-matching string (including "planner" itself since lowercase
+    letters match) are accepted. Empty / non-string / shell-meta values rejected.
+    """
+    if not isinstance(value, str) or not value:
+        return "agent_key must be a non-empty string"
+    if not SLUG_PATTERN.fullmatch(value):
+        return (
+            "agent_key must match the slug regex (1-42 lowercase letters/digits "
+            "with internal hyphens). Pass 'planner' for the hivemind or your "
+            "normalized coder_id (same id you pass to wait_for_planner_message)."
+        )
+    return None
+
+
+def _sanitize_presence_detail(value: Any) -> Optional[str]:
+    """Clamp a detail string: trim, cap to AGENT_PRESENCE_DETAIL_MAX, strip
+    control characters except \\n. Returns None on empty/None input."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(ch for ch in value if ch == "\n" or ord(ch) >= 32).strip()
+    if not cleaned:
+        return None
+    return cleaned[:AGENT_PRESENCE_DETAIL_MAX]
+
+
+def _touch_presence(
+    session: Session,
+    agent_key: str,
+    role: str,
+    project_id: Optional[str] = None,
+    default_state: str = "working",
+) -> None:
+    """Heartbeat-bump AgentPresence for (tenant, project, agent_key). Inserts a
+    row with state=default_state if none exists; otherwise just bumps
+    last_heartbeat_at (state + detail + expected_done_at untouched). Per-tool-call
+    granularity — no throttle — so a Planner can see exactly when the last MCP
+    call landed. Safe to call from inside any existing session.
+    """
+    if project_id is None:
+        project_id = _project_id(session)
+    if project_id is None:
+        return  # project doesn't exist in this tenant — nothing to do
+    now = _utcnow()
+    row = session.exec(
+        select(AgentPresence).where(
+            AgentPresence.project_id == project_id,
+            AgentPresence.agent_key == agent_key,
+        )
+    ).first()
+    if row is None:
+        session.add(AgentPresence(
+            tenant_id=current_tenant(),
+            project_id=project_id,
+            agent_key=agent_key,
+            role=role,
+            state=default_state,
+            transitioned_at=now,
+            last_heartbeat_at=now,
+            source="declared",
+        ))
+    else:
+        row.last_heartbeat_at = now
+        # `role` may have been wrong on a legacy row — keep it correct.
+        if row.role != role:
+            row.role = role
+        session.add(row)
+    session.commit()
+
+
+def _touch_planner_presence(session: Session) -> None:
+    """Convenience for planner-side `_do_*` helpers — same as _touch_presence
+    with agent_key=PLANNER_AGENT_KEY and role='planner'. Default state stays
+    'working' (the planner just made an MCP call, ergo alive)."""
+    _touch_presence(session, agent_key=PLANNER_AGENT_KEY, role="planner")
+
+
+def _promote_presence_state(state: str, last_heartbeat_at: datetime, now: datetime) -> str:
+    """Lazy server-side state promotion. Pure function — no DB write. Applied at
+    read time in list_agent_states + _build_state_payload so we don't run a
+    background sweep. SQLite stores naive datetimes; coerce before subtracting.
+    """
+    if last_heartbeat_at is None:
+        return state
+    last = last_heartbeat_at if last_heartbeat_at.tzinfo is not None else last_heartbeat_at.replace(tzinfo=timezone.utc)
+    age = (now - last).total_seconds()
+    if age >= AGENT_PRESENCE_DEAD_SECONDS:
+        return "dead"
+    # Non-idle declared state going quiet → stale. Idle stays idle (the agent
+    # explicitly said they have nothing to do; "stale-idle" would be noise).
+    if state != "idle" and state not in ("stale", "dead") and age >= AGENT_PRESENCE_STALE_SECONDS:
+        return "stale"
+    return state
+
+
+def _presence_dict(row: AgentPresence, now: Optional[datetime] = None) -> dict[str, Any]:
+    """Serialize an AgentPresence row with the read-time state promotion applied."""
+    if now is None:
+        now = _utcnow()
+    effective_state = _promote_presence_state(row.state, row.last_heartbeat_at, now)
+    last_hb = row.last_heartbeat_at
+    if last_hb is not None and last_hb.tzinfo is None:
+        last_hb_aware = last_hb.replace(tzinfo=timezone.utc)
+    else:
+        last_hb_aware = last_hb
+    seconds_since_heartbeat = (
+        int((now - last_hb_aware).total_seconds()) if last_hb_aware is not None else None
+    )
+    return {
+        "agent_key": row.agent_key,
+        "role": row.role,
+        "state": effective_state,
+        "declared_state": row.state,  # what the agent declared, pre-promotion
+        "detail": row.detail,
+        "expected_done_at": row.expected_done_at.isoformat() if row.expected_done_at else None,
+        "transitioned_at": row.transitioned_at.isoformat() if row.transitioned_at else None,
+        "last_heartbeat_at": row.last_heartbeat_at.isoformat() if row.last_heartbeat_at else None,
+        "seconds_since_heartbeat": seconds_since_heartbeat,
+        "source": row.source,
+    }
+
+
+def _do_set_my_state(
+    state: str,
+    detail: Optional[str] = None,
+    expected_seconds: Optional[int] = None,
+    agent_key: str = PLANNER_AGENT_KEY,
+) -> dict[str, Any]:
+    """Upsert AgentPresence for (tenant, project, agent_key) with the declared
+    state. transitioned_at bumps only when `state` actually changes (detail /
+    expected_seconds-only updates leave it alone so the UI's "X working for 45s"
+    counter stays sensible). Heartbeat always bumps."""
+    if state not in VALID_DECLARED_STATES:
+        return {
+            "error": (
+                f"state must be one of {sorted(VALID_DECLARED_STATES)}; "
+                "'stale' and 'dead' are server-side promotions and can't be declared."
+            ),
+        }
+    err = _validate_agent_key(agent_key)
+    if err:
+        return {"error": err}
+    role = "planner" if agent_key == PLANNER_AGENT_KEY else "coder"
+    detail_clean = _sanitize_presence_detail(detail)
+    expected_at: Optional[datetime] = None
+    if expected_seconds is not None:
+        try:
+            secs = int(expected_seconds)
+        except (TypeError, ValueError):
+            return {"error": "expected_seconds must be a positive integer"}
+        if secs <= 0:
+            return {"error": "expected_seconds must be positive"}
+        if secs > AGENT_PRESENCE_EXPECTED_SECONDS_MAX:
+            return {"error": f"expected_seconds capped at {AGENT_PRESENCE_EXPECTED_SECONDS_MAX} (24h)"}
+        expected_at = _utcnow() + timedelta(seconds=secs)
+    with Session(get_engine()) as session:
+        pid = _project_id(session)
+        if pid is None:
+            return {"error": f"project '{current_project()}' does not exist"}
+        now = _utcnow()
+        row = session.exec(
+            select(AgentPresence).where(
+                AgentPresence.project_id == pid,
+                AgentPresence.agent_key == agent_key,
+            )
+        ).first()
+        if row is None:
+            row = AgentPresence(
+                tenant_id=current_tenant(),
+                project_id=pid,
+                agent_key=agent_key,
+                role=role,
+                state=state,
+                detail=detail_clean,
+                expected_done_at=expected_at,
+                transitioned_at=now,
+                last_heartbeat_at=now,
+                source="declared",
+            )
+        else:
+            if row.state != state:
+                row.transitioned_at = now
+                row.state = state
+            row.detail = detail_clean
+            row.expected_done_at = expected_at
+            row.last_heartbeat_at = now
+            row.role = role  # keep correct if a legacy row had it wrong
+            row.source = "declared"
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return {
+            "ok": True,
+            "agent_key": row.agent_key,
+            "role": row.role,
+            "state": row.state,
+            "detail": row.detail,
+            "expected_done_at": row.expected_done_at.isoformat() if row.expected_done_at else None,
+            "transitioned_at": row.transitioned_at.isoformat(),
+            "last_heartbeat_at": row.last_heartbeat_at.isoformat(),
+        }
+
+
+def _do_list_agent_states(project_slug: Optional[str] = None) -> dict[str, Any]:
+    """Return every AgentPresence row for (tenant, project). Applies the lazy
+    state promotion at read time. NO heartbeat side-effect on this call — same
+    "info read" semantics as get_active_mission()."""
+    with Session(get_engine()) as session:
+        pid = _project_id(session, slug=project_slug) if project_slug else _project_id(session)
+        if pid is None:
+            return {"agents": []}
+        rows = session.exec(
+            select(AgentPresence)
+            .where(AgentPresence.project_id == pid)
+            .order_by(AgentPresence.role.desc(), AgentPresence.agent_key)
+        ).all()
+        now = _utcnow()
+        return {"agents": [_presence_dict(r, now=now) for r in rows]}
 
 
 # ---------- Module-level write operations (v1.5) ----------
@@ -493,6 +749,7 @@ def _do_answer_question(question_id: str, answer: str) -> dict[str, Any]:
     if err:
         return err
     with Session(get_engine()) as session:
+        _touch_planner_presence(session)  # Mission A: planner heartbeat
         q = _tenant_get(session, Question, question_id)
         if q is None:
             return {"error": f"no question with id {question_id}"}
@@ -514,6 +771,7 @@ def _do_respond_to_summary(summary_id: str, response: str) -> dict[str, Any]:
     if err:
         return err
     with Session(get_engine()) as session:
+        _touch_planner_presence(session)  # Mission A: planner heartbeat
         s = _tenant_get(session, Summary, summary_id)
         if s is None:
             return {"error": f"no summary with id {summary_id}"}
@@ -566,6 +824,7 @@ def _do_send_to_coder(body: str, target_coder_id: Optional[str] = None) -> dict[
     except ValueError as e:
         return {"error": str(e)}
     with Session(get_engine()) as session:
+        _touch_planner_presence(session)  # Mission A: planner heartbeat
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission — cannot send"}
@@ -598,6 +857,7 @@ def _do_send_to_user(body: str) -> dict[str, Any]:
     if err:
         return err
     with Session(get_engine()) as session:
+        _touch_planner_presence(session)  # Mission A: planner heartbeat
         pid = _project_id(session)
         if pid is None:
             return {"error": f"project '{current_project()}' does not exist"}
@@ -676,6 +936,7 @@ def _do_create_mission(
     for attempt in range(2):
         try:
             with Session(get_engine()) as session:
+                _touch_planner_presence(session)  # Mission A: planner heartbeat
                 pid = _project_id(session)
                 if pid is None:
                     return {"error": f"project '{current_project()}' does not exist"}
@@ -811,6 +1072,7 @@ def _do_set_foundation(name: str, spec: str) -> dict[str, Any]:
     if err:
         return err
     with Session(get_engine()) as session:
+        _touch_planner_presence(session)  # Mission A: planner heartbeat
         pid = _project_id(session)
         if pid is None:
             return {"error": f"project '{current_project()}' does not exist"}
@@ -827,6 +1089,7 @@ def _do_set_foundation(name: str, spec: str) -> dict[str, Any]:
 def _do_mark_mission_done() -> dict[str, Any]:
     """v1.9: scoped to current project's active mission."""
     with Session(get_engine()) as session:
+        _touch_planner_presence(session)  # Mission A: planner heartbeat
         mission = _active_mission(session)
         if mission is None:
             return {"error": "no active mission"}
@@ -971,6 +1234,49 @@ def register_tools(mcp, settings: Settings) -> None:
                 you're mutating the project you intend.
         """
         return _do_create_mission(name, spec, project_slug=project_slug)
+
+    @mcp.tool
+    def set_my_state(
+        state: str,
+        detail: Optional[str] = None,
+        expected_seconds: Optional[int] = None,
+        agent_key: str = PLANNER_AGENT_KEY,
+    ) -> dict[str, Any]:
+        """Declare YOUR current state so other agents + the operator can see what
+        you're doing. Mission A foundation for the "you guys keep freezing"
+        complaint — previously there was no first-class concept of agent state.
+
+        agent_key:  default "planner" for the hivemind. CODERS MUST pass their
+                    normalized coder_id (same id used for wait_for_planner_message).
+        state:      one of idle | working | waiting_on_planner | waiting_on_coder
+                    | waiting_on_user | blocked. "stale"/"dead" are server-side
+                    promotions and rejected here.
+        detail:     short free-text up to 200 chars — what you're doing
+                    (e.g. "deploying server", "ask_planner: which endpoint shape?").
+        expected_seconds: optional declared deadline. If set, expected_done_at =
+                    now + expected_seconds. The UI uses this to surface "(~N s
+                    remaining)" or "(over by N s)" so a stale "deploying ~120s"
+                    claim becomes visible.
+
+        Recommended calls (from the spec): before any long shell wait
+        (railway up / npm install / tagging), declare working+detail+expected; after
+        the work lands, set state="idle". Heartbeat bumps automatically on every
+        other MCP call you make.
+        """
+        return _do_set_my_state(state, detail=detail, expected_seconds=expected_seconds, agent_key=agent_key)
+
+    @mcp.tool
+    def list_agent_states(project_slug: Optional[str] = None) -> dict[str, Any]:
+        """Show the current declared state of every agent in this project. Apply
+        before sending: if the target coder is in {stale, dead}, prefer notifying
+        the user via send_to_user instead of firing into a void.
+
+        Returns {agents: [{agent_key, role, state, declared_state, detail,
+        expected_done_at, transitioned_at, last_heartbeat_at, seconds_since_heartbeat,
+        source}, ...]}. State is the EFFECTIVE state (lazy-promoted to stale after
+        5 min of heartbeat silence on a non-idle state, dead after 30 min);
+        declared_state is what the agent last actually claimed."""
+        return _do_list_agent_states(project_slug=project_slug)
 
     @mcp.tool
     def get_active_mission(coder_id: Optional[str] = None) -> dict[str, Any]:

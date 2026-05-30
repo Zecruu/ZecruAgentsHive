@@ -342,6 +342,21 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
         # current request's project (passed in to avoid re-resolving the slug).
         inbox = _recent_inbox_messages(session, project_id=project_id)
 
+        # Mission A: AgentPresence rows for THIS project (tenant-scoped via
+        # project_id resolution above). Applies the lazy stale/dead promotion at
+        # read time — same helper the list_agent_states tool uses, single source
+        # of truth. Empty list when the project has no presence rows yet.
+        agent_presence: list[dict[str, Any]] = []
+        if project_id is not None:
+            from .db import AgentPresence
+            from .tools import _presence_dict
+            presence_rows = session.exec(
+                select(AgentPresence)
+                .where(AgentPresence.project_id == project_id)
+                .order_by(AgentPresence.role.desc(), AgentPresence.agent_key)
+            ).all()
+            agent_presence = [_presence_dict(r, now=now) for r in presence_rows]
+
         # v1.13: Connected Coders panel. Empty list when no active mission
         # (per Planner — empty list, not None, so the frontend "no rows to
         # render" path handles both states uniformly).
@@ -356,6 +371,7 @@ def _build_state_payload(_settings: Settings) -> dict[str, Any]:
             "pending_questions": pending_q,
             "pending_summaries": pending_s,
             "pending_from_planner": pending_from_planner,
+            "agent_presence": agent_presence,
             "messages": {"coder_to_planner": c2p, "planner_to_coder": p2c},
             "inbox": inbox,
             "server_info": server_info,

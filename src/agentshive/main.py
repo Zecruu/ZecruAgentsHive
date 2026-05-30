@@ -72,7 +72,15 @@ def build_app():
             "AgentsHive is the bridge between AI Planners (Claude/Codex desktop & mobile) "
             "and AI Coders (Claude Code, Codex CLI). Planners create missions and answer the "
             "Coder's questions. Coders fetch missions, ask the Planner instead of the human, "
-            "and submit progress summaries. There is one active mission at a time."
+            "and submit progress summaries. There is one active mission at a time. "
+            # Mission A nudge — guidance, not enforcement. Cuts the "fire send_to_coder into a void" failure mode.
+            "MUTUAL STATE AWARENESS: Before send_to_coder or answer_question, you SHOULD call "
+            "list_agent_states() to see if the target coder is alive. If state in (stale, dead) "
+            "for the target, prefer notifying the user via send_to_user instead of firing the "
+            "message into a void. Before any long wait (deploy, install, tag), call "
+            "set_my_state('working', detail, expected_seconds=N) so the operator + peers can "
+            "see what you're doing; call set_my_state('idle') when the work lands. Coders MUST "
+            "pass their normalized coder_id as agent_key; the planner defaults to 'planner'."
         ),
         auth=oauth_provider,
     )

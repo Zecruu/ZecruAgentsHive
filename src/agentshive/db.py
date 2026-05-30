@@ -274,6 +274,53 @@ class SyncedMessage(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
+# v2.x mutual agent-state awareness (Mission A — manual declaration version).
+#
+# AgentsHive previously had heartbeats (last_seen at) and message queues but no
+# concept of "current state" — the Planner fired send_to_coder into a void and
+# coders sat idle without knowing if the planner was alive. AgentPresence makes
+# the missing state model first-class.
+#
+# Identity:  (tenant_id, project_id, agent_key) — agent_key = "planner" for the
+#            hivemind or the slug-normalized coder_id for coders. UNIQUE composite.
+# State machine (declared):  idle | working | waiting_on_planner | waiting_on_coder
+#                            | waiting_on_user | blocked
+# State promotion (server-side, LAZY at read time):
+#   - any non-idle declared state + heartbeat older than 5 min → "stale"
+#   - any state                  + heartbeat older than 30 min → "dead"
+# Read-time promotion is cheaper than a background sweep and avoids worker
+# contention; list_agent_states + _build_state_payload apply it.
+#
+# source: "declared" today (Mission A). Mission B will introduce "observed" — the
+# desktop will publish what it actually sees the agent doing, and the server will
+# prefer observed over declared. The column ships now so Mission B is additive.
+class AgentPresence(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("project_id", "agent_key", name="uq_agentpresence_project_agent"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    tenant_id: str = Field(index=True)
+    project_id: str = Field(index=True)
+    # "planner" for the hivemind or the normalized coder_id (slug regex) for coders.
+    agent_key: str
+    # "planner" | "coder" — derived from agent_key on upsert.
+    role: str
+    # Declared bucket; "stale"/"dead" are server-promoted only and rejected from
+    # set_my_state.
+    state: str
+    # Short free-text detail — capped + trimmed at the tool layer.
+    detail: Optional[str] = None
+    # Optional declared deadline so the UI can show "(~N s left)" / "(over by N s)".
+    expected_done_at: Optional[datetime] = None
+    # When `state` last changed (not bumped on detail-only updates).
+    transitioned_at: datetime = Field(default_factory=_utcnow)
+    # Bumped on EVERY set_my_state call AND every MCP tool already touching
+    # coder_last_seen. Drives the 5-min stale / 30-min dead promotions.
+    last_heartbeat_at: datetime = Field(default_factory=_utcnow)
+    # Forward-compat for Mission B: "declared" today; later also "observed".
+    source: str = Field(default="declared")
+
+
 # v2.x long-lived agent tokens — kill the 1h Supabase JWT-expiry MCP auth break.
 #
 # Operator signs in once with Supabase, the desktop mints one of these per machine,
